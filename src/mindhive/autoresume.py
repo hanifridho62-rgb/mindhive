@@ -25,8 +25,8 @@ roadmap events stay the semantic record):
   ``delivered`` / ``still_limited`` / ``error`` / ``skipped``; a
   still-limited delivery re-schedules itself until MAX_ATTEMPTS -- a
   one-shot after a short backoff, a relaunched loop one cooldown after it
-  returned, where only a relaunch that checked off no plan step spends an
-  attempt.
+  returned, where only a relaunch that checked off nothing new on its
+  fix_plan checklist spends an attempt.
 - ``cancelled`` — a human picked the plan back up (``hive roadmap resume`` /
   ``complete``), so the pending delivery and its OS timer are withdrawn.
 
@@ -168,6 +168,11 @@ def validate_payload(payload) -> None:
         if mode == "loop" and not str(payload.get("goal_dir") or "").strip():
             raise ValueError(
                 "autoresume mode 'loop' requires the goal_dir to relaunch")
+        high = payload.get("checked_high")
+        if high is not None and (not isinstance(high, int)
+                                 or isinstance(high, bool) or high < 0):
+            raise ValueError(
+                "autoresume checked_high must be an integer >= 0")
     elif action == "fired":
         if payload.get("outcome") not in OUTCOMES:
             raise ValueError(
@@ -221,6 +226,14 @@ def fold(evs) -> dict:
                 mode=p.get("mode") if p.get("mode") in MODES else "prompt",
                 goal_dir=str(p.get("goal_dir") or "")[:MAX_PATH_CHARS],
                 outcome="", detail="")
+            # A loop chain's high-water mark rides only the schedule that
+            # carried it forward: one without it starts the count over.
+            high = p.get("checked_high")
+            if isinstance(high, int) and not isinstance(high, bool) \
+                    and high >= 0:
+                rec["checked_high"] = high
+            else:
+                rec.pop("checked_high", None)
         elif action == "fired":
             outcome = p.get("outcome")
             if outcome not in OUTCOMES:
@@ -418,12 +431,13 @@ def _unregister_timer(plan_id) -> None:
 
 def schedule(plan_id, *, project=None, evs=None, cooldown_hours=None, at=None,
              attempt=1, model=None, cwd=None, mode="prompt", goal_dir=None,
-             session_id=None, register=None, now=None):
+             checked_high=None, session_id=None, register=None, now=None):
     """Schedule the plan's marker to re-enter Claude. Guards mirror
     roadmap.record: the plan must exist and be interrupted — auto-resume
     delivers interruption markers, nothing else. Re-scheduling replaces the
-    pending delivery (and the -Force'd OS task). Returns the appended
-    event."""
+    pending delivery (and the -Force'd OS task). ``checked_high`` carries a
+    loop chain's high-water mark of checked items from one wake-up to the
+    next (see `fire`). Returns the appended event."""
     if evs is None:
         evs = ev_mod.read_all(project)
     rec = roadmap.get(evs, plan_id)
@@ -466,6 +480,8 @@ def schedule(plan_id, *, project=None, evs=None, cooldown_hours=None, at=None,
                "model": str(model or "")[:MAX_MODEL_CHARS], "timer": timer,
                "mode": mode,
                "goal_dir": str(goal_dir or "")[:MAX_PATH_CHARS]}
+    if checked_high is not None:
+        payload["checked_high"] = checked_high
     validate_payload(payload)
     return ev_mod.append_event("autoresume", payload, session_id=session_id,
                                tags=["autoresume"], project=project)
@@ -526,8 +542,26 @@ def waking_attempt():
     itself: its fresh schedule would restart the count at attempt 1 on every
     relaunch -- a capped loop waking every cooldown with no end. Inside a
     wake-up `fire` re-arms instead, and spends an attempt unless the
-    relaunch checked off a plan step, until MAX_ATTEMPTS."""
+    relaunch checked off something new on its checklist, until
+    MAX_ATTEMPTS."""
     return _WAKING.get()
+
+
+def _checked_items(goal_dir):
+    """How many items the goal dir's fix_plan.md has checked off -- the
+    loop's own record of how far it got -- or None when it cannot be read.
+    Not the roadmap's done count: a session that adopts the interrupted plan
+    while the loop sleeps re-writes its steps with its own todos, and the
+    roadmap keeps at most roadmap.MAX_STEPS of them."""
+    from pathlib import Path
+    from .loop import task as task_mod
+    plan = Path(goal_dir) / "fix_plan.md"
+    try:
+        text = plan.read_text(encoding="utf-8", errors="replace") \
+            if plan.exists() else ""
+    except OSError:
+        return None
+    return len(task_mod.plan_items(text)["done"])
 
 
 def _run_loop_delivery(plan_id, goal_dir, project) -> tuple:
@@ -581,9 +615,10 @@ def fire(plan_id, *, project=None, session_id=None, runner=None,
     itself until MAX_ATTEMPTS: a one-shot RETRY_HOURS later, a relaunched
     loop one cooldown after the relaunch returned. The relaunched run's own
     snapshot leaves that re-arming to this call (`waking_attempt`), which
-    counts the attempts: a relaunch that checked off a plan step restarts
-    the count, one that checked off none spends one, and one cancelled while
-    it ran is not re-armed at all. Returns the fired payload."""
+    counts the attempts: a relaunch that left more items checked on its
+    fix_plan checklist than the chain had ever seen restarts the count, one
+    that did not spends one, and one cancelled while it ran is not re-armed
+    at all. Returns the fired payload."""
     evs = ev_mod.read_all(project)
     sched = fold(evs).get(plan_id)
     attempt = sched["attempt"] if sched else 1
@@ -604,6 +639,7 @@ def fire(plan_id, *, project=None, session_id=None, runner=None,
     goal_dir = (sched or {}).get("goal_dir") or ""
     if (sched or {}).get("mode") == "loop" and goal_dir \
             and os.path.isdir(goal_dir):
+        before = _checked_items(goal_dir)
         waking = _WAKING.set(attempt)
         try:
             outcome, detail = (loop_runner or _run_loop_delivery)(
@@ -616,19 +652,26 @@ def fire(plan_id, *, project=None, session_id=None, runner=None,
             outcome, detail = "error", f"{type(e).__name__}: {e}"
         finally:
             _WAKING.reset(waking)
-        # What the relaunch left behind decides the next wake-up: the plan
-        # its snapshot re-interrupted, and any cancel a human issued while it
-        # ran -- the `fired` row lands only now, so a cancel meanwhile found
-        # the delivery still scheduled and succeeded.
+        # What the relaunch left behind decides the next wake-up: its
+        # checklist, and any cancel a human issued while it ran -- the
+        # `fired` row lands only now, so a cancel meanwhile found the
+        # delivery still scheduled and succeeded.
         after = ev_mod.read_all(project)
-        rec_after = roadmap.get(after, plan_id)
         cancelled = sched["status"] != "cancelled" and \
             (fold(after).get(plan_id) or {}).get("status") == "cancelled"
-        # Only a wake-up that checked off no step spends an attempt: the
+        # Only a wake-up that checked off nothing new spends an attempt: the
         # bound is for a loop capped without getting anywhere, not for one
-        # capped while it works through a plan longer than MAX_ATTEMPTS.
-        progressed = rec_after is not None and \
-            rec_after["progress"]["done"] > rec["progress"]["done"]
+        # capped while it works through a plan longer than MAX_ATTEMPTS. New
+        # means past the most this chain has seen checked, so a step checked
+        # and un-checked by turns never counts twice, nor does work checked
+        # off between wake-ups.
+        seen = [n for n in (sched.get("checked_high"), before)
+                if n is not None]
+        checked = _checked_items(goal_dir)
+        progressed = checked is not None and bool(seen) \
+            and checked > max(seen)
+        high = max(seen + ([] if checked is None else [checked]),
+                   default=None)
         next_attempt = 1 if progressed else attempt + 1
         rearm = outcome == "still_limited" and not cancelled \
             and next_attempt <= MAX_ATTEMPTS
@@ -636,7 +679,7 @@ def fire(plan_id, *, project=None, session_id=None, runner=None,
             detail = f"{detail} -- " + (
                 "not re-armed: cancelled while it ran" if cancelled else
                 f"gave up: {MAX_ATTEMPTS} wake-ups in a row checked off "
-                "no step")
+                "nothing new")
         payload = {"action": "fired", "plan_id": plan_id, "attempt": attempt,
                    "outcome": outcome,
                    "detail": str(detail)[:MAX_DETAIL_CHARS]}
@@ -656,8 +699,8 @@ def fire(plan_id, *, project=None, session_id=None, runner=None,
                          cooldown_hours=sched["cooldown_hours"],
                          at=_iso(back + sched["cooldown_hours"] * 3600),
                          attempt=next_attempt, cwd=sched["cwd"],
-                         mode="loop", goal_dir=goal_dir, register=register,
-                         now=now)
+                         mode="loop", goal_dir=goal_dir, checked_high=high,
+                         register=register, now=now)
                 rearmed = True
             except ValueError:
                 pass            # no longer interrupted: nothing to re-arm

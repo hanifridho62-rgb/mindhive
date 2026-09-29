@@ -22,8 +22,8 @@ closes that gap end to end:
   checkpoints progress into THE fabrication roadmap (the fix_plan checklist
   is the source of truth) and re-arms a loop-mode auto-resume, so the cycle
   is loop -> sleep -> loop until the exit gate passes, or until
-  autoresume.MAX_ATTEMPTS wake-ups in a row check off no step. Completion
-  earns the roadmap its exit from every view.
+  autoresume.MAX_ATTEMPTS wake-ups in a row check off nothing new.
+  Completion earns the roadmap its exit from every view.
 
 Lifecycle is three ``fabrication`` events (deterministic telemetry;
 ``roadmap`` events remain the semantic plan, ``loop_*`` the run telemetry):

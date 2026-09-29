@@ -401,6 +401,79 @@ All nine parts built.
 """
 
 
+def _capped_result():
+    from mindhive.loop.driver import DriverResult, Usage
+    return DriverResult(text="", usage=Usage(input_tokens=10),
+                        session_id="s1", num_turns=1, rate_limited=True)
+
+
+def _check_one(text):
+    """The agent checks the next open item off."""
+    return text.replace("- [ ]", "- [x]", 1)
+
+
+def _toggle_first(text):
+    """The agent flaps: it un-checks what it checked, then checks it again."""
+    if "- [x]" in text:
+        return text.replace("- [x]", "- [ ]", 1)
+    return _check_one(text)
+
+
+def _checked(rec):
+    return (Path(rec["goal_dir"]) / "fix_plan.md").read_text(
+        encoding="utf-8").count("- [x]")
+
+
+def _wake_up_chain(monkeypatch, rec, edit, between=None, cap=40):
+    """Launch the fabrication once, then let the OS timer fire every wake-up
+    the chain arms until it ends -- or `cap` wake-ups, for a chain that would
+    not. The launch and every relaunch are the real loop engine, driven by an
+    agent that applies `edit` to fix_plan.md and hits the usage cap.
+    `between(k)` runs before the k-th wake-up: what happens while the loop
+    sleeps. Returns the attempt of every wake-up, and the timers left armed
+    and dropped."""
+    fix_plan = Path(rec["goal_dir"]) / "fix_plan.md"
+    from mindhive.loop import config as loop_config
+    from mindhive.loop import engine as loop_engine
+
+    class EditThenCapped:
+        def run(self, prompt, loop_context, **kw):
+            fix_plan.write_text(edit(fix_plan.read_text(encoding="utf-8")),
+                                encoding="utf-8")
+            return _capped_result()
+
+    def capped_run(plan_id, goal_dir, project):
+        result = loop_engine.run_loop(
+            project="test", loop_dir=goal_dir,
+            cfg=loop_config.LoopConfig(max_iterations=3),
+            driver=EditThenCapped(), now_fn=lambda: T0_EPOCH,
+            sleep_fn=lambda s: None, progress_fn=lambda i: True,
+            plan_id=plan_id)
+        assert result["reason"] == "api_cap"
+        return "still_limited", "loop api_cap"
+
+    armed, gone = [], []
+    monkeypatch.setattr(autoresume, "_register_timer",
+                        lambda plan_id, *a: armed.append(plan_id)
+                        or "windows_task")
+    monkeypatch.setattr(autoresume, "_unregister_timer", gone.append)
+    capped_run(rec["fab_id"], rec["goal_dir"], "test")    # the launch
+    fires = 0
+    while armed and fires < cap:                           # the OS timer
+        if between is not None:
+            between(fires)
+        armed.pop()
+        autoresume.fire(
+            rec["fab_id"], loop_runner=capped_run,
+            runner=lambda *a, **k: pytest.fail("prompt runner must not be "
+                                               "used"))
+        fires += 1
+    attempts = [e.payload["attempt"] for e in events.read_all()
+                if e.type == "autoresume"
+                and e.payload.get("action") == "fired"]
+    return attempts, armed, gone
+
+
 def test_only_wake_ups_that_check_off_no_step_spend_an_attempt(tmp_path,
                                                              monkeypatch):
     """MAX_ATTEMPTS bounds a loop that is capped without getting anywhere, not
@@ -412,54 +485,105 @@ def test_only_wake_ups_that_check_off_no_step_spend_an_attempt(tmp_path,
     7/9 with nothing left to resume it."""
     monkeypatch.chdir(tmp_path)
     rec = fabricate.compile_work_order(PRD_LONG, base_dir=tmp_path)
-    fix_plan = Path(rec["goal_dir"]) / "fix_plan.md"
-    from mindhive.loop import config as loop_config
-    from mindhive.loop import engine as loop_engine
-    from mindhive.loop.driver import DriverResult, Usage
-
-    class OneStepThenCapped:
-        def run(self, prompt, loop_context, **kw):
-            text = fix_plan.read_text(encoding="utf-8")
-            fix_plan.write_text(text.replace("- [ ]", "- [x]", 1),
-                                encoding="utf-8")
-            return DriverResult(text="", usage=Usage(input_tokens=10),
-                                session_id="s1", num_turns=1,
-                                rate_limited=True)
-
-    def capped_run(plan_id, goal_dir, project):
-        result = loop_engine.run_loop(
-            project="test", loop_dir=goal_dir,
-            cfg=loop_config.LoopConfig(max_iterations=3),
-            driver=OneStepThenCapped(), now_fn=lambda: T0_EPOCH,
-            sleep_fn=lambda s: None, progress_fn=lambda i: True,
-            plan_id=plan_id)
-        assert result["reason"] == "api_cap"
-        return "still_limited", "loop api_cap"
-
-    armed, gone = [], []
-    monkeypatch.setattr(autoresume, "_register_timer",
-                        lambda plan_id, *a: armed.append(plan_id)
-                        or "windows_task")
-    monkeypatch.setattr(autoresume, "_unregister_timer", gone.append)
-    capped_run(rec["fab_id"], rec["goal_dir"], "test")   # the launch: step 1
-    fires = 0
-    while armed and fires < 30:                           # the OS timer
-        armed.pop()
-        autoresume.fire(
-            rec["fab_id"], loop_runner=capped_run,
-            runner=lambda *a, **k: pytest.fail("prompt runner must not be "
-                                               "used"))
-        fires += 1
+    attempts, armed, gone = _wake_up_chain(monkeypatch, rec, _check_one)
     evs = events.read_all()
     assert roadmap.get(evs, rec["fab_id"])["progress"] == \
         {"done": 9, "total": 9}
-    # Wake-ups 1-8 each checked a step off and re-armed at attempt 1; the
-    # ninth found nothing left, and from there every wake-up spent one.
-    assert [e.payload["attempt"] for e in evs if e.type == "autoresume"
-            and e.payload.get("action") == "fired"] == \
-        [1] * 9 + list(range(2, autoresume.MAX_ATTEMPTS + 1))
+    # The launch checked step 1 off, wake-ups 1-8 the rest, each re-arming at
+    # attempt 1; the ninth found nothing left, and from there every wake-up
+    # spent one.
+    assert attempts == [1] * 9 + list(range(2, autoresume.MAX_ATTEMPTS + 1))
     assert armed == [] and gone == [rec["fab_id"]]
     assert autoresume.pending(evs) == []
+
+
+def test_a_step_checked_and_unchecked_by_turns_is_not_progress(tmp_path,
+                                                               monkeypatch):
+    """Progress is measured against the most items this chain has ever seen
+    checked, not against where each wake-up began: an agent that checks a
+    step off in one window and un-checks it in the next gets nowhere, and
+    MAX_ATTEMPTS wake-ups end the chain. Measured from each wake-up's start,
+    every second one checked a step off and the chain never ended."""
+    monkeypatch.chdir(tmp_path)
+    rec = fabricate.compile_work_order(PRD_LONG, base_dir=tmp_path)
+    attempts, armed, gone = _wake_up_chain(monkeypatch, rec, _toggle_first)
+    assert attempts == list(range(1, autoresume.MAX_ATTEMPTS + 1))
+    assert armed == [] and gone == [rec["fab_id"]]
+    # Each re-arm carries the mark forward: the one item the launch checked.
+    assert [e.payload.get("checked_high") for e in events.read_all()
+            if e.type == "autoresume"
+            and e.payload.get("action") == "scheduled"] == \
+        [None] + [1] * (autoresume.MAX_ATTEMPTS - 1)
+
+
+def test_an_interactive_session_between_wake_ups_does_not_hide_progress(
+        tmp_path, monkeypatch):
+    """While the loop sleeps, a session can adopt its interrupted plan --
+    re-setting the roadmap steps with its own todos -- and interrupt it again
+    when it ends. The roadmap's done count is then the session's, not the
+    loop's: measured there, no wake-up read as progress and the plan was
+    dropped at 7/9. The loop's own checklist still says how far it got."""
+    monkeypatch.chdir(tmp_path)
+    rec = fabricate.compile_work_order(PRD_LONG, base_dir=tmp_path)
+
+    def between(k):
+        plan = roadmap.get(events.read_all(), rec["fab_id"])
+        roadmap.record(
+            "set", rec["fab_id"], prompt=plan["prompt"],
+            steps=[{"text": s["text"], "status": s["status"]}
+                   for s in plan["steps"]]
+            + [{"text": f"session {k} todo {j}", "status": "done"}
+               for j in (1, 2)])
+        roadmap.record("interrupt", rec["fab_id"], cause="session_end")
+
+    attempts, armed, gone = _wake_up_chain(monkeypatch, rec, _check_one,
+                                           between=between)
+    assert _checked(rec) == 9
+    assert attempts == [1] * 9 + list(range(2, autoresume.MAX_ATTEMPTS + 1))
+    assert armed == [] and gone == [rec["fab_id"]]
+
+
+def test_progress_past_the_roadmap_step_cap_still_counts(tmp_path,
+                                                          monkeypatch):
+    """The roadmap keeps at most MAX_STEPS steps, checked ones first, so past
+    that many checked items its done count stops moving. The checklist keeps
+    counting: a long fabrication whose plan grew is carried to its end."""
+    monkeypatch.chdir(tmp_path)
+    rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
+    (Path(rec["goal_dir"]) / "fix_plan.md").write_text(
+        "# Fix plan\n\n"
+        + "".join(f"- [x] part {i}\n" for i in range(roadmap.MAX_STEPS))
+        + "".join(f"- [ ] extra part {i}\n" for i in range(10)),
+        encoding="utf-8")
+    attempts, armed, gone = _wake_up_chain(monkeypatch, rec, _check_one)
+    assert _checked(rec) == roadmap.MAX_STEPS + 10
+    # The launch checked the first extra part off, wake-ups 1-9 the others.
+    assert attempts == [1] * 10 + list(range(2, autoresume.MAX_ATTEMPTS + 1))
+    assert armed == [] and gone == [rec["fab_id"]]
+
+
+def test_a_checklist_the_wake_up_cannot_read_is_not_progress(tmp_path):
+    """Reading the checklist is best-effort, like everything the wake-up does
+    after the relaunch: one it cannot read counts as no progress, and the
+    wake-up still records its outcome and re-arms."""
+    rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
+    roadmap.record("interrupt", rec["fab_id"], cause="api_cap")
+    autoresume.schedule(rec["fab_id"], mode="loop", goal_dir=rec["goal_dir"],
+                        register=_no_timer, now=T0_EPOCH)
+    fix_plan = Path(rec["goal_dir"]) / "fix_plan.md"
+
+    def loop_runner(plan_id, goal_dir, project):
+        fix_plan.unlink()
+        fix_plan.mkdir()                    # reading it now raises OSError
+        return "still_limited", "loop api_cap"
+
+    payload = autoresume.fire(rec["fab_id"], loop_runner=loop_runner,
+                              register=_no_timer, unregister=lambda p: None,
+                              runner=_no_prompt)
+    assert payload["outcome"] == "still_limited"
+    ar = autoresume.fold(events.read_all())[rec["fab_id"]]
+    assert (ar["status"], ar["attempt"]) == ("scheduled", 2)
+    assert ar["checked_high"] == 0          # what it read before the relaunch
 
 
 def test_loop_mode_fire_relaunches_the_loop(tmp_path):
@@ -811,6 +935,31 @@ def test_autoresume_contract_rejects_bad_mode_payloads():
         autoresume.validate_payload(
             {"action": "scheduled", "plan_id": "x-1",
              "due": "2026-07-18T05:00:00Z", "attempt": 1, "mode": "loop"})
+
+
+def test_autoresume_contract_rejects_a_bad_checked_high():
+    ok = {"action": "scheduled", "plan_id": "x-1",
+          "due": "2026-07-18T05:00:00Z", "attempt": 1}
+    autoresume.validate_payload(dict(ok, checked_high=0))
+    for bad in (-1, True, "3", 2.5):
+        with pytest.raises(ValueError, match="checked_high"):
+            autoresume.validate_payload(dict(ok, checked_high=bad))
+
+
+def test_a_schedule_without_a_checked_high_starts_the_count_over(tmp_path):
+    """The mark belongs to the chain of wake-ups that carried it forward: a
+    schedule without one -- a fresh launch's, a human's -- measures from the
+    checklist as it stands."""
+    rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
+    roadmap.record("interrupt", rec["fab_id"], cause="api_cap")
+    autoresume.schedule(rec["fab_id"], mode="loop", goal_dir=rec["goal_dir"],
+                        register=_no_timer, now=T0_EPOCH, checked_high=3)
+    ar = autoresume.fold(events.read_all())[rec["fab_id"]]
+    assert ar["checked_high"] == 3
+    autoresume.schedule(rec["fab_id"], mode="loop", goal_dir=rec["goal_dir"],
+                        register=_no_timer, now=T0_EPOCH)
+    assert "checked_high" not in \
+        autoresume.fold(events.read_all())[rec["fab_id"]]
 
 
 # --- registry discipline ------------------------------------------------------
