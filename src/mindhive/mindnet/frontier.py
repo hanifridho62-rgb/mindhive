@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/mindnet/frontier.py
 """The wave frontier: which tasks of a folded graph may run now, as a unit.
 

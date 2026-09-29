@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/dashboard_js_core.py
 """The page's runtime: element handles, the real-time engine, the render/paint
 choke points, project scoping and the Overview section.
@@ -278,6 +279,10 @@ JS = """\
   // exactly how the table and the sections drift apart, which is the same
   // reason run() carries a shape rather than a flag plus a lookup.
   const navEl = document.querySelector('nav');
+  // The sticky grid item that holds the nav and the actions group: the
+  // offsetParent both `#navdot` and the buttons resolve against, and the
+  // rail's scrollport. `nav` itself is static and unscrolled since the split.
+  const railEl = document.getElementById('rail');
   const navDot = document.getElementById('navdot');
   function markSection(id){
     let hit = null;
@@ -299,8 +304,9 @@ JS = """\
       panelEl.classList.add('swap');
     }
     if (!hit) return;
-    // offsetTop is read against `nav`, which is the offsetParent because the
-    // sheet gives it `position:relative` for precisely this.
+    // offsetTop is read against `#rail`, the offsetParent: the sheet makes it
+    // sticky (a positioned value) and leaves `nav` static for precisely this,
+    // so the bar, absolutely positioned in the same box, lands on the button.
     navDot.style.height = hit.offsetHeight + 'px';
     navDot.style.translate = '0 ' + hit.offsetTop + 'px';
     navDot.classList.add('lit');
@@ -311,9 +317,9 @@ JS = """\
     // scrollable ancestor: the document is one of those, and the reader's place
     // in a 42000px list is not this function's to move.
     const top = hit.offsetTop, bottom = top + hit.offsetHeight;
-    if (top < navEl.scrollTop) navEl.scrollTop = top;
-    else if (bottom > navEl.scrollTop + navEl.clientHeight)
-      navEl.scrollTop = bottom - navEl.clientHeight;
+    if (top < railEl.scrollTop) railEl.scrollTop = top;
+    else if (bottom > railEl.scrollTop + railEl.clientHeight)
+      railEl.scrollTop = bottom - railEl.clientHeight;
   }
   // --- the rail, and the long list, from the keyboard ------------------------
   // A 26-button rail that only answers the mouse makes the most-repeated action

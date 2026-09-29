@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/rotation/install.py
 """Idempotent registration of the Stop hook in a Claude Code settings.json.
 

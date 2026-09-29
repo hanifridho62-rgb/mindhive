@@ -1,6 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/graph.py
 from __future__ import annotations
 import hashlib
+import logging
 from collections import defaultdict
 from . import events as ev_mod, paths
 
@@ -175,7 +177,17 @@ def build(project=None, semantic: bool = False, _evs=None) -> dict:
     from . import plugins
     _expand_plugin_catalog(plugins.latest_catalog(project), add_node, add_edge)
 
-    # Optional semantic edges (graceful degradation if deps/embeddings absent)
+    # Optional semantic edges: a failure still yields the deterministic graph,
+    # but it is RECORDED -- `semantic_error` in the result and a warning --
+    # because a graph that asked for these edges and silently has none looks
+    # exactly like one whose memos are unrelated. Nothing indexed is not a
+    # failure: `semantic_recall` answers that with no hits.
+    #
+    # All or nothing: the pairs are collected and added only once every query
+    # has answered. A pass that failed half-way kept the edges it had drawn,
+    # under a banner saying there were none -- and graph.json, served to
+    # every later viewer without that banner, kept them too.
+    semantic_error = None
     if semantic:
         try:
             from . import vectors
@@ -183,7 +195,7 @@ def build(project=None, semantic: bool = False, _evs=None) -> dict:
 
             ledger = build_ledger_entries(evs)  # [(fname, content, ev), ...]
             fname_to_evid = {fn: _ev_id(ev) for fn, _c, ev in ledger}
-            seen_sem_pairs: set[tuple[str, str]] = set()
+            seen_sem_pairs: dict[tuple[str, str], None] = {}
             for fn, _c, ev in ledger:
                 src_id = _ev_id(ev)
                 body = ev.payload.get("text", "") if isinstance(ev.payload, dict) else str(ev.payload)
@@ -193,28 +205,37 @@ def build(project=None, semantic: bool = False, _evs=None) -> dict:
                     tgt_id = fname_to_evid.get(hit["file"])
                     if not tgt_id or tgt_id == src_id:
                         continue
-                    pair = tuple(sorted((src_id, tgt_id)))
-                    if pair in seen_sem_pairs:
-                        continue
-                    seen_sem_pairs.add(pair)
-                    add_edge(pair[0], pair[1], "semantic_near", source="INFERRED")
-        except Exception:
-            pass  # deps missing / LIVE_LOCK / not embedded -> deterministic edges only
+                    seen_sem_pairs.setdefault(tuple(sorted((src_id, tgt_id))))
+        except Exception as e:  # deps missing / LIVE_LOCK / unreadable index
+            # Never empty: `str(RuntimeError())` is '', and an empty error is
+            # falsy to the page, which then draws no banner at all.
+            semantic_error = str(e) or type(e).__name__
+            logging.getLogger("mindhive.graph").warning(
+                "graph: semantic edges skipped: %s", semantic_error)
+        else:
+            for a, b in seen_sem_pairs:        # insertion order: first found
+                add_edge(a, b, "semantic_near", source="INFERRED")
 
     result = {
         "version": GRAPH_BUILD_VERSION,
         "nodes": sorted(nodes.values(), key=lambda n: n["id"]),
         "edges": edges,
     }
+    if semantic_error is not None:
+        result["semantic_error"] = semantic_error
 
-    # Persist
+    # Persist -- everything but `semantic_error`. The error belongs to the build
+    # that asked for semantic edges and goes back to that caller; graph.json is
+    # what every later viewer is served, semantic or not, and a failure written
+    # into it would outlive the index that caused it.
     pdir = paths.project_dir(project)
     pdir.mkdir(parents=True, exist_ok=True)
     from . import events as ev_mod2  # canonical_json lives here
     gfile = pdir / "graph.json"
     # Shared writer: the old `graph.json.tmp` was one fixed name two concurrent
     # graph builds would both write and then both rename, publishing a hybrid.
-    paths.write_text_atomic(gfile, ev_mod2.canonical_json(result))
+    paths.write_text_atomic(gfile, ev_mod2.canonical_json(
+        {k: v for k, v in result.items() if k != "semantic_error"}))
 
     return result
 

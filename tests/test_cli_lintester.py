@@ -11,12 +11,14 @@ between looking and doing must be an explicit flag — not a default anybody can
 flip by editing one line.
 
 `test_the_registration_stays_within_the_ratchet` guards the reason this command
-lives in its own module at all: `src/mindhive/__main__.py` is under a
-shrink-only cap in `tests/test_file_size_cap.py`, and the self-registering
+lives in its own module at all: the parser module -- `src/mindhive/__main__.py`
+until the P9 split, `src/mindhive/commands/parsers/__init__.py` since -- is
+under a line cap (`tests/test_commands_reexport.py`), and the self-registering
 pattern is what keeps a new command from eating it.
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -55,7 +57,11 @@ def test_the_parser_carries_the_positional_intent():
 
 
 def test_the_registration_stays_within_the_ratchet():
-    """The whole reason `cli.py` exists rather than 90 more lines in `__main__`."""
+    """The whole reason `cli.py` exists rather than 90 more lines in the parser
+    module. That module was `__main__.py` when this was written; the P9 split
+    moved `_build_parser` to `mindhive.commands.parsers`, so the scan follows
+    the function to whichever file owns it instead of naming one."""
+    import inspect
     import re
 
     from mindhive import review as review_mod
@@ -63,25 +69,41 @@ def test_the_registration_stays_within_the_ratchet():
     # The cap is read out of the one file that owns it rather than copied here.
     # A copy is a second authority, and the two drift the first time somebody
     # lowers the real one.
-    cap_src = (REPO / "tests" / "test_file_size_cap.py").read_text(
+    cap_src = (REPO / "tests" / "test_commands_reexport.py").read_text(
         encoding="utf-8")
-    match = re.search(r'"__main__\.py":\s*(\d+)', cap_src)
-    assert match, "the ratchet entry moved or was renamed"
+    match = re.search(r"^MODULE_CAP\s*=\s*(\d+)", cap_src, re.MULTILINE)
+    assert match, "the commands-module cap moved or was renamed"
 
     # `review._line_count` takes a PATH, not the text. Handing it the whole
     # file body made it raise OSError internally and answer 0, so this half of
     # the ratchet asserted `0 <= 4237` and could never fail -- it was green on
     # a file of any length. Found when the other half went red for real.
-    path = REPO / "src" / "mindhive" / "__main__.py"
-    text = path.read_text(encoding="utf-8")
+    path = Path(inspect.getsourcefile(cli_mod._build_parser))
     cap = int(match.group(1))
     counted = review_mod._line_count(str(path))
     assert counted > 0, "the cap check went vacuous again"
-    assert counted <= cap, f"__main__.py is {counted} lines, cap {cap}"
+    assert counted <= cap, f"{path.name} is {counted} lines, cap {cap}"
 
-    block = [ln for ln in text.splitlines() if "lintester" in ln]
-    assert len(block) <= 4, (
-        f"the command's wiring is leaking back into __main__.py: {block}")
+    # The whole wiring, SUMMED: every module of the parser package, the shim,
+    # and the module that owns `cmd_mindnet_orchestrate` (whose signpost names
+    # this command once, as it did in `__main__.py`). Pre-split the four lines
+    # sat in ONE file against a cap of four -- zero headroom. Capping each file
+    # at four after the split handed the same leak several budgets (a review
+    # planted five in the handler module and four in a sibling parser module
+    # and stayed green), so the cap is on the sum, and it is still four.
+    shim = REPO / "src" / "mindhive" / "__main__.py"
+    handler = Path(inspect.getsourcefile(cli_mod.cmd_mindnet_orchestrate))
+    scanned = sorted({shim, handler, *path.parent.glob("*.py")})
+    assert path in scanned and len(scanned) >= 4, scanned
+    block = {}
+    for f in scanned:
+        hits = [ln for ln in f.read_text(encoding="utf-8").splitlines()
+                if "lintester" in ln]
+        if hits:
+            block[f.name] = hits
+    total = sum(len(v) for v in block.values())
+    assert total <= 4, (
+        f"the command's wiring is leaking back into the parser tree: {block}")
 
 
 def test_the_help_text_names_the_start_flag_without_minting_a_synonym():
@@ -294,6 +316,37 @@ def test_the_json_surface_carries_the_environment_refusal(capsys, monkeypatch):
     assert "before any lane was made" in captured.err
 
 
+@pytest.mark.parametrize("extra", [(), ("--json",)], ids=["plain", "json"])
+def test_the_refusal_line_opens_with_the_gates_fatal_frame_exactly_once(
+        capsys, monkeypatch, extra):
+    """§10.9.2's frame on the front door's refusal, whichever surface was asked
+    for: a wrapper greps ONE string for "this machine refused" and finds it
+    whether `hive lintester` or the gate said so. Read from `environment`,
+    never retyped -- a copy here would pass while the two drifted apart."""
+    from mindhive.orchestrator import environment as env_mod
+
+    detail = "claude auth status: loggedIn=false (authMethod=none)"
+    monkeypatch.setattr(lint_cli, "_preflight", lambda: ("auth", detail))
+    assert _cli("lintester", "make the writer retry", "--execute", *extra) == 3
+    captured = capsys.readouterr()
+    frame = env_mod.FATAL_REFUSAL_FRAME
+    assert captured.err.count(frame) == 1, captured.err
+    # The frame FIRST, as §10.9.2 writes it and as the gate prints it, so one
+    # anchored pattern (`^\[FATAL PREFLIGHT REFUSAL`) finds both refusals.
+    assert captured.err.startswith(
+        f"{frame}lintester: refused before any lane was made -- "), captured.err
+    assert captured.err.startswith(
+        env_mod.refusal_line("lintester", "refused before any lane was made -- ")
+    ), "the front door built its line apart from the gate's formatter"
+    assert "log in" in captured.err
+    # stdout is untouched: nothing on a plain run, the same report on --json.
+    if extra:
+        reason = json.loads(captured.out)["reason"]
+        assert reason == env_mod.describe("auth", detail), reason
+    else:
+        assert captured.out == ""
+
+
 def test_a_dry_run_never_probes_the_machine(monkeypatch):
     """The probe spawns a process; a plan spawns nothing, and must not start."""
     probed = []
@@ -415,6 +468,135 @@ def test_no_gate_leaves_the_validator_unset(monkeypatch):
 def test_a_dry_run_wires_no_gate(monkeypatch):
     seen = _wired(monkeypatch)
     assert seen.get("validator") is None
+
+
+# --- P2: the gate's two refusals, and the flags that stand them down ----------
+
+def test_the_gate_defaults_to_fail_closed_on_both_counts(monkeypatch):
+    """The defaults ARE the feature. A gate wired permissive by default would
+    leave every property `tests/test_orchestrator_gate.py` pins reachable only
+    by a caller who asked for it."""
+    gate = _wired(monkeypatch, "--execute")["validator"]
+    assert gate.allow_untested is False
+    assert gate.immutable_tests is True
+    assert gate.allow_test_edits is False
+
+
+def test_allow_untested_reaches_the_gate(monkeypatch):
+    gate = _wired(monkeypatch, "--execute", "--allow-untested")["validator"]
+    assert gate.allow_untested is True
+
+
+def test_allow_test_edits_reaches_the_gate(monkeypatch):
+    gate = _wired(monkeypatch, "--execute", "--allow-test-edits")["validator"]
+    assert gate.allow_test_edits is True
+
+
+def test_no_immutable_tests_reaches_the_gate(monkeypatch):
+    gate = _wired(monkeypatch, "--execute", "--no-immutable-tests")["validator"]
+    assert gate.immutable_tests is False
+
+
+def test_the_lane_lock_is_held_for_the_mission_and_let_go_after(monkeypatch):
+    """`worktree.LOCK_TESTS` is a module flag because `lintester.py` sits
+    between this front door and `acquire_lanes` and is not edited by this
+    blueprint. A flag left set would then apply to whatever ran next in the
+    same process."""
+    from mindhive.orchestrator import lintester as lint_mod
+    from mindhive.orchestrator import worktree as wt_mod
+
+    during = []
+
+    class Spy(lint_mod.LintesterOrchestrator):
+        def execute_mission(self, intent, dry_run=True, checkpoint_dir=None):
+            during.append(wt_mod.LOCK_TESTS)
+            return _mission(outcome="ok", reason="", environment="", left=())
+
+    monkeypatch.setattr(lint_mod, "LintesterOrchestrator", Spy)
+    monkeypatch.setattr(lint_cli, "_preflight", lambda: ("", ""))
+    monkeypatch.setattr(wt_mod, "LOCK_TESTS", False)
+
+    assert _cli("lintester", "x", "--execute") == 0
+    assert during == [True]
+    assert wt_mod.LOCK_TESTS is False, "the policy outlived its mission"
+
+
+def test_a_dry_run_locks_nothing(monkeypatch):
+    """Nothing runs, so there is nothing to lock — and a plan that chmod-ed
+    the operator's own checkout would be a surprise with no upside."""
+    from mindhive.orchestrator import lintester as lint_mod
+    from mindhive.orchestrator import worktree as wt_mod
+
+    during = []
+
+    class Spy(lint_mod.LintesterOrchestrator):
+        def execute_mission(self, intent, dry_run=True, checkpoint_dir=None):
+            during.append(wt_mod.LOCK_TESTS)
+            return _mission(outcome="dry-run", reason="", environment="",
+                            left=())
+
+    monkeypatch.setattr(lint_mod, "LintesterOrchestrator", Spy)
+    monkeypatch.setattr(wt_mod, "LOCK_TESTS", False)
+    assert _cli("lintester", "x") == 0
+    assert during == [False]
+
+
+def test_allow_test_edits_also_stands_the_chmod_down(monkeypatch):
+    """One flag, both layers. Locking the files a unit was explicitly allowed
+    to edit would make the permission a lie the child has to work around."""
+    from mindhive.orchestrator import lintester as lint_mod
+    from mindhive.orchestrator import worktree as wt_mod
+
+    during = []
+
+    class Spy(lint_mod.LintesterOrchestrator):
+        def execute_mission(self, intent, dry_run=True, checkpoint_dir=None):
+            during.append(wt_mod.LOCK_TESTS)
+            return _mission(outcome="ok", reason="", environment="", left=())
+
+    monkeypatch.setattr(lint_mod, "LintesterOrchestrator", Spy)
+    monkeypatch.setattr(lint_cli, "_preflight", lambda: ("", ""))
+    monkeypatch.setattr(wt_mod, "LOCK_TESTS", False)
+    assert _cli("lintester", "x", "--execute", "--allow-test-edits") == 0
+    assert during == [False]
+
+
+def test_the_report_counts_the_units_nothing_judged(capsys, monkeypatch):
+    """A green mission whose units all passed under `--allow-untested` reads
+    exactly like a tested one. The count is what tells them apart."""
+    from mindhive.orchestrator import lintester as lint_mod
+
+    monkeypatch.setattr(lint_cli, "_preflight", lambda: ("", ""))
+    monkeypatch.setattr(
+        lint_mod.LintesterOrchestrator, "execute_mission",
+        lambda self, intent, dry_run=True, checkpoint_dir=None: _mission(
+            outcome="ok", reason="", environment="", left=(),
+            gates=({"task_id": "t-1", "ok": True, "attempt": 0,
+                    "scope": "untested_override", "targets": [],
+                    "reason": "untested override"},
+                   {"task_id": "t-2", "ok": True, "attempt": 0,
+                    "scope": "untested_override", "targets": [],
+                    "reason": "untested override"},
+                   {"task_id": "t-3", "ok": True, "attempt": 0,
+                    "scope": "targeted", "targets": ["tests/test_x.py"],
+                    "reason": ""})))
+    assert _cli("lintester", "x", "--execute") == 0
+    assert "warning: 2 untested override(s)" in capsys.readouterr().out
+
+
+def test_a_report_with_nothing_overridden_says_nothing(capsys, monkeypatch):
+    from mindhive.orchestrator import lintester as lint_mod
+
+    monkeypatch.setattr(lint_cli, "_preflight", lambda: ("", ""))
+    monkeypatch.setattr(
+        lint_mod.LintesterOrchestrator, "execute_mission",
+        lambda self, intent, dry_run=True, checkpoint_dir=None: _mission(
+            outcome="ok", reason="", environment="", left=(),
+            gates=({"task_id": "t-1", "ok": True, "attempt": 0,
+                    "scope": "targeted", "targets": ["tests/test_x.py"],
+                    "reason": ""},)))
+    assert _cli("lintester", "x", "--execute") == 0
+    assert "untested override" not in capsys.readouterr().out
 
 
 def test_the_plain_report_names_the_gate_and_suite_rows(capsys, monkeypatch):
@@ -568,3 +750,269 @@ def test_a_non_numeric_ceiling_is_a_caller_error_not_a_silent_default():
     with pytest.raises(SystemExit) as exc:
         _cli("lintester", "x", "--memory-mb", "lots")
     assert exc.value.code == 2
+
+
+# --- P2 round 2, review fixes: the lock's other paths, and what --no-gate says ---
+
+def test_a_mission_that_raises_still_lets_the_lock_go(monkeypatch):
+    """The `finally` in `_tests_locked`, exercised: a mission that raises out
+    of `execute_mission` must not leave `LOCK_TESTS` switched on for whatever
+    runs next in this process."""
+    from mindhive.orchestrator import lintester as lint_mod
+    from mindhive.orchestrator import worktree as wt_mod
+
+    during = []
+
+    class Boom(lint_mod.LintesterOrchestrator):
+        def execute_mission(self, intent, dry_run=True, checkpoint_dir=None):
+            during.append(wt_mod.LOCK_TESTS)
+            raise RuntimeError("the mission blew up")
+
+    monkeypatch.setattr(lint_mod, "LintesterOrchestrator", Boom)
+    monkeypatch.setattr(lint_cli, "_preflight", lambda: ("", ""))
+    monkeypatch.setattr(wt_mod, "LOCK_TESTS", False)
+    try:
+        _cli("lintester", "x", "--execute")
+    except RuntimeError:
+        pass
+    assert during == [True]
+    assert wt_mod.LOCK_TESTS is False, "the policy outlived its mission"
+
+
+def test_no_immutable_tests_also_stands_the_chmod_down(monkeypatch):
+    """The third term of `_tests_locked`'s condition: with the check itself
+    switched off there is nothing for the deterrent to deter."""
+    from mindhive.orchestrator import lintester as lint_mod
+    from mindhive.orchestrator import worktree as wt_mod
+
+    during = []
+
+    class Spy(lint_mod.LintesterOrchestrator):
+        def execute_mission(self, intent, dry_run=True, checkpoint_dir=None):
+            during.append(wt_mod.LOCK_TESTS)
+            return _mission(outcome="ok", reason="", environment="", left=())
+
+    monkeypatch.setattr(lint_mod, "LintesterOrchestrator", Spy)
+    monkeypatch.setattr(lint_cli, "_preflight", lambda: ("", ""))
+    monkeypatch.setattr(wt_mod, "LOCK_TESTS", False)
+    assert _cli("lintester", "x", "--execute", "--no-immutable-tests") == 0
+    assert during == [False]
+
+
+def test_the_no_gate_help_says_the_lanes_tests_stay_read_only():
+    """`--no-gate` skips the gate; it does not skip the read-only lock on the
+    lane's tests, which `_tests_locked` decides from `--immutable-tests` and
+    `--allow-test-edits` alone. Help that did not say so would send an
+    operator hunting for why a child in an ungated run cannot edit a test."""
+    parser = _subparser_action(cli_mod._build_parser()).choices["lintester"]
+    helps = {a.dest: str(a.help or "") for a in parser._actions}
+    assert "read-only" in helps["no_gate"], helps["no_gate"]
+    assert "--allow-test-edits" in helps["no_gate"], helps["no_gate"]
+
+
+# --- P8: `--weight-model`, delivered through the environment (blueprint P4/K3) ---
+#
+# `lintester.py` weighs every unit through `metrics.calculate_workload_weight`
+# and names no model, so that call reads `MINDHIVE_WEIGHT_MODEL` at call time.
+# The front door therefore hands the flag over AS that variable for the length
+# of the mission and puts the variable back afterwards; the lanes a mission
+# spawns inherit it. `lintester.py` is not edited by this blueprint (three
+# lines of headroom under the size cap), so the variable is the only door.
+#
+# A REAL dry run weighs only the files a unit's description names by path --
+# `rotate the ledger segment` names none and never reaches the seam (measured
+# on this checkout), which is why the seam tests below name a source file.
+
+WEIGHED_INTENT = "add retry to src/mindhive/events.py"
+
+
+def _model_during(monkeypatch, *argv):
+    """`MINDHIVE_WEIGHT_MODEL` as the mission saw it, with the mission itself
+    replaced: what this pins is the hand-off, not the weighing."""
+    from mindhive.orchestrator import lintester as lint_mod
+    from mindhive.orchestrator import metrics as metrics_mod
+
+    during = []
+
+    class Spy(lint_mod.LintesterOrchestrator):
+        def execute_mission(self, intent, dry_run=True, checkpoint_dir=None):
+            during.append(os.environ.get(metrics_mod.WEIGHT_MODEL_ENV))
+            return _mission(outcome="dry-run", reason="", environment="",
+                            left=(), dry_run=True)
+
+    monkeypatch.setattr(lint_mod, "LintesterOrchestrator", Spy)
+    assert _cli("lintester", "x", *argv) == 0
+    assert during, "the mission never ran, so nothing was observed"
+    return during[0]
+
+
+def _report(monkeypatch, *argv):
+    """``(stdout, status)`` of a dry run whose mission is replaced, so the
+    report's own lines can be read without weighing anything."""
+    from mindhive.orchestrator import lintester as lint_mod
+
+    class Spy(lint_mod.LintesterOrchestrator):
+        def execute_mission(self, intent, dry_run=True, checkpoint_dir=None):
+            return _mission(outcome="dry-run", reason="", environment="",
+                            left=(), dry_run=True)
+
+    monkeypatch.setattr(lint_mod, "LintesterOrchestrator", Spy)
+    return _cli("lintester", "x", *argv)
+
+
+def test_the_flag_takes_exactly_the_models_metrics_knows_and_defaults_to_none():
+    """`choices=` is read off the one constant, never retyped, and the default
+    is None -- absent, not `log_linear` -- so an operator's exported
+    `MINDHIVE_WEIGHT_MODEL` still decides when the flag is not typed."""
+    from mindhive.orchestrator import metrics as metrics_mod
+
+    parser = _subparser_action(cli_mod._build_parser()).choices["lintester"]
+    (action,) = [a for a in parser._actions
+                 if "--weight-model" in a.option_strings]
+    assert tuple(action.choices) == metrics_mod.WEIGHT_MODELS
+    assert action.default is None
+    assert metrics_mod.WEIGHT_MODEL_ENV in str(action.help), action.help
+    with pytest.raises(SystemExit) as exc:
+        _cli("lintester", "x", "--weight-model", "cubic")
+    assert exc.value.code == 2
+
+
+def test_the_flag_sets_the_variable_for_the_mission_and_unsets_it_after(
+        monkeypatch):
+    from mindhive.orchestrator import metrics as metrics_mod
+
+    monkeypatch.delenv(metrics_mod.WEIGHT_MODEL_ENV, raising=False)
+    assert _model_during(monkeypatch, "--weight-model", "linear") == "linear"
+    assert metrics_mod.WEIGHT_MODEL_ENV not in os.environ, (
+        "the variable outlived the mission")
+
+
+def test_the_flag_restores_the_value_the_operator_had_exported(monkeypatch):
+    from mindhive.orchestrator import metrics as metrics_mod
+
+    monkeypatch.setenv(metrics_mod.WEIGHT_MODEL_ENV, "linear")
+    assert _model_during(monkeypatch, "--weight-model", "log_linear") \
+        == "log_linear"
+    assert os.environ[metrics_mod.WEIGHT_MODEL_ENV] == "linear"
+
+
+@pytest.mark.parametrize("exported", [None, "linear"], ids=["unset", "exported"])
+def test_no_flag_leaves_the_variable_exactly_as_it_was(monkeypatch, exported):
+    """The default is ABSENCE. A default of `log_linear` written into the
+    environment would silently overrule an operator's own export."""
+    from mindhive.orchestrator import metrics as metrics_mod
+
+    if exported is None:
+        monkeypatch.delenv(metrics_mod.WEIGHT_MODEL_ENV, raising=False)
+    else:
+        monkeypatch.setenv(metrics_mod.WEIGHT_MODEL_ENV, exported)
+    assert _model_during(monkeypatch) == exported
+    assert os.environ.get(metrics_mod.WEIGHT_MODEL_ENV) == exported
+
+
+def test_a_mission_that_raises_still_puts_the_variable_back(monkeypatch):
+    """The `finally`, exercised: whatever runs next in this process must not
+    inherit a model it never asked for."""
+    from mindhive.orchestrator import lintester as lint_mod
+    from mindhive.orchestrator import metrics as metrics_mod
+
+    monkeypatch.setenv(metrics_mod.WEIGHT_MODEL_ENV, "linear")
+
+    class Boom(lint_mod.LintesterOrchestrator):
+        def execute_mission(self, intent, dry_run=True, checkpoint_dir=None):
+            raise RuntimeError("the mission blew up")
+
+    monkeypatch.setattr(lint_mod, "LintesterOrchestrator", Boom)
+    with pytest.raises(RuntimeError):
+        _cli("lintester", "x", "--weight-model", "log_linear")
+    assert os.environ[metrics_mod.WEIGHT_MODEL_ENV] == "linear"
+
+
+@pytest.mark.parametrize("model", ["linear", "log_linear"])
+def test_the_model_reaches_the_metrics_seam_on_a_real_dry_run(monkeypatch,
+                                                              model):
+    """Not the hand-off but the weighing: a real dry-run mission, with
+    `metrics.calculate_workload_weight` wrapped so every `Weight` it answers
+    is recorded. The variable is exported to the OTHER model first, so a
+    flag that merely failed to overrule it shows up as the wrong model; and
+    the canary is that the seam was reached at all."""
+    from mindhive.orchestrator import metrics as metrics_mod
+
+    other = next(m for m in metrics_mod.WEIGHT_MODELS if m != model)
+    monkeypatch.setenv(metrics_mod.WEIGHT_MODEL_ENV, other)
+    seen = []
+    real = metrics_mod.calculate_workload_weight
+
+    def spy(*a, **kw):
+        weight = real(*a, **kw)
+        seen.append(weight.model)
+        return weight
+
+    monkeypatch.setattr(metrics_mod, "calculate_workload_weight", spy)
+    assert _cli("lintester", WEIGHED_INTENT, "--weight-model", model) == 0
+    assert seen, "the dry run weighed no file, so this proves nothing"
+    assert set(seen) == {model}, seen
+
+
+def test_the_two_models_weigh_the_same_unit_differently(monkeypatch, capsys):
+    """The visible effect, in the report itself: `linear` is the three-term
+    sum and `log_linear` a clamped logarithm, so on a real module they cannot
+    agree. A flag the mission never read would print the same weights twice."""
+    from mindhive.orchestrator import metrics as metrics_mod
+
+    monkeypatch.delenv(metrics_mod.WEIGHT_MODEL_ENV, raising=False)
+    weights = {}
+    for model in metrics_mod.WEIGHT_MODELS:
+        assert _cli("lintester", WEIGHED_INTENT, "--json",
+                    "--weight-model", model) == 0
+        payload = json.loads(capsys.readouterr().out)
+        weights[model] = max(t["weight"] for t in payload["tasks"])
+    assert weights["linear"] > weights["log_linear"], weights
+
+
+def test_the_report_names_the_model_in_effect(monkeypatch, capsys):
+    """The same way the report names its fencing and its lane quota: a key on
+    the JSON surface and a line on the plain one."""
+    from mindhive.orchestrator import metrics as metrics_mod
+
+    monkeypatch.delenv(metrics_mod.WEIGHT_MODEL_ENV, raising=False)
+    assert _report(monkeypatch, "--json", "--weight-model", "linear") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["weight_model"] == "linear"
+    assert payload["weight_model_reason"] == ""
+    assert _report(monkeypatch, "--weight-model", "linear") == 0
+    assert "weight model: linear" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("exported,expect", [(None, None), ("linear", "linear")],
+                         ids=["unset-default", "exported"])
+def test_without_the_flag_the_report_names_what_really_answered(
+        monkeypatch, capsys, exported, expect):
+    from mindhive.orchestrator import metrics as metrics_mod
+
+    if exported is None:
+        monkeypatch.delenv(metrics_mod.WEIGHT_MODEL_ENV, raising=False)
+    else:
+        monkeypatch.setenv(metrics_mod.WEIGHT_MODEL_ENV, exported)
+    assert _report(monkeypatch, "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["weight_model"] == (expect or metrics_mod.DEFAULT_WEIGHT_MODEL)
+
+
+def test_an_unknown_exported_model_is_reported_rather_than_hidden(monkeypatch,
+                                                                  capsys):
+    """`metrics` falls back to the default on a name it does not know and says
+    so on the `Weight`; the report carries that sentence, because a
+    misconfiguration behind a plausible number is the failure it exists to
+    name."""
+    from mindhive.orchestrator import metrics as metrics_mod
+
+    monkeypatch.setenv(metrics_mod.WEIGHT_MODEL_ENV, "cubic")
+    assert _report(monkeypatch, "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["weight_model"] == metrics_mod.DEFAULT_WEIGHT_MODEL
+    assert "cubic" in payload["weight_model_reason"]
+    assert _report(monkeypatch) == 0
+    out = capsys.readouterr().out
+    assert f"weight model: {metrics_mod.DEFAULT_WEIGHT_MODEL}" in out
+    assert "cubic" in out

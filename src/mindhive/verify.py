@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/verify.py
 """Mechanical test-run records: the evidence a "the suite is green" claim can
 be checked against.
@@ -53,6 +54,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 from . import events as ev_mod
@@ -64,6 +66,10 @@ VERIFIED_BY = "python"
 # answers for a child that outlived its timeout, so a killed suite and a killed
 # child read alike wherever both are reported.
 TIMEOUT_EXIT = 124
+# How often the caller looks in on the drain thread. Small enough that the cap's
+# drain grace is honoured closely, large enough that a four-minute suite costs
+# wakeups rather than a spin.
+_DRAIN_POLL_S = 0.2
 
 # The payload keys this module writes itself. `extra` may add to a payload; it
 # may not stand in for any of these, or the stamp would be forgeable through
@@ -155,17 +161,36 @@ def _stream(argv, echo: bool, emit=None, env=None, cwd=None, timeout_s=None):
     *env* replaces the child's environment wholesale when given, and ``None``
     means inherit. The caller builds it — `selftest` points `PYTHONPATH` at the
     checkout under test — because this function knows nothing about which
-    source tree the command is meant to import.
+    source tree the command is meant to import. Either way the child gets
+    ``PYTHONDONTWRITEBYTECODE=1`` unless a value was already chosen
+    (`paths.no_bytecode_env`): a suite run must not leave `__pycache__` in the
+    tree it judged.
 
     *cwd* is where the command runs; ``None`` means here. *timeout_s* arms a
-    kill: past it the child is killed, the loop drains what it wrote, and the
-    run answers `TIMEOUT_EXIT` with the cap named in *error*. Known limit:
-    `Popen.kill` reaches the child alone, so a grandchild that inherited the
-    pipe can hold the read open past the cap. Recorded here, not hidden.
+    kill: past it the child's WHOLE TREE is killed
+    (`orchestrator.driver.terminate_process_tree`; the child heads its own
+    process group and is held for that), the loop drains what it wrote, and the
+    run answers `TIMEOUT_EXIT` with the cap named in *error*. It used to be
+    `Popen.kill`, which reaches the child alone: a grandchild that inherited the
+    pipe held the read open past the cap (blueprint Bug 16). Heading its own
+    group also takes the child out of the console's Ctrl+C group on Windows, so
+    any other exit from the drain -- an interrupt included -- ends the tree here
+    first.
+
+    *error* says what the cap ACTUALLY did. "killed at the Ns cap" is claimed
+    only when the kill reports having taken the tree; a cap that could not reach
+    it says so, and one that gave up on the read says that too. This string is
+    recorded in a `verification` event under ``verified_by="python"``, so it is
+    held to the same standard as any other mechanical claim -- and it was
+    measured asserting a kill that never happened.
 
     Line-streamed rather than captured wholesale so a four-minute suite still
     prints as it goes; the buffer is what becomes the artifact. argv list only
     — `shell=True` appears nowhere in this module and a test pins that."""
+    # What runs here is a test suite, and in a lane the tests are an agent's:
+    # it gets an agent's environment, without the SOP process token (P1d).
+    from . import advice as authorship
+    from .orchestrator import driver        # lazy: that package imports this module
     chunks: list[str] = []
     kept = 0
     try:
@@ -176,34 +201,92 @@ def _stream(argv, echo: bool, emit=None, env=None, cwd=None, timeout_s=None):
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=env,
+            env=driver.no_bytecode_env(authorship.scrub_agent_env(env)),
             cwd=str(cwd) if cwd else None,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            **driver.isolation_kwargs(),
         )
     except (OSError, ValueError) as e:
         # A missing program is a real, recordable outcome — not a crash for the
         # caller to handle. 127 is the shell convention for "not found".
         return 127, "", f"{type(e).__name__}: {e}"
+    # Held, so the kill still reaches the tree once the direct child has gone:
+    # an orphaned grandchild on the inherited pipe used to defeat the cap outright.
+    driver.hold_tree(proc)
     killed: list = []
     timer = None
     if timeout_s:
         def _kill():
-            killed.append(1)
-            try:
-                proc.kill()
-            except OSError:                     # pragma: no cover - already gone
-                pass
+            killed.append(driver.terminate_process_tree(proc))   # total: it never raises
         timer = threading.Timer(float(timeout_s), _kill)
         timer.daemon = True
         timer.start()
+    abandoned = False
     try:
-        code = _drain(proc, chunks, kept, emit, echo)
+        code, abandoned = _drain_bounded(proc, chunks, kept, emit, echo, killed)
+    except BaseException:
+        # Nothing else will end a child that left the console's Ctrl+C group.
+        driver.terminate_process_tree(proc)
+        driver.reap(proc)
+        raise
     finally:
         if timer is not None:
             timer.cancel()
+        driver.release_tree(proc)
     if killed:
-        return TIMEOUT_EXIT, "".join(chunks), f"killed at the {timeout_s}s cap"
+        return TIMEOUT_EXIT, "".join(chunks), _cap_error(timeout_s, killed[0], abandoned)
     return code, "".join(chunks), ""
+
+
+def _drain_bounded(proc, chunks, kept, emit, echo, killed) -> tuple:
+    """`_drain` on a daemon thread, so the read cannot outlive the cap. Answers
+    ``(exit_code, abandoned)``.
+
+    ``for line in proc.stdout`` ends at EOF, and EOF is when the LAST holder of
+    the write end lets go -- a descendant the kill could not reach holds it for
+    as long as it lives, and `hive selftest` runs with ``timeout_s=None``, so
+    nothing else bounds this. Once the cap has fired the read gets
+    `driver.DRAIN_GRACE_S` more and is then abandoned; the thread is a daemon,
+    and the job close in the caller's `finally` is what releases it.
+
+    Whatever `_drain` raised is re-raised HERE, on the caller's thread, so the
+    interrupt path above still ends the tree before it propagates."""
+    from .orchestrator import driver        # lazy: that package imports this module
+    done: dict = {}
+
+    def _body():
+        try:
+            done["code"] = _drain(proc, chunks, kept, emit, echo)
+        except BaseException as exc:        # noqa: BLE001 -- re-raised on the caller's thread
+            done["raised"] = exc
+
+    worker = threading.Thread(target=_body, name="hive-verify-drain", daemon=True)
+    worker.start()
+    deadline = None
+    while worker.is_alive():
+        worker.join(_DRAIN_POLL_S)
+        if not killed:
+            continue
+        if deadline is None:
+            deadline = time.monotonic() + driver.DRAIN_GRACE_S
+        elif time.monotonic() > deadline:
+            return TIMEOUT_EXIT, True
+    raised = done.get("raised")
+    if raised is not None:
+        raise raised
+    return done.get("code", TIMEOUT_EXIT), False
+
+
+def _cap_error(timeout_s, kill, abandoned: bool) -> str:
+    """What the cap may honestly say it did (see `_stream`)."""
+    from .orchestrator import driver        # lazy: that package imports this module
+    if kill is None or kill.took_the_tree:
+        said = f"killed at the {timeout_s}s cap"
+    else:
+        said = f"the {timeout_s}s cap fired but the tree was not taken: {kill.reason}"
+    if abandoned:
+        said += (f"; the read was abandoned after a further {driver.DRAIN_GRACE_S}s "
+                 f"and the output above may be short")
+    return said
 
 
 def _drain(proc, chunks, kept, emit, echo) -> int:

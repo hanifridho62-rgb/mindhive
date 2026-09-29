@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/loop/context.py
 """The smart zone: how much context a session is carrying, and whether that has
 left the band where the model still does its best work.

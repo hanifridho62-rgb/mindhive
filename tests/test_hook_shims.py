@@ -608,13 +608,42 @@ def test_a_shim_declares_the_posix_shell(name):
     assert first == "#!/bin/sh", f"{name}.sh opens with {first!r}"
 
 
+# Constructs `#!/bin/sh` does not promise. `sh` is dash on Debian and Ubuntu,
+# which is where the ubuntu CI legs run, and each of these is bash-only or left
+# unspecified by POSIX. `((` is the arithmetic COMMAND; `$((`, arithmetic
+# EXPANSION, is POSIX and `lib.sh`'s walk counter uses it, so `bashisms_in`
+# reads past it rather than reporting it.
+BASHISMS = ("[[ ", "((", "local ", "source ", "<<<", "=~", "echo -e")
+
+
+def bashisms_in(lines) -> list:
+    """Which of `BASHISMS` appear in *lines*, in the tuple's order."""
+    text = "\n".join(lines).replace("$((", "")
+    return [bad for bad in BASHISMS if bad in text]
+
+
 @pytest.mark.parametrize("name", sorted(STAGE))
 def test_a_shim_carries_no_bashism_this_suite_knows_about(name):
-    """Cheap static sweep. `#!/bin/sh` is dash on Debian and Ubuntu, which is
-    where the ubuntu CI legs run, and every construct below is bash-only."""
-    text = "\n".join(code_lines(f"{name}.sh"))
-    for bad in ("[[ ", "((", "local ", "source ", "<<<", "=~", "echo -e"):
-        assert bad not in text, f"{name}.sh uses the bashism {bad!r}"
+    """Cheap static sweep over each shim's code lines."""
+    assert bashisms_in(code_lines(f"{name}.sh")) == [], f"{name}.sh"
+
+
+def test_the_library_carries_no_bashism_this_suite_knows_about():
+    """The same sweep over `lib.sh`, which every shim sources and which the
+    per-shim sweep above never reads: `NOT_A_SHIM` keeps it out of `STAGE`.
+    It is where the family's shared code lives -- `extract_json_field`
+    included -- so a bashism here reaches all nine hooks at once."""
+    assert bashisms_in(code_lines("lib.sh")) == []
+
+
+def test_the_bashism_sweep_reports_what_it_names_and_passes_posix_arithmetic():
+    """CANARY for the two sweeps above. Their silence means something only if
+    the sweep can speak: it must report `local` and the `((` command, and it
+    must pass `$((...))`, or the library -- which counts its walk with one --
+    could never be swept at all."""
+    assert bashisms_in(["f() {", "    local x=1", "    (( x++ ))", "}"]) == [
+        "((", "local "]
+    assert bashisms_in(["_mh_n=$((_mh_n + 1))"]) == []
 
 
 @sh_missing
@@ -1626,9 +1655,10 @@ def test_an_unusable_session_id_becomes_unknown(payload, fake_python):
     "abc\nzzz", "warning: site\nsh-test-1", " sh-test-1", "sh-test-1 extra",
 ], ids=["two-lines", "warning-first", "leading-space", "trailing-word"])
 def test_a_chatty_interpreter_cannot_smuggle_a_session_id(tmp_path, chatter):
-    """The whitelist inside the `-c` program holds only if the interpreter
-    printed nothing else. A `sitecustomize` line or a warning on stdout would
-    otherwise become the id, so the shell re-checks whatever came back."""
+    """The shell whitelist in `mindhive_session_id` judges what the
+    interpreter PRINTED, not what the payload held. A `sitecustomize` line or a
+    warning on stdout would otherwise become the id, so whatever comes back
+    through `extract_json_field` is checked in the shell, whole."""
     exe = tmp_path / "chatty"
     exe.write_text("#!/bin/sh\nprintf '%s\\n' \"$CHATTER\"\n",
                    encoding="utf-8", newline="\n")
@@ -1701,3 +1731,455 @@ def test_the_capture_hook_really_appends_an_event(tmp_path):
     assert written, f"no event was appended; stderr was {got.stderr!r}"
     body = "\n".join(p.read_text(encoding="utf-8") for p in written)
     assert "sh-test-1" in body
+
+
+# --- extract_json_field: JSON without jq (MEB HOOK-01, spec Bug 10) ------------
+#
+# The spec's Bug 10 is a `jq` call that fails SILENTLY wherever `jq` is not
+# installed -- this machine included (TODOS item 14). MEB HOOK-01's answer is
+# `extract_json_field <py> <field> <json>`: the payload goes to the resolved
+# interpreter's stdin and one top-level value comes back, or nothing, with rc 0
+# either way, because a hook that exits non-zero is a hook Claude Code reports
+# as failed. `mindhive_session_id` reads the id through it and keeps its own
+# whitelist on whatever comes back.
+#
+# Every probe hands the helper `sys.executable`: the helper takes its
+# interpreter as an argument, and finding one is `mindhive_python`'s job,
+# pinned above.
+
+_SOURCE_LIB = f'. "{(HOOKS / "lib.sh").as_posix()}"; '
+_PY = _sh_quote(sys.executable)
+SESSION_ABC = '{"session_id":"abc"}'
+
+
+def _field_probe(field, raw) -> str:
+    """A probe script that reads *field* out of *raw* the way a shim would --
+    interpreter, field, payload, captured by `$(...)` -- and prints
+    `[<value>] rc=<status>`. `rc=$?` after `got=$(...)` is the substitution's
+    own status, which POSIX gives an assignment that has no command name."""
+    return (_SOURCE_LIB
+            + f"got=$(extract_json_field {_PY} {_sh_quote(field)} {_sh_quote(raw)}); "
+            + 'rc=$?; printf "[%s] rc=%s\\n" "$got" "$rc"')
+
+
+def _jq_trap(tmp_path):
+    """A `jq` first on PATH that records each call and answers `abc`, the value
+    every probe below asks for. An implementation leaning on jq therefore gets
+    the RIGHT answer from it -- here, and on a CI image that ships a real jq
+    alike -- so only the record can tell. Answers `(path, log)`."""
+    bindir = tmp_path / "jqbin"
+    bindir.mkdir()
+    log = tmp_path / "jq.log"
+    jq = bindir / "jq"
+    jq.write_text("#!/bin/sh\n"
+                  f"printf 'jq %s\\n' \"$*\" >> '{log.as_posix()}'\n"
+                  "cat >/dev/null\n"
+                  "printf 'abc\\n'\n",
+                  encoding="utf-8", newline="\n")
+    jq.chmod(0o755)
+    return os.pathsep.join([str(bindir), os.environ.get("PATH", "")]), log
+
+
+@sh_missing
+@pytest.mark.parametrize("field, raw, value", [
+    ("session_id", SESSION_ABC, "abc"),
+    ("tool_name", '{"session_id": "abc", "tool_name": "Bash", "cwd": "/x"}', "Bash"),
+], ids=["session-id", "named-field"])
+def test_extract_json_field_answers_the_named_top_level_string(field, raw, value):
+    """The MEB contract's own example, `'{"session_id":"abc"}'` -> `abc`: the
+    bare value, with no JSON quotes around it and rc 0. `named-field` asks for
+    a key that is neither first nor `session_id`, so a helper that ignored its
+    `<field>` argument, or answered the first value it met, prints the wrong
+    string."""
+    got = probe(_field_probe(field, raw))
+    assert got.stderr == "", got.stderr
+    assert got.stdout == f"[{value}] rc=0\n", got.stdout
+
+
+@sh_missing
+@pytest.mark.parametrize("raw", [
+    '{"session_id": "abc"',
+    '{"session_id": "abc"} and then prose',
+    "not json at all",
+    "",
+], ids=["truncated", "trailing-garbage", "prose", "empty"])
+def test_extract_json_field_answers_nothing_with_rc_0_for_corrupt_json(raw):
+    """Corrupt JSON is no value, not a failure: the hook that asked still exits
+    0. `truncated` and `trailing-garbage` each carry a well-formed
+    `"session_id": "abc"` pair, so a pattern match over the text -- the
+    approach this library's own commentary calls wrong the first time a value
+    carries an escaped quote -- answers `abc` where a parser answers nothing."""
+    got = probe(_field_probe("session_id", raw))
+    assert got.stderr == "", got.stderr
+    assert got.stdout == "[] rc=0\n", got.stdout
+
+
+@sh_missing
+@pytest.mark.parametrize("raw", [
+    '[{"session_id": "abc"}]',
+    '{"other": "session_id"}',
+    '{"nested": {"session_id": "abc"}}',
+    '{"session_id": null}',
+], ids=["array", "missing", "nested-only", "null"])
+def test_extract_json_field_answers_nothing_with_rc_0_without_a_top_level_value(raw):
+    """Well-formed JSON with no top-level value under the key. `array` and
+    `nested-only` hide a `session_id` one level down and `missing` carries the
+    key's NAME as a value, so a search through the document, rather than a
+    lookup on its top level, answers `abc` or `session_id` for them. `null` is
+    the MEB's own `val is not None` branch: nothing, not the text `None`."""
+    got = probe(_field_probe("session_id", raw))
+    assert got.stderr == "", got.stderr
+    assert got.stdout == "[] rc=0\n", got.stdout
+
+
+@sh_missing
+def test_extract_json_field_round_trips_spaces_quotes_and_unicode():
+    """A string value comes back byte for byte, every hazard a shell adds
+    included: doubled, leading and trailing spaces (a capture keeps them, only
+    trailing newlines go); an escaped double quote and a single quote; a
+    literal `$HOME`; a backslash, which dash's `echo` would read as an escape
+    where `printf '%s'` does not; and non-ASCII twice over, as JSON escapes and
+    as raw UTF-8, both of which must come back as the same bytes. A pattern
+    match hands the escapes back as written, a trim or a word split loses the
+    spaces, and a payload spliced into program text rather than piped to stdin
+    breaks on the quote.
+
+    The comparison is made INSIDE the shell, on bytes, and reports `SAME` or
+    the bytes that came back, so the test process's own decoding of the
+    child's stdout (cp1252 on this machine) takes no part in it.
+
+    The payload and the expected value reach the shell through its
+    environment, the way a shim holds its payload in a variable, and not
+    through the script text. On Windows `subprocess` joins argv into one
+    command line and the MSYS runtime splits it back for Git Bash's `sh`,
+    reading a doubled backslash inside a quoted argument as a single one:
+    spliced into the script, the JSON escape for the backslash in `C:\\new`
+    arrived as `\\n`, a newline (measured). A hook's payload comes in on stdin
+    and never meets that layer.
+
+    `PYTHONIOENCODING=utf-8` pins the interpreter's stdio to what every POSIX
+    locale gives Python 3.7+ (PEP 538/540) and what this machine's own
+    environment sets. Unset, a Windows pipe speaks the ANSI code page:
+    `sys.stdout.write` raises on the CJK characters inside the helper's `try`
+    and the answer is nothing, rc 0 (measured) -- the next test's contract,
+    not a round trip."""
+    raw = ('{"v": "  two  spaces, \\"quoted\\", it\'s $HOME, C:\\\\new, '
+           'caf\\u00e9 = café, \\u65e5\\u672c = 日本  "}')
+    want = '  two  spaces, "quoted", it\'s $HOME, C:\\new, café = café, 日本 = 日本  '
+    script = (_SOURCE_LIB
+              + f'got=$(extract_json_field {_PY} v "$MH_RAW"); rc=$?; '
+              + 'if [ "$got" = "$MH_WANT" ]; then echo "SAME rc=$rc"; '
+              + 'else printf "DIFF rc=%s:" "$rc"; printf "%s" "$got" | od -An -tx1; fi')
+    got = probe(script, env={"PYTHONIOENCODING": "utf-8",
+                             "MH_RAW": raw, "MH_WANT": want})
+    assert got.stderr == "", got.stderr
+    assert got.stdout.strip() == "SAME rc=0", got.stdout
+
+
+@sh_missing
+def test_extract_json_field_answers_nothing_for_a_value_it_cannot_write():
+    """A value the interpreter's stdout cannot encode is no value: nothing,
+    rc 0, and no traceback on the hook's stderr -- never a `?`-mangled or
+    re-escaped string a caller would take for the real one.
+    `PYTHONIOENCODING=ascii` makes `café` unwritable on every platform, and the
+    payload itself is pure ASCII (`\\u00e9`), so it is the WRITE that fails,
+    inside the helper's `try`, and not the read."""
+    got = probe(_field_probe("v", '{"v": "caf\\u00e9"}'),
+                env={"PYTHONIOENCODING": "ascii"})
+    assert got.stderr == "", got.stderr
+    assert got.stdout == "[] rc=0\n", got.stdout
+
+
+# A field name built to close the `get('` it would be spliced into and run a
+# statement of its own, one that leaves `PWNED` in the working directory.
+HOSTILE_FIELD = "x'); open('PWNED','w').close() #"
+
+
+def _probe_in(cwd, script):
+    """`probe`, run from *cwd*, which the helper's interpreter inherits: a
+    statement that creates a relative file creates it there, never in the
+    checkout."""
+    child = dict(os.environ)
+    for key in ("MINDHIVE_PYTHON", "MINDHIVE_HOOK_WALK_LIMIT", "MINDHIVE_HEADLESS"):
+        child.pop(key, None)
+    return subprocess.run([SH, "-c", script], capture_output=True, text=True,
+                          shell=False, cwd=str(cwd), env=child, timeout=30)
+
+
+@sh_missing
+def test_extract_json_field_never_runs_a_field_name_as_code(tmp_path):
+    """The field name is data. Spliced into the program the way the MEB's text
+    does it (`data.get('$field_name', '')`), `HOSTILE_FIELD` ends the string
+    and runs `open('PWNED','w')` -- and the helper still prints nothing and
+    exits 0, so the marker file is the only witness. Handed over as an
+    argument, it is only an odd key: absent, so nothing, rc 0."""
+    got = _probe_in(tmp_path, _field_probe(HOSTILE_FIELD, SESSION_ABC))
+    assert got.stderr == "", got.stderr
+    assert got.stdout == "[] rc=0\n", got.stdout
+    assert not (tmp_path / "PWNED").exists(), "the field name ran as code"
+
+
+@sh_missing
+def test_the_pwned_marker_records_a_field_name_spliced_into_the_program(tmp_path):
+    """CANARY for the test above. A helper that splices `<field>` the MEB's
+    way, run on the same name from the same directory, must leave the marker
+    behind -- so its absence above means the name never ran, not that the
+    statement could not have created the file there."""
+    spliced = ("extract_json_field() { printf '%s' \"$3\" | \"$1\" -c "
+               "\"import sys, json; data = json.load(sys.stdin); "
+               "val = data.get('$2', '')\" 2>/dev/null; }; ")
+    got = _probe_in(tmp_path, _SOURCE_LIB + spliced
+                    + f"extract_json_field {_PY} {_sh_quote(HOSTILE_FIELD)} "
+                    + _sh_quote(SESSION_ABC))
+    assert got.returncode == 0, got.stderr
+    assert (tmp_path / "PWNED").exists(), (got.stdout, got.stderr)
+
+
+@sh_missing
+def test_neither_json_reader_in_the_library_runs_jq(tmp_path):
+    """Bug 10's defect is a DEPENDENCY, not a wrong answer. Where `jq` is
+    missing -- this machine, a stock Windows box -- a jq-based read fails in
+    silence; where it is installed, as on the ubuntu CI image, it answers
+    correctly and hides the dependency. So both readers run with a recording
+    `jq` first on PATH, and the assertion is that nothing called it."""
+    path, log = _jq_trap(tmp_path)
+    script = (_SOURCE_LIB
+              + f"printf '[%s]\\n' \"$(extract_json_field {_PY} session_id "
+              + f"{_sh_quote(SESSION_ABC)})\"; "
+              + f"mindhive_session_id {_PY} {_sh_quote(SESSION_ABC)}")
+    got = probe(script, env={"PATH": path})
+    assert got.stderr == "", got.stderr
+    assert got.stdout.split() == ["[abc]", "abc"], got.stdout
+    assert not log.exists(), "jq was called: " + log.read_text(encoding="utf-8")
+
+
+@sh_missing
+def test_the_jq_trap_records_a_jq_based_extract_json_field(tmp_path):
+    """CANARY for the test above. The same trap, with `extract_json_field`
+    replaced by the shape spec 10.14.3 retires -- `jq -r '.<field> // empty'`
+    -- must record the call. Without it, a trap `sh` never reached (a PATH it
+    did not read, a stub it could not run) would leave the log empty for every
+    implementation and the test above green by construction. The value that
+    comes back is the RIGHT one, which is why the log and not the answer is
+    what the test above asserts."""
+    path, log = _jq_trap(tmp_path)
+    script = (_SOURCE_LIB
+              + 'extract_json_field() { printf "%s" "$3" | jq -r ".$2 // empty"; }; '
+              + f"printf '[%s]\\n' \"$(extract_json_field {_PY} session_id "
+              + f"{_sh_quote(SESSION_ABC)})\"")
+    got = probe(script, env={"PATH": path})
+    assert got.stdout.split() == ["[abc]"], (got.stdout, got.stderr)
+    assert log.exists(), "the recording jq never ran, so its silence proves nothing"
+    assert log.read_text(encoding="utf-8").splitlines() == ["jq -r .session_id // empty"]
+
+
+@sh_missing
+def test_mindhive_session_id_reads_the_id_through_extract_json_field(tmp_path):
+    """The plan's wiring, asserted: `mindhive_session_id` asks
+    `extract_json_field` for `session_id`, handing it the interpreter and the
+    raw payload in the MEB's order. A shell function is looked up when it is
+    CALLED, so one defined after the library is sourced stands in for the
+    helper in this probe. Both the helper and an inline parse print `abc` for
+    this payload; a stand-in that answers something else is the only way to
+    see which of them did the reading."""
+    seen = tmp_path / "helper_args.txt"
+    script = (_SOURCE_LIB
+              + "extract_json_field() { "
+              + f"printf '%s\\n' \"$1\" \"$2\" \"$3\" > '{seen.as_posix()}'; "
+              + "printf '%s' via-helper; }; "
+              + f"mindhive_session_id {_PY} {_sh_quote(SESSION_ABC)}")
+    got = probe(script)
+    assert got.stderr == "", got.stderr
+    assert got.stdout == "via-helper\n", (
+        "mindhive_session_id parsed the payload itself instead of reading it "
+        f"through extract_json_field: {got.stdout!r}")
+    assert seen.read_text(encoding="utf-8").splitlines() == [
+        sys.executable, "session_id", SESSION_ABC]
+
+
+@sh_missing
+@pytest.mark.parametrize("returned", [
+    "../../escaped", "with/slash", "a b", "-flag", "x" * 129, "{'a': 1}",
+    "abc\nzzz", "abc\n", "", "..", ".x", "_x",
+], ids=["traversal", "slash", "space", "flag", "overlong", "object-repr",
+        "two-lines", "trailing-newline", "empty", "dot-dot", "dot-led",
+        "underscore-led"])
+def test_mindhive_session_id_whitelists_whatever_extract_json_field_returns(returned):
+    """The whitelist judges the helper's ANSWER. The payload is a clean `abc`,
+    so an implementation that bypassed the helper passes no row below; the
+    stand-in helper then returns each shape an id must never take.
+    `object-repr` is what Python's `str()` makes of a JSON object, and
+    `trailing-newline` is the one a plain `$(...)` capture would trim into a
+    valid-looking `abc` before the whitelist ever saw it."""
+    script = (_SOURCE_LIB
+              + f"extract_json_field() {{ printf '%s' {_sh_quote(returned)}; }}; "
+              + f"mindhive_session_id {_PY} {_sh_quote(SESSION_ABC)}")
+    got = probe(script)
+    assert got.stderr == "", got.stderr
+    assert got.stdout == "unknown\n", got.stdout
+
+
+@sh_missing
+@pytest.mark.parametrize("status, want", [(0, "abc"), (1, "unknown")],
+                         ids=["read-succeeded", "read-failed"])
+def test_mindhive_session_id_keeps_nothing_a_failed_read_printed(status, want):
+    """A read that exits non-zero answers `unknown`, whatever it printed
+    first: the `|| _mh_sid=""` the inline parse always carried, kept across
+    the delegation. Both rows print the same clean `abc`, and `read-succeeded`
+    is the canary that the whitelist keeps it, so only the exit status decides
+    `read-failed`. The helper's status is its interpreter's, non-zero only when
+    the interpreter itself failed -- missing, unrunnable, killed -- which is
+    exactly when nothing it printed can be trusted."""
+    script = (_SOURCE_LIB
+              + f"extract_json_field() {{ printf '%s' abc; return {status}; }}; "
+              + f"mindhive_session_id {_PY} {_sh_quote(SESSION_ABC)}")
+    got = probe(script)
+    assert got.stderr == "", got.stderr
+    assert got.stdout == f"{want}\n", got.stdout
+
+
+@sh_missing
+@pytest.mark.parametrize("value", [
+    "42", "1.5", "true", "false", "Infinity", '"abc\\n"', '"a\\u0000b"',
+], ids=["int", "float", "true", "false", "infinity", "trailing-newline", "nul"])
+def test_a_session_id_the_shell_would_misread_is_unknown(value):
+    """Held by the `-c` program this family used to run, which refused a
+    non-string and whitelisted inside Python, and pinned here because a
+    delegation that judges only the helper's printed text loses every row --
+    measured on this machine with the MEB helper verbatim behind the
+    unchanged shell whitelist: `str()` prints `42`, `1.5`, `True`, `False` and
+    `inf`, each a valid-looking id; `$(...)` trims `abc` plus a newline to
+    `abc`; and it drops the NUL from `a`, NUL, `b`, leaving `ab` and printing
+    bash's "ignored null byte" warning on the hook's stderr.
+
+    `lib.ps1`'s `Get-MindhiveSessionId` answers `unknown` for all seven
+    (measured), so this is also the two families agreeing."""
+    raw = '{"session_id": %s}' % value
+    got = probe(_SOURCE_LIB + f"mindhive_session_id {_PY} {_sh_quote(raw)}")
+    assert got.stderr == "", got.stderr
+    assert got.stdout == "unknown\n", got.stdout
+
+
+@sh_missing
+@pytest.mark.parametrize("value", ["42", "True", "inf"])
+def test_a_string_session_id_that_only_looks_numeric_is_kept(value):
+    """CANARY for the test above: the refusal is about the JSON TYPE, not the
+    spelling. These tokens, as strings, are ordinary ids today in this family
+    and in `lib.ps1` (measured), so a fix that refused anything shaped like a
+    number or a boolean would pass the test above and fail here."""
+    raw = '{"session_id": "%s"}' % value
+    got = probe(_SOURCE_LIB + f"mindhive_session_id {_PY} {_sh_quote(raw)}")
+    assert got.stderr == "", got.stderr
+    assert got.stdout == f"{value}\n", got.stdout
+
+
+@sh_missing
+@pytest.mark.parametrize("value", [".", "..", ".x", "_", "_x"],
+                         ids=["dot", "dot-dot", "dot-led", "underscore",
+                              "underscore-led"])
+def test_a_session_id_opening_with_a_dot_or_underscore_is_unknown(value):
+    """A letter or a digit first: the rule `events.SESSION_ID_RE` and
+    `lib.ps1` state, and the one the `-c` program this family used to run
+    enforced inside Python. Behind a helper that answers any string, only the
+    shell whitelist is left to enforce it, and that refused a leading `-`
+    alone -- so all five rows, `..` among them, came back as themselves where
+    the inline parse answered `unknown` (measured; `lib.ps1` answers `unknown`
+    for all five)."""
+    raw = '{"session_id": "%s"}' % value
+    got = probe(_SOURCE_LIB + f"mindhive_session_id {_PY} {_sh_quote(raw)}")
+    assert got.stderr == "", got.stderr
+    assert got.stdout == "unknown\n", got.stdout
+
+
+@sh_missing
+@pytest.mark.parametrize("value", ["x.", "a..b", "a_b", "0.x"])
+def test_a_dot_or_underscore_after_the_first_character_is_kept(value):
+    """CANARY for the test above: the rule is about the FIRST character, not
+    about dots or underscores. Each of these is an id before and after the
+    delegation, in this family and in `lib.ps1` (measured), so a fix that
+    refused every `.` or `_`, or every `..`, would pass the test above and
+    fail here."""
+    raw = '{"session_id": "%s"}' % value
+    got = probe(_SOURCE_LIB + f"mindhive_session_id {_PY} {_sh_quote(raw)}")
+    assert got.stderr == "", got.stderr
+    assert got.stdout == f"{value}\n", got.stdout
+
+
+# --- session_start checks the plugin cache (spec Bug 8) -------------------------
+#
+# Claude Code runs a plugin from its COPY under `~/.claude/plugins/cache/`, so a
+# copy older than this checkout runs instructions the repository no longer
+# holds, and nothing says so. `mindhive plugins cache-check --hook` is the check
+# in its session-start form: one line on drift, nothing otherwise, exit 0
+# whatever happens. The shim's share is to run it after `state`, forward its
+# line into the new session's context the way it forwards `state`'s, and keep
+# any failure of it off the hook's stderr. `tests/test_hook_shims_ps.py` holds
+# the same three properties for `session_start.ps1`.
+
+CACHE_CHECK = "-m mindhive plugins cache-check --hook"
+
+
+def _session_start_python(tmp_path, fail=""):
+    """A stub interpreter for `session_start`. Every `-m` call appends its argv
+    to a log and prints `child stdout: <argv>`, so the hook's stdout shows
+    which calls it forwarded, in order; `-c` goes to the real interpreter, as
+    with `fake_python`. A call whose argv contains *fail* prints
+    `child stderr: <argv>` on stderr and exits 3 instead. Answers
+    `(env, log)`."""
+    log = tmp_path / "calls.log"
+    exe = tmp_path / "session-start-python"
+    exe.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "-c" ]; then shift; exec "$STUB_REAL_PY" -c "$@"; fi\n'
+        f"printf '%s\\n' \"$*\" >> '{log.as_posix()}'\n"
+        'if [ -n "$STUB_FAIL" ]; then\n'
+        '    case "$*" in\n'
+        "        *\"$STUB_FAIL\"*) printf 'child stderr: %s\\n' \"$*\" >&2; exit 3 ;;\n"
+        "    esac\n"
+        "fi\n"
+        "printf 'child stdout: %s\\n' \"$*\"\n",
+        encoding="utf-8", newline="\n")
+    exe.chmod(0o755)
+    return ({"MINDHIVE_PYTHON": str(exe), "STUB_REAL_PY": sys.executable,
+             "STUB_FAIL": fail}, log)
+
+
+@sh_missing
+def test_session_start_checks_the_plugin_cache_right_after_state(tmp_path):
+    """The check is the very next call after `state`, and its answer reaches
+    the hook's stdout -- the new session's context -- right after the state it
+    qualifies, the way `state`'s own answer does. The stub prints for EVERY
+    call, so the exact stdout also pins what is not forwarded: the `append`
+    bookkeeping and the detached background calls."""
+    env, log = _session_start_python(tmp_path)
+    got = run_shim("session_start", env=env)
+    assert got.returncode == 0, got.stderr
+    calls = log.read_text(encoding="utf-8").splitlines()
+    assert "-m mindhive state" in calls, calls
+    at = calls.index("-m mindhive state")
+    assert calls[at + 1:at + 2] == [CACHE_CHECK], calls
+    assert got.stdout.splitlines() == ["child stdout: -m mindhive directives",
+                                       "child stdout: -m mindhive state",
+                                       f"child stdout: {CACHE_CHECK}"], got.stdout
+
+
+@sh_missing
+def test_a_failing_plugin_cache_check_leaves_session_start_quiet_and_exit_0(tmp_path):
+    """`--hook` is fail-open on the Python side, and the shim does not lean on
+    that: a check that dies loudly -- a line on stderr, exit 3 -- costs the
+    session its one line and nothing else. The hook exits 0, prints nothing on
+    stderr, and forwards exactly what it forwards without the check. The log
+    proves the check RAN, so the quiet is the shim's doing rather than a call
+    that never happened, and the stub run bare proves the failure is loud."""
+    env, log = _session_start_python(tmp_path, fail="plugins cache-check")
+    got = run_shim("session_start", env=env)
+    assert got.returncode == 0, got.stderr
+    assert got.stderr == "", got.stderr
+    assert CACHE_CHECK in log.read_text(encoding="utf-8").splitlines()
+    assert got.stdout.splitlines() == ["child stdout: -m mindhive directives",
+                                       "child stdout: -m mindhive state"], got.stdout
+    bare = subprocess.run([SH, env["MINDHIVE_PYTHON"], *CACHE_CHECK.split()],
+                          capture_output=True, text=True, timeout=30,
+                          env={**os.environ, **env})
+    assert (bare.returncode, bare.stdout, bare.stderr) == (
+        3, "", f"child stderr: {CACHE_CHECK}\n")

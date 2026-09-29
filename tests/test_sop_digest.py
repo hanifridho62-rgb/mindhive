@@ -20,7 +20,7 @@ of no reader at all.
 Fail-safe polarity, asserted below: no measurement (missing or corrupt sidecar →
 verdict `silent` → empty id set) means bodies STAY.
 """
-from mindhive import context, events, paths, projector, sop
+from mindhive import adaptivetail, context, events, paths, projector, sop
 from mindhive.sync import sync
 
 
@@ -170,6 +170,26 @@ def test_a_full_registry_no_longer_pushes_the_digest_past_the_loader_budget(tmp_
     assert pressure["over"] == 0, (
         f"digest is {pressure['lines']} lines against {pressure['budget']}; "
         f"dropped={pressure['dropped']}")
+    # The byte side of the same loader (plan 9.2) -- the cut that actually bit.
+    assert pressure["bytes"] <= adaptivetail.MAX_LOADER_BYTES, pressure
+    assert not pressure["truncated"] and not pressure["over_safe"], pressure
     content = path.read_text(encoding="utf-8")
     assert "## Key decisions" in content
     assert "decision number 4" in content
+
+
+def test_the_largest_body_the_prompt_pass_refuses_still_fits_the_safe_ceiling(tmp_path):
+    """Plan 9.2: the digest stays at or under 24 500 bytes. `over == 0` above is
+    the LINE side only, and a body is a few very long lines: one character past
+    `sopgate.PROMPT_BUDGET` the prompt pass ships a pointer, so the digest is
+    that body's only channel and carries it whole -- on a single line here."""
+    from mindhive import sopgate
+    body = "M" * (sopgate.PROMPT_BUDGET + 1)
+    _registry(n_ordinary=10, mandatory_body=body)
+    fake_home = tmp_path / "home"
+    fake_home.mkdir(exist_ok=True)
+    path = sync(r"C:\TEMP\demo", project=None, home=fake_home)
+    pressure = context.memory_pressure(path)
+    assert body in path.read_text(encoding="utf-8")
+    assert pressure["bytes"] <= adaptivetail.MAX_LOADER_BYTES, pressure
+    assert pressure["over"] == 0 and not pressure["truncated"] and not pressure["over_safe"]

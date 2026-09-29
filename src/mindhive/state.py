@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/state.py
 """The `state_set` contract: what the top of STATE.md may contain.
 
@@ -11,7 +12,7 @@ surface with no module of its own: no contract in
 That is not a coincidence, it is the cause. Every other registry has an owning
 module (`sop`, `roadmap`, `changelog`, `autoresume`, `jobs`, `consensus`) and
 every one of those registered a `validate_payload` there. `state_set` has no
-subcommand at all — `grep -rn state_set src/mindhive/__main__.py` finds
+subcommand at all — `grep -rn state_set src/mindhive/commands/` finds
 nothing — so `hive append state_set --json …` is its ONLY writer, and the one
 write surface it has was also the one nobody was guarding.
 
@@ -40,7 +41,7 @@ to read back yesterday's events. The single narrowing is a payload with NO known
 key at all, which is refused for a reason the comment at that line gives: this
 type is last-one-wins, so an unreadable row does not sit beside the state, it
 replaces it. This is a gate on the two RAW-APPEND surfaces
-(`__main__.cmd_append` and `dashboard_post`), never on `events.append_event`
+(`commands.ledger.cmd_append` and `dashboard_post`), never on `events.append_event`
 itself: the store stays type-agnostic, and every reader stays total over
 history that predates this file.
 """

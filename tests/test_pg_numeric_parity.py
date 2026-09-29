@@ -151,6 +151,11 @@ SPELLING_COLLAPSES = {
     "small_exponent": 1e-07,                   # '1e-07' -> '0.0000001'
     "tiny_exponent": 1e-09,                    # '1e-09' -> '0.000000001'
     "nested": {"deep": [{"inner": 2.5e-08}]},  # rendering must reach any depth
+    # Collapsed at the WRITER, not by `numeric`: `canonical_json` normalises
+    # `-0.0` to `0.0` (RFC 8785, MEB SEC-02), so the ledger never holds a
+    # signed zero and the mirror -- which has none either -- cannot differ.
+    # It sat in DOES_NOT_SURVIVE until that normalisation landed.
+    "signed_zero": -0.0,                       # '-0.0' -> '0.0', before COPY
 }
 
 # Text-identical through `numeric`, and destroyed by any narrowing store.
@@ -166,19 +171,19 @@ PRECISION_HAZARDS = {
 # came back. Listed separately so it is never counted as proof of anything here.
 SERVER_ONLY = {"trailing_zero": 100.0}
 
-# THE SHAPES THAT DO NOT SURVIVE, kept together because the property they
-# prove is the opposite one: a mirror is not faithful because it never
-# differs, it is faithful because it cannot differ SILENTLY. Both of these
-# move the chain head, so `hive pg parity` reports them -- which is the
-# whole reason parity is a hash comparison and not a row count.
+# THE SHAPE THAT DOES NOT SURVIVE, kept apart because the property it
+# proves is the opposite one: a mirror is not faithful because it never
+# differs, it is faithful because it cannot differ SILENTLY. It moves the
+# chain head, so `hive pg parity` reports it -- which is the whole reason
+# parity is a hash comparison and not a row count.
 #
-# `signed_zero` came from reading `numeric`'s documented semantics.
 # `large_exponent` came from a real PostgreSQL 17 contradicting this file's
-# own model, and it is the more interesting of the two: it is a whole CLASS
-# -- every float at or above 1e+16 -- not one boundary value.
+# own model, and it is a whole CLASS -- every float at or above 1e+16 --
+# not one boundary value. `signed_zero` used to sit beside it (read off
+# `numeric`'s documented semantics); it moved to SPELLING_COLLAPSES the day
+# `canonical_json` began normalising `-0.0` at the writer.
 DOES_NOT_SURVIVE = {
     "large_exponent": 1e+30,                   # comes back an int
-    "signed_zero": -0.0,                       # numeric has no signed zero
 }
 
 # Everything CLAIMED to survive. `DOES_NOT_SURVIVE` is deliberately not in
@@ -288,14 +293,22 @@ def test_every_shape_that_does_not_survive_moves_the_head(name):
         f"{name} survives after all, so it belongs in ADVERSARIAL")
 
 
-def test_the_two_exceptions_break_in_the_ways_recorded():
-    """Not just THAT they differ but HOW, so a future change that breaks
-    them differently is not silently absorbed by the test above."""
-    assert json.dumps(-0.0) == "-0.0"
-    assert json.dumps(through_jsonb({"signed_zero": -0.0})["signed_zero"]) \
-        == "0.0"
+def test_the_exception_breaks_in_the_way_recorded():
+    """Not just THAT it differs but HOW, so a future change that breaks
+    it differently is not silently absorbed by the test above."""
     back = through_jsonb({"large_exponent": 1e+30})["large_exponent"]
     assert isinstance(back, int) and back == 10 ** 30
+
+
+def test_signed_zero_collapses_at_the_writer_so_the_mirror_cannot_differ():
+    """`json.dumps` alone still spells `-0.0`; `canonical_json` no longer
+    does (RFC 8785, MEB SEC-02), so what COPY sends is already what
+    `numeric` returns and the head is unchanged by the round trip."""
+    assert json.dumps(-0.0) == "-0.0"
+    assert events.canonical_json({"signed_zero": -0.0}) == '{"signed_zero":0.0}'
+    assert json.dumps(through_jsonb({"signed_zero": -0.0})["signed_zero"]) \
+        == "0.0"
+    assert head_of([{"signed_zero": -0.0}]) == head_of([{"signed_zero": 0.0}])
 
 
 def test_the_rule_is_the_decimal_point_and_1e16_is_where_it_bites():

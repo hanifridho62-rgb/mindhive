@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/rotation/artifact.py
 """The ROTATION_PENDING file — the only channel between hook and supervisor.
 

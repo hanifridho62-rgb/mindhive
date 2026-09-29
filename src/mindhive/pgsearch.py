@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/pgsearch.py
 """The eighth AI tool: search the ledger by MEANING rather than by string.
 

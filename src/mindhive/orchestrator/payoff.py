@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/orchestrator/payoff.py
 """TODOS 27b — does weighted-lanes-plus-stealing actually beat static waves?
 
@@ -50,9 +51,20 @@ level on 2471.
 runs a flat unit set — so a graph WITH dependencies is not a comparison this can
 make. `compare` says so rather than inventing a lane-side dependency policy that
 does not exist in the shipped code.
+
+## And, since blueprint P4, the weight itself (decision K3)
+
+`compute_calibrated_weight` at the foot of this module is the MEB's calibrated
+file weight -- `clamp(1, 50, 1 + 0.65 ln(1 + cc) + 0.45 ln(1 + churn))` --
+which `metrics.calculate_workload_weight` fuses by under its default model. It
+lives here, beside the harness that scores weights against measured wall time,
+because this is where a weight is judged; the block above it says why it is not
+`models.log_linear_estimate`.
 """
 from __future__ import annotations
 
+import math
+import sys
 from collections import deque
 from typing import NamedTuple
 
@@ -542,3 +554,52 @@ def record_result(cal, mission_id="", project=None) -> bool:
     except Exception:                                   # noqa: BLE001
         return False
     return True
+
+
+# --- K3: the calibrated weight (blueprint P4, decision K3) ---------------------
+#
+# The MEB's workload weight, its numbers verbatim:
+#
+#     W = clamp(WEIGHT_MIN, WEIGHT_MAX,
+#               _ALPHA_BASE + _BETA_COMPLEXITY * ln(1 + cc) + _BETA_CHURN * ln(1 + churn))
+#
+# It is `metrics.calculate_workload_weight`'s default model (`log_linear`), and
+# it is deliberately NOT `models.log_linear_estimate`: that one is BAB 3's
+# duration ESTIMATE, `exp(alpha + b1 ln C + b2 ln churn)`, whose logarithms have
+# no value at zero and whose range over a real repository runs into the
+# hundreds. `ln(1 + x)` needs no floor, gives a file with nothing to it exactly
+# `_ALPHA_BASE`, and compresses K3's grid (cc in [1, 500], churn in [0, 300]) to
+# a max/min ratio of about 5.2 against the 18.4 the decision allows
+# (`tests/test_tier2_stability.py`). The ceiling is out of reach for any count
+# a repository produces -- with both terms equal it takes counts near 2e19 --
+# and is kept because the MEB states it. A count that is not a count (negative,
+# NaN, infinite, a bool, a string) is refused: the callers hand in AST
+# decisions and numstat line totals, never any of those, so one here is a bug
+# upstream and not a term to be zeroed.
+_ALPHA_BASE = 1.0
+_BETA_COMPLEXITY = 0.65
+_BETA_CHURN = 0.45
+WEIGHT_MIN = 1.0
+WEIGHT_MAX = 50.0
+
+
+def compute_calibrated_weight(complexity, churn) -> float:
+    """The K3 weight of one file from its cyclomatic count and its churned
+    lines: `1 + 0.65 ln(1 + cc) + 0.45 ln(1 + churn)`, clamped to [1, 50].
+    `(0, 0)` is exactly `1.0`; strictly increasing in each term."""
+    terms = []
+    for name, value in (("complexity", complexity), ("churn", churn)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{name} bukan bilangan: {value!r}")
+        try:
+            x = float(value)
+        except OverflowError:
+            # An int past float range is still a count, and ln(1 + x) of it is
+            # past the ceiling by any reading: it clamps like any other.
+            x = sys.float_info.max
+        if not math.isfinite(x) or x < 0:
+            raise ValueError(f"{name} harus bilangan >= 0 dan hingga: {value!r}")
+        terms.append(x)
+    raw = (_ALPHA_BASE + _BETA_COMPLEXITY * math.log1p(terms[0])
+           + _BETA_CHURN * math.log1p(terms[1]))
+    return float(min(WEIGHT_MAX, max(WEIGHT_MIN, raw)))

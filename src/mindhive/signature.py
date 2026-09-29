@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/signature.py
 """Map a raw error string to a canonical root-cause SIGNATURE.
 

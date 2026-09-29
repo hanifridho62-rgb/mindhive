@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/orchestrator/jobs.py
 """Windows Job Objects: the kernel fence `setrlimit` is on POSIX.
 
@@ -166,6 +167,50 @@ def _job_for(limits) -> tuple:
         # TOTAL, like the rest of this module: a sandbox that raises while
         # setting up its own fence has cost the caller a run it could have had
         # unfenced-but-reported.
+        if job:
+            try:
+                lib.CloseHandle(job)
+            except Exception:                           # noqa: BLE001
+                pass
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _containment_job() -> tuple:
+    """``(handle, why)`` — a job object with NO ceilings, whose only flag is
+    `KILL_ON_JOB_CLOSE`. Never raises.
+
+    `_job_for` exists to apply limits and answers ``(None, "")`` when none were
+    asked for. This one is for the other thing a job buys, which `driver` needs
+    and `resilience` gets as a side effect: a handle that reaches the whole tree
+    whether or not the leader is still alive. A kill by pid cannot — `taskkill
+    /F /T` on an exited pid answers rc 128, "process not found" — so an orphaned
+    grandchild holding the inherited pipe defeated the cap outright.
+
+    ``(None, "")`` off Windows, where a process GROUP does the same job and the
+    caller already has one."""
+    available, _why = _jobs_available()
+    if not available:
+        return None, ""                     # POSIX: the child heads its own group
+    import ctypes
+
+    lib = _kernel32()
+    job = None
+    try:
+        job = lib.CreateJobObjectW(None, None)
+        if not job:
+            return None, (f"CreateJobObject failed (WinError "
+                          f"{ctypes.get_last_error()})")
+        info = _limit_structs()()
+        info.BasicLimitInformation.LimitFlags = _JOB_LIMIT_KILL_ON_JOB_CLOSE
+        ok = lib.SetInformationJobObject(
+            job, _JOB_EXTENDED_LIMIT_INFORMATION, ctypes.byref(info),
+            ctypes.sizeof(info))
+        if not ok:
+            err = ctypes.get_last_error()
+            lib.CloseHandle(job)
+            return None, f"SetInformationJobObject failed (WinError {err})"
+        return job, ""
+    except Exception as exc:                            # noqa: BLE001 — see module docstring
         if job:
             try:
                 lib.CloseHandle(job)

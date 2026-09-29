@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/failures.py
 """Deterministic capture of tool FAILURES from Claude Code transcripts.
 

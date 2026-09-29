@@ -1,4 +1,4 @@
-# src/mindhive/research.py
+# SPDX-License-Identifier: Apache-2.0
 """Self-Reliant backend — autonomous autoresearch experiments for MindHive.
 
 Phase 1 (this module's first slice) is the deterministic core the autonomous
@@ -78,6 +78,10 @@ def _popen(argv, cwd=None):
     kwargs = dict(
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
         text=True, encoding="utf-8", errors="replace", cwd=cwd or None)
+    # The trainer is a script the research agent edits, so it gets an agent's
+    # environment: no SOP process token (blueprint P1d). `None` = inherit.
+    from . import advice as authorship
+    kwargs["env"] = authorship.scrub_agent_env(None)
     if _IS_WIN:
         kwargs["creationflags"] = (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
                                    | getattr(subprocess, "CREATE_NO_WINDOW", 0))

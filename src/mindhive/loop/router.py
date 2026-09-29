@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/loop/router.py
 """Deterministic model-tier routing for loop iterations.
 

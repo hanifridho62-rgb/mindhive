@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/mindnet/ui_sessions.py
 """MN-19 — the session cat board's data provider: which Claude is working.
 

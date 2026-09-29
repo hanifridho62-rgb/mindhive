@@ -1,10 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/orchestrator/cli.py
 """`hive lintester "<intent>"` — the PRD's single user-facing instruction.
 
 Self-registering, the trade `bench`, `briefcli`, `clusterscli` and `ab` all
-make: `src/mindhive/__main__.py` sits under a shrink-only ratchet
-(`tests/test_file_size_cap.py`), so the argparse wiring and the command body
-live here and that file pays two lines.
+make: the parser module (`src/mindhive/__main__.py` under a shrink-only ratchet
+when this was written, `commands/parsers/__init__.py` since the P9 split, capped
+at 500 lines by `tests/test_commands_reexport.py`) pays two lines, and the
+argparse wiring and the command body live here.
 
 Two things about this module are deliberate and easy to undo by accident.
 
@@ -23,11 +25,13 @@ unnecessary and a violation.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
 
 from .. import cliparse
+from . import environment as env_mod
 
 
 def cmd_lintester(args) -> int | None:
@@ -61,7 +65,8 @@ def cmd_lintester(args) -> int | None:
         # stderr, not stdout: `--json` is a machine surface and a friendly
         # note printed into it is a parse error at the other end.
         print(f"lintester: {why}", file=sys.stderr)
-    mission = LintesterOrchestrator(
+    ledger = _ledger(args)
+    orch = LintesterOrchestrator(
         # The flag's help has always said "default: cwd" and the parser has
         # always passed None, which is not a softer default but a crash:
         # `worktree.lane_path_for` builds its lane path OUTSIDE the guard that
@@ -94,11 +99,30 @@ def cmd_lintester(args) -> int | None:
         # place a person types a number for this; the library takes a `Limits`.
         limits=_limits(args),
         bus=bus, observer=observer,
-    ).execute_mission(intent, dry_run=not started,
-                      checkpoint_dir=args.checkpoint_dir)
+    )
+    # The lane budget, wired HERE and nowhere else (K21). `lintester.py` is
+    # zero-edit, so the guard goes on through the `runner` field the
+    # orchestrator already injects: `_run_child` is what it would have used, so
+    # wrapping it changes nothing for a run with no ceiling -- `guard` returns
+    # the runner unchanged when there is no quota, exactly as `_limits`/`_spawn`
+    # leave an unfenced run alone. Before the gate rather than after it: the
+    # gate is wrapped around whatever `runner` holds, so the order on a real
+    # unit is gate -> quota -> child, and a refusal costs no child at all.
+    if ledger is not None:
+        orch.runner = ledger.guard(orch._run_child)
+    with _tests_locked(args, started), _weight_model(args) as weighed:
+        mission = orch.execute_mission(intent, dry_run=not started,
+                                       checkpoint_dir=args.checkpoint_dir)
 
     _close_board(bus, board, board_stream)
+    _record_quota(ledger, args.project)
     report = mission.as_dict()
+    # The fusion that weighed this mission's units, named the way the report
+    # names its fencing: a lane plan that looks wrong is diagnosed by asking
+    # which model answered, and the mission itself does not record it.
+    report["weight_model"], report["weight_model_reason"] = weighed
+    if ledger is not None:
+        report["lane_quota"] = _quota_report(ledger)
     scored = _payoff(mission) if getattr(args, "payoff", False) else None
     if scored is not None:
         report["payoff"] = scored.as_dict()
@@ -108,6 +132,8 @@ def cmd_lintester(args) -> int | None:
         return _status(mission.outcome)
 
     _print(mission)
+    _print_weight_model(weighed)
+    _print_quota(ledger)
     if scored is not None:
         _print_payoff(scored)
     return _status(mission.outcome)
@@ -115,8 +141,9 @@ def cmd_lintester(args) -> int | None:
 
 # The machine refused, not the mission: the same status the preflight answers,
 # and distinct from `1` so a wrapper can tell "some units failed" from "nothing
-# could start here" without parsing the report.
-ENVIRONMENT_STATUS = 3
+# could start here" without parsing the report. Bound to the gate's own name,
+# never retyped: two literals that agree today are two authorities tomorrow.
+ENVIRONMENT_STATUS = env_mod.EXIT_ENVIRONMENT_REFUSAL
 
 
 def _status(outcome) -> int:
@@ -127,8 +154,6 @@ def _status(outcome) -> int:
 
 def _preflight():
     """`environment.preflight`, behind a seam a test can replace."""
-    from . import environment as env_mod
-
     return env_mod.preflight()
 
 
@@ -137,11 +162,14 @@ def _refuse_environment(args, kind, detail) -> int:
 
     The sentence goes to stderr whether or not `--json` was asked for, and the
     JSON surface gets a report of the same shape a mission would print, so a
-    caller parsing stdout sees an `environment` outcome rather than nothing."""
-    from . import environment as env_mod
-
+    caller parsing stdout sees an `environment` outcome rather than nothing.
+    The line is the gate's own `refusal_line`, so it opens with
+    `FATAL_REFUSAL_FRAME` and a wrapper finds this refusal and the gate's by
+    one anchored string. Why this door keeps its own writer rather than
+    calling `enforce_preflight_gate` is in `environment`'s docstring."""
     reason = env_mod.describe(kind, detail)
-    print(f"lintester: refused before any lane was made -- {reason}",
+    print(env_mod.refusal_line("lintester",
+                               f"refused before any lane was made -- {reason}"),
           file=sys.stderr)
     if getattr(args, "json", False):
         print(json.dumps({"outcome": "environment", "environment": kind,
@@ -260,6 +288,68 @@ def _reflector():
     return res_mod.reflect_on_open
 
 
+@contextlib.contextmanager
+def _tests_locked(args, started):
+    """Hold `worktree.LOCK_TESTS` for the length of one mission (K13).
+
+    A module flag rather than an argument because `lintester.py` sits between
+    this front door and `acquire_lanes`, and this blueprint does not edit it.
+    Restored in a `finally` so a mission that raises does not leave the policy
+    switched on for whatever runs next in this process.
+
+    It only ever adds the chmod deterrent. The check that decides is
+    `gate.tests_mutated`, which `_validator` carries, and switching this off
+    does not switch that off."""
+    from . import worktree as wt_mod
+
+    want = bool(started) and bool(getattr(args, "immutable_tests", True)) \
+        and not bool(getattr(args, "allow_test_edits", False))
+    before = wt_mod.LOCK_TESTS
+    wt_mod.LOCK_TESTS = want
+    try:
+        yield want
+    finally:
+        wt_mod.LOCK_TESTS = before
+
+
+@contextlib.contextmanager
+def _weight_model(args):
+    """Run one mission under `--weight-model`, and put the environment back.
+
+    Yields ``(model, note)``: the fusion that answers
+    `metrics.calculate_workload_weight` for this mission and, when a name
+    could not be honoured, the one sentence `metrics` says about it. Read
+    through `metrics._resolve_model` AFTER the variable is set, so the report
+    names what really weighed rather than what was asked for; reaching that
+    private seam is the trade `orch._run_child` makes above, and a copy of
+    its rule here would be the second authority `metrics` warns against.
+
+    The flag travels AS `MINDHIVE_WEIGHT_MODEL` (blueprint P4, K3) because
+    `lintester.py` weighs without naming a model, that call reads the
+    variable at call time, and `lintester.py` is not edited by this
+    blueprint. A variable rather than a process-local switch also means the
+    lanes a mission spawns inherit the model. Absent, the environment is
+    left exactly alone: an operator's own export still decides. Restored in
+    a `finally` -- unset back to unset -- so a mission that raises does not
+    hand the model to whatever runs next in this process."""
+    from . import metrics as metrics_mod
+
+    key = metrics_mod.WEIGHT_MODEL_ENV
+    model = getattr(args, "weight_model", None)
+    if not model:
+        yield metrics_mod._resolve_model(None)
+        return
+    before = os.environ.get(key)
+    os.environ[key] = model
+    try:
+        yield metrics_mod._resolve_model(None)
+    finally:
+        if before is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = before
+
+
 def _validator(args, started):
     """The per-unit test gate a run that starts work gets, or ``None``.
 
@@ -272,7 +362,11 @@ def _validator(args, started):
         return None
     from . import gate as gate_mod
 
-    return gate_mod.SuiteGate(root=args.root, project=args.project)
+    return gate_mod.SuiteGate(
+        root=args.root, project=args.project,
+        allow_untested=bool(getattr(args, "allow_untested", False)),
+        immutable_tests=bool(getattr(args, "immutable_tests", True)),
+        allow_test_edits=bool(getattr(args, "allow_test_edits", False)))
 
 
 def _payoff(mission):
@@ -319,6 +413,27 @@ def _print_payoff(scored) -> None:
         print("    (not a like-for-like comparison — see the verdict)")
 
 
+def _print_weight_model(weighed) -> None:
+    """The fusion that weighed the units, with `metrics`' note when the name
+    asked for was not one it knows."""
+    model, note = weighed
+    print(f"  weight model: {model}" + (f" ({note})" if note else ""))
+
+
+def _print_overrides(gates) -> None:
+    """One warning line for the units nothing judged.
+
+    A green mission whose units all passed under `--allow-untested` reads
+    exactly like a green mission that was tested, and the per-unit lines say
+    `untested_override` in a place nobody counts. This is the count."""
+    from . import gate as gate_mod
+
+    n = gate_mod.count_scopes(gates).get(gate_mod.UNTESTED_OVERRIDE, 0)
+    if n:
+        print(f"  warning: {n} untested override(s) — no test judged that "
+              f"work; --allow-untested passed it")
+
+
 def _print(mission) -> None:
     head = f"mission {mission.mission_id}: {mission.outcome}"
     if mission.reason:
@@ -355,6 +470,7 @@ def _print(mission) -> None:
               f"{'ok' if row.get('ok') else 'RED'} [{row.get('scope')}] "
               f"{len(row.get('targets') or ())} test file(s)"
               + (f" — {row['reason']}" if row.get("reason") else ""))
+    _print_overrides(mission.gates)
     for row in mission.commits:
         if not row.get("ok"):
             what = f"FAILED — {row.get('reason') or 'no reason recorded'}"
@@ -411,8 +527,100 @@ def _limits(args):
     return Limits(memory_bytes=mb * 1024 * 1024, cpu_seconds=cpu)
 
 
+def _quota(args):
+    """The per-lane ceiling the flags asked for, or ``None`` for no ceiling.
+
+    ``None`` rather than an empty `LaneQuota` so the enforcement is off by
+    construction, not by a branch someone can forget: `LaneLedger.guard`
+    returns the runner it was handed and the report prints nothing. Negative is
+    clamped to zero, the same choice `_limits` makes -- a typo costs the
+    budget, not the mission. Zero is a REAL ceiling, and the strictest one: a
+    lane may then spend nothing that is measured."""
+    from .breaker import LaneQuota
+
+    tokens = getattr(args, "max_lane_tokens", None)
+    cost = getattr(args, "max_lane_cost", None)
+    if tokens is None and cost is None:
+        return None
+    return LaneQuota(max_tokens=None if tokens is None else max(0, int(tokens)),
+                     max_cost_usd=None if cost is None else max(0.0, float(cost)))
+
+
+def _ledger(args):
+    """The `LaneLedger` this run enforces with, or ``None``."""
+    quota = _quota(args)
+    if quota is None:
+        return None
+    from .breaker import LaneLedger
+
+    return LaneLedger(quota)
+
+
+def _quota_report(ledger) -> dict:
+    """The `--json` shape for the lane budget. `measured` is the load-bearing
+    key: with it False the totals are UNMEASURED, not zero (see `quota.py`)."""
+    quota = ledger.quota
+    return {
+        "max_tokens": quota.max_tokens,
+        "max_cost_usd": quota.max_cost_usd,
+        "measured": ledger.measured(),
+        "lanes": {str(lane): {"tokens": use.tokens, "cost_usd": use.cost_usd}
+                  for lane, use in sorted(ledger.totals().items())},
+        "refused": [{"lane_id": lane, "task_id": task, "reason": why}
+                    for lane, task, why in ledger.refusals()],
+    }
+
+
+def _print_quota(ledger) -> None:
+    """The lane budget, for a run that asked for one."""
+    if ledger is None:
+        return
+    quota = ledger.quota
+    ceiling = ", ".join(
+        part for part in (
+            f"{quota.max_tokens} token(s)" if quota.max_tokens is not None else "",
+            f"${quota.max_cost_usd:g}" if quota.max_cost_usd is not None else "")
+        if part)
+    print(f"  lane quota: {ceiling}")
+    if not ledger.measured():
+        # Said plainly rather than printed as a confident zero: this runner
+        # reports no spend, so nothing was refused and nothing could have been.
+        print("      usage: unavailable — this runner reports no token or cost "
+              "figure, so no lane was measured against the ceiling")
+        return
+    for lane, use in sorted(ledger.totals().items()):
+        print(f"      lane {lane}: {use.tokens} token(s), ${use.cost_usd:g}")
+    for lane, task, why in ledger.refusals():
+        print(f"      refused {task or '(unnamed unit)'} on lane {lane}: {why}")
+
+
+def _record_quota(ledger, project=None) -> None:
+    """One anomaly per lane the budget refused, so `hive rules` sees it.
+
+    `record_anomaly` is the existing `tool_failed` door the tool breaker
+    already writes through -- a parallel record only this package could read
+    would be the worse choice. Total: it swallows its own failures, and a run
+    that refused nothing writes nothing."""
+    if ledger is None:
+        return
+    lanes: dict = {}
+    for lane, task, why in ledger.refusals():
+        lanes.setdefault(lane, [why, []])[1].append(task or "(unnamed unit)")
+    if not lanes:
+        return
+    from . import resilience as res_mod
+
+    for lane, (why, tasks) in sorted(lanes.items()):
+        res_mod.record_anomaly(
+            f"lane-{lane}", "lane_quota_exceeded",
+            detail=f"lane {lane} took no further unit: {why} "
+                   f"({len(tasks)} unit(s) refused: {', '.join(tasks)})",
+            project=project)
+
+
 def register(subparsers) -> None:
-    """Wire `lintester` onto ``__main__``'s top-level subparser set."""
+    """Wire `lintester` onto the root subparser set built by
+    `commands.parsers._build_parser`."""
     p = subparsers.add_parser(
         "lintester",
         help="one intent -> weighted lanes, isolated worktrees, briefed agents")
@@ -432,7 +640,36 @@ def register(subparsers) -> None:
                    help="skip the per-unit test gate and the closing full "
                         "suite; a unit is then validated on its child's exit "
                         "code alone, and the merge-back commits and merges "
-                        "that unverified work")
+                        "that unverified work. The lane's tests stay "
+                        "read-only regardless: only --allow-test-edits or "
+                        "--no-immutable-tests stands that down")
+    p.add_argument("--allow-untested", action="store_true",
+                   help="pass a unit whose change no test could name — a "
+                        "README, a migration, a config file. It does NOT "
+                        "excuse a new module: there the gate names the test "
+                        "file to write, and writing it is the way through")
+    p.add_argument("--allow-test-edits", action="store_true",
+                   help="let a unit modify test files the lane was checked "
+                        "out with. For a unit whose job really is the suite; "
+                        "otherwise a red test has a second cure — change what "
+                        "it demands — and a child under repair will find it")
+    p.add_argument("--immutable-tests", dest="immutable_tests",
+                   action="store_true", default=True,
+                   help="refuse a unit that edited an existing test (default)")
+    p.add_argument("--no-immutable-tests", dest="immutable_tests",
+                   action="store_false",
+                   help="switch that check off for the whole mission")
+    # `choices` read off the one constant, never retyped; the import is lazy
+    # so `hive --help` pays for it only when this parser is built.
+    from . import metrics as metrics_mod
+    p.add_argument("--weight-model", dest="weight_model",
+                   choices=metrics_mod.WEIGHT_MODELS, default=None,
+                   help="the fusion every unit is weighed by (blueprint P4, "
+                        "K3): log_linear is the calibrated default, linear "
+                        "the three-term sum. Travels as MINDHIVE_WEIGHT_MODEL "
+                        "for the length of the mission, so the lanes it "
+                        "starts weigh the same way; omitted, an exported "
+                        "MINDHIVE_WEIGHT_MODEL still applies")
     p.add_argument("--memory-mb", type=int, default=0,
                    help="per-child memory ceiling in MB (0: none). Held by a "
                         "Windows job object or a POSIX rlimit; the report's "
@@ -442,6 +679,13 @@ def register(subparsers) -> None:
                    help="per-child CPU-time ceiling in seconds (0: none). "
                         "Distinct from the wall-clock timeout, which always "
                         "applies")
+    p.add_argument("--max-lane-tokens", type=int, default=None,
+                   help="ceiling on the tokens ONE lane may spend (MEB K21); "
+                        "omitted means no ceiling")
+    p.add_argument("--max-lane-cost", type=float, default=None,
+                   help="ceiling in USD on what ONE lane may spend; omitted "
+                        "means no ceiling. Both ceilings need a runner that "
+                        "reports usage — the report says so when none did")
     p.add_argument("--payoff", action="store_true",
                    help="also score this unit set under both scheduling "
                         "policies (TODOS 27b)")

@@ -383,3 +383,15 @@ def test_the_bench_writes_no_events(monkeypatch):
     cli_mod.main(["bench", "dashboard", "--url", ORIGIN, "--label", "x",
                   "--token", TOKEN, "--reps", "0"])
     assert len(events.read_all()) == before
+
+
+def test_the_bench_group_lists_its_three_scenarios(capsys):
+    """Blueprint P8: `cli-startup` and `recall-semantic` register beside
+    `dashboard` (`bench_scenarios.register`, called from `register` here), and
+    `hive bench --help` is where an operator finds all three."""
+    with pytest.raises(SystemExit) as exit_info:
+        cli_mod.main(["bench", "--help"])
+    assert exit_info.value.code == 0
+    out = capsys.readouterr().out
+    for verb in ("dashboard", "cli-startup", "recall-semantic"):
+        assert verb in out, verb

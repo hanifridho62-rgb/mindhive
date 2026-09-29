@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/loop/contract.py
 import re
 from dataclasses import dataclass

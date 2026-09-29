@@ -1,4 +1,4 @@
-# src/mindhive/orchestrator/lintester.py
+# SPDX-License-Identifier: Apache-2.0
 """`LintesterOrchestrator.execute_mission(intent)` — the single public entry.
 
 One instruction in, one `Mission` out. Everything between is automatic, and

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/mindnet/fence.py
 """The fenced block's defuser: every untrusted string passes through here.
 

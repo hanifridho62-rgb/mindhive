@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # post_tool_use_failure — structured live failure capture. Appends one
 # tool_failed event with a machine-readable {tool, category, retryable}
 # payload per failing tool call, so failures are parseable at capture time

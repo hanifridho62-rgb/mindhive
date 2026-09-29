@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/mindnet/tasks.py
 """MN-2 — the dynamic hierarchical task graph.
 

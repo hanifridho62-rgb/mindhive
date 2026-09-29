@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/dashboard_js_improve.py
 """The Memory and Improvements sections: the semantic-event view, the lessons
 learned from recorded failures, and the efficiency strip over them.

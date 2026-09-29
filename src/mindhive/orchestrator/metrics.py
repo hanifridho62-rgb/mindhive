@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/orchestrator/metrics.py
 """Quantitative workload weighting — how heavy is one file, really?
 
@@ -19,15 +20,28 @@ Every term is TOTAL. A syntax error, a missing file, an absent git, an
 unreachable ledger: that term contributes 0 and the others still count. The only
 caller is a scheduler deciding how to pack lanes, and a weighting function that
 raises takes the whole mission down to improve an estimate.
+
+**Two fusions (blueprint P4, decision K3).** `calculate_workload_weight`
+answers by one of two models. `log_linear`, the default, is the MEB's
+calibrated weight, `payoff.compute_calibrated_weight(complexity, churn)` --
+`clamp(1, 50, 1 + 0.65 ln(1 + cc) + 0.45 ln(1 + churn))`, a real number whose
+range over a repository is a handful, not a thousandfold, so a lane packer
+orders by decisions and volatility without one generated module owning the
+plan. `linear` is the original sum above, kept whole for a caller that wants it
+(`model="linear"`, or `MINDHIVE_WEIGHT_MODEL=linear`, read at call time).
+`Weight.model` says which one answered. A name that is neither is not an
+exception either: the default answers and `reason` says what was asked for.
 """
 from __future__ import annotations
 
 import ast
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 from .. import paths
+from . import payoff
 
 # Relative importance of the three terms. Deliberately small integers: the score
 # only has to ORDER files correctly, and a float here would invite the belief
@@ -41,6 +55,15 @@ _CHURN_TIMEOUT_S = 5
 # A file this large is not weighted by parsing it — `ast.parse` on a multi-megabyte
 # generated module is slow enough to matter when a mission weighs a whole tree.
 MAX_PARSE_BYTES = 2_000_000
+
+# Which fusion `calculate_workload_weight` uses when the caller does not say
+# (blueprint P4, decision K3). `log_linear` is the MEB's calibrated weight in
+# `payoff.compute_calibrated_weight`; `linear` is the three-term sum above, kept
+# whole. The environment variable is read at CALL time, like every `paths.*`
+# setting, so a test or a mission can switch it without an import.
+DEFAULT_WEIGHT_MODEL = "log_linear"
+WEIGHT_MODELS = ("log_linear", "linear")
+WEIGHT_MODEL_ENV = "MINDHIVE_WEIGHT_MODEL"
 
 
 class ComplexityVisitor(ast.NodeVisitor):
@@ -219,8 +242,9 @@ class Weight:
     complexity: int = 0
     churn: int = 0
     usage: int = 0
-    total: int = 0
-    reason: str = ""            # why a term is 0, when it is worth saying
+    total: float = 0.0
+    reason: str = ""            # why a term is 0, or which model really answered
+    model: str = "linear"       # the fusion `total` came from; a bare record is the old sum
 
 
 def _read_text(path: Path) -> str:
@@ -230,22 +254,59 @@ def _read_text(path: Path) -> str:
         return ""
 
 
+def _resolve_model(model) -> tuple:
+    """`(name, note)`: the fusion to weigh by and, when the request could not
+    be honoured, one sentence saying so.
+
+    Total, like every term. An unknown name -- from `model=` or from
+    `MINDHIVE_WEIGHT_MODEL` -- falls back to `DEFAULT_WEIGHT_MODEL` and is
+    REPORTED on the Weight's `reason`: a weighting function that raises takes
+    the whole mission down to improve an estimate, and one that guesses
+    silently hides a misconfiguration behind a plausible number. An empty name
+    is unset."""
+    source, raw = "model=", model
+    if raw is None:
+        source, raw = WEIGHT_MODEL_ENV, os.environ.get(WEIGHT_MODEL_ENV)
+    name = str(raw or "").strip().lower()
+    if not name:
+        return DEFAULT_WEIGHT_MODEL, ""
+    if name in WEIGHT_MODELS:
+        return name, ""
+    return DEFAULT_WEIGHT_MODEL, (f"unknown weight model {name!r} from {source}: "
+                                  f"used {DEFAULT_WEIGHT_MODEL}")
+
+
+def _reasons(*parts) -> str:
+    return "; ".join(p for p in parts if p)
+
+
 def calculate_workload_weight(file_path, root=None, evs=None,
-                              usage_key=None) -> Weight:
-    """Fuse the three terms for one file.
+                              usage_key=None, model=None) -> Weight:
+    """Fuse the terms for one file.
 
     *root* is the repo the churn term is measured in; without it the file's own
     parent chain is used, which is right for an absolute path and gives 0 for a
     relative one rather than measuring some unrelated repository.
 
     *usage_key* is the telemetry key — a task id, since telemetry records agent
-    turns per task and not per file. Omitted, the usage term is 0 and says so."""
+    turns per task and not per file. Omitted, the usage term is 0 and says so.
+
+    *model* picks the fusion (blueprint P4, decision K3): `"log_linear"` is
+    `payoff.compute_calibrated_weight(complexity, churn)`, the MEB's calibrated
+    weight, and the default; `"linear"` is the original three-term sum above.
+    `None` reads `MINDHIVE_WEIGHT_MODEL`, then `DEFAULT_WEIGHT_MODEL`. Under
+    `log_linear` the usage term is still measured and carried on the record but
+    not fused -- K3's formula has two terms. A file whose every term is 0
+    weighs 0 under BOTH models: that is a file this could not weigh, and the
+    formula's floor of 1.0 is not an answer to a question it never asked."""
+    fusion, note = _resolve_model(model)
     try:
         target = Path(str(file_path))
     except (TypeError, ValueError):
-        return Weight(reason="unusable path")
+        return Weight(reason=_reasons("unusable path", note), model=fusion)
     if not target.exists():
-        return Weight(path=str(target), reason="no such file")
+        return Weight(path=str(target), reason=_reasons("no such file", note),
+                      model=fusion)
 
     complexity = cyclomatic(_read_text(target)) if target.suffix == ".py" else 0
 
@@ -258,16 +319,24 @@ def calculate_workload_weight(file_path, root=None, evs=None,
 
     used = usage(usage_key, evs=evs) if usage_key else 0
 
-    total = (W_COMPLEXITY * complexity + W_CHURN * churned + W_USAGE * used)
-    reason = "" if (complexity or churned or used) else "every term resolved 0"
+    if not (complexity or churned or used):
+        total, reason = 0.0, "every term resolved 0"
+    elif fusion == "log_linear":
+        total, reason = payoff.compute_calibrated_weight(complexity, churned), ""
+    else:
+        total = float(W_COMPLEXITY * complexity + W_CHURN * churned + W_USAGE * used)
+        reason = ""
     return Weight(path=str(target), complexity=complexity, churn=churned,
-                  usage=used, total=int(total), reason=reason)
+                  usage=used, total=total, reason=_reasons(reason, note),
+                  model=fusion)
 
 
-def weigh_files(files, root=None, evs=None) -> dict:
+def weigh_files(files, root=None, evs=None, model=None) -> dict:
     """`{rel_posix: total}` for *files* — the shape `clusters.shard_plan` wants.
 
-    Total per file: one unweighable file contributes 0 and the rest still weigh."""
+    Total per file: one unweighable file contributes 0 and the rest still weigh.
+    *model* is `calculate_workload_weight`'s; `shard_plan` casts each total with
+    `int()`, so the numbers here may be real."""
     out: dict = {}
     for item in files or ():
         try:
@@ -275,5 +344,6 @@ def weigh_files(files, root=None, evs=None) -> dict:
         except (TypeError, ValueError):
             continue
         candidate = Path(root) / rel if root else Path(rel)
-        out[rel] = calculate_workload_weight(candidate, root=root, evs=evs).total
+        out[rel] = calculate_workload_weight(candidate, root=root, evs=evs,
+                                             model=model).total
     return out

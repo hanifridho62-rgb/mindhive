@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # circle.ps1 — run the MindHive autonomous loop ("hive loop") from anywhere.
 # This is the reliable, surface-independent equivalent of typing /circle: it puts
 # the Claude Code CLI on PATH (auto-detecting the desktop app's bundled claude.exe),

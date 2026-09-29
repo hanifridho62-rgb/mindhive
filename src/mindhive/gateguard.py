@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/gateguard.py
 """Pure classifiers behind the static policy tier in enforce.py — the in-process
 Python port of ECC's GateGuard hook suite.

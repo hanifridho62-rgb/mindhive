@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/symbols.py
 """T7/T8 — zero-token structural extraction: a ranked symbol index of the tree.
 
@@ -14,8 +15,8 @@ dependency: `pyproject.toml`'s ``dependencies = []`` stays empty.
 
 136 modules do not fit a 1,024-token budget, so something chooses which ones
 appear. Without a ranking the chooser is `sorted()`, and the answer is
-alphabetical: `autoresume.py` lands, `__main__.py` -- 4,213 lines, the centre of
-everything -- is cut.
+alphabetical: `autoresume.py` lands, `__main__.py` -- 4,213 lines at the time,
+before the P9 split, and the centre of everything -- is cut.
 
 The import graph is already in hand, so ranking costs a function, not a
 dependency. Two PageRanks run over it, because one direction is provably not
@@ -61,8 +62,8 @@ ENV_SWITCH = "MINDHIVE_SYMBOLS"
 ENV_ROOT = "MINDHIVE_SYMBOLS_ROOT"
 
 # Per file, per name-list. One module must not crowd out every other entry:
-# `__main__.py` alone declares hundreds of functions, and a map of one file is
-# not a map. What gets cut is COUNTED and rendered -- see `_line`.
+# the pre-split `__main__.py` alone declared hundreds of functions, and a map
+# of one file is not a map. What gets cut is COUNTED and rendered -- see `_line`.
 MAX_NAMES = 12
 
 # The two halves of the score. Not equal, and the asymmetry is the decision:
@@ -688,10 +689,13 @@ def probe(raw=None):
 def cli(args) -> int:
     """`hive symbols [PATH] [--budget N] [--json]`.
 
-    Lives here rather than in `__main__` deliberately: that file sits 19 lines
-    under its size ratchet, and `tests/test_file_size_cap.py` is explicit that
-    the allowlist is a ceiling and not a licence. The CLI surface there stays
-    argparse wiring; the behaviour is here, beside the thing it renders."""
+    Lives here rather than in the parser module deliberately: `__main__.py` sat
+    19 lines under its size ratchet when this was written, and
+    `tests/test_file_size_cap.py` is explicit that the allowlist is a ceiling
+    and not a licence (since the P9 split the wiring is `commands/parsers/`,
+    capped at 500 lines by `tests/test_commands_reexport.py`). The CLI surface
+    there stays argparse wiring; the behaviour is here, beside the thing it
+    renders."""
     budget = getattr(args, "budget", None) or BUDGET_TOKENS
     idx = index(getattr(args, "path", None), budget=budget)
     if getattr(args, "json", False):

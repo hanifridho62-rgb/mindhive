@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/orchestrator/board.py
 """WB7 — the half of the board that needs no terminal.
 
@@ -190,6 +191,11 @@ def make_event(kind, **fields) -> tuple:
 # memory leak wearing a feature's clothes.
 DEFAULT_CAPACITY = 512
 
+# How much of a HELD backlog is the mission's opening, kept whatever arrives
+# after it: blueprint §2.11's "the first 50 events". Bounded by `capacity // 2`
+# (`EventBus.head`), so the present always keeps at least half the room.
+BACKLOG_HEAD = 50
+
 
 def _running_loop():
     """The loop running on THIS thread, or ``None``. Never raises."""
@@ -274,6 +280,11 @@ class EventBus:
         return len(self._subs)
 
     @property
+    def head(self) -> int:
+        """How many of the held events are the opening, never evicted."""
+        return min(BACKLOG_HEAD, self.capacity // 2)
+
+    @property
     def unknown(self) -> tuple:
         """The distinct drift complaints, first-seen order. Reading surface
         unchanged: every caller and every test compares it as a tuple."""
@@ -310,9 +321,16 @@ class EventBus:
                 self.bind(running)
         elif self._loop is None or _closed(self._loop):
             self.bind()
-        queue: asyncio.Queue = asyncio.Queue(maxsize=self.capacity)
+        # The replay rides ON TOP of the live bound. Sized to `capacity` alone,
+        # a full backlog filled the queue, and the first event published before
+        # the subscriber's first read evicted the queue's oldest: the
+        # `mission_started` the backlog had just kept for it. The mission's
+        # scheduler starts the moment the board's `async with` opens, so that
+        # window is not hypothetical.
+        held = self.drain()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=self.capacity + len(held))
         self._subs.append(queue)
-        for event in self.drain():
+        for event in held:
             queue.put_nowait(event)
         return queue
 
@@ -348,8 +366,18 @@ class EventBus:
             # bare `return` here left the header reading `(no mission)
             # Waiting` over a finished run — and said `dropped == 0` while it
             # did, which is the one thing this class promises never to do.
+            #
+            # Over capacity the loss falls BEHIND THE OPENING, not on it. The
+            # live queue drops its oldest because a board is a view of now,
+            # but this backlog is replayed into a board that has seen nothing,
+            # and the two ends are not alike: the present is restated by every
+            # later event, while `mission_started` is said once, first, and
+            # never again. Dropping the oldest here lost the header past
+            # capacity -- blueprint §2.11's symptom, which asks for "the first
+            # 50 events" to be kept. So the first `head` stay whatever follows
+            # them, and the oldest event behind them is the one that goes.
             if len(self._held) >= self.capacity:
-                self._held.popleft()
+                del self._held[self.head]
                 self.dropped += 1
             self._held.append(event)
             return
@@ -369,8 +397,9 @@ class EventBus:
                 queue.put_nowait(event)
             except asyncio.QueueFull:
                 # Drop the OLDEST, keep the newest. A board is a view of NOW; a
-                # backlog that discards the present to preserve the past is the
-                # wrong end to lose.
+                # live queue that discards the present to preserve the past is
+                # the wrong end to lose. (The HELD backlog in `publish` keeps
+                # its opening instead, and says why.)
                 self.dropped += 1
                 try:
                     queue.get_nowait()

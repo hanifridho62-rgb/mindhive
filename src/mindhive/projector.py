@@ -1,9 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/projector.py
 import hashlib
 import threading
 from . import paths, events, chain, review, changelog, incidents, reflect, sop
 from . import provenance, state as state_mod
 from . import roadmap
+# Reaches only `events` at import; the tag grammar lives with its contract.
+from . import initiatives, worksessions
 # `sopgate` reaches only `outcomes` (stdlib), `sop` and `promptgate` (-> `paths`),
 # so this introduces no cycle either. Importing it here also means the
 # `sop-injection` surface is registered by anything that can rebuild a
@@ -16,6 +19,24 @@ from .mindnet import phases as mn_phases, tasks as mn_tasks
 LEDGER_TYPES = events.SEMANTIC_TYPES - {"state_set"}
 
 SUGGEST_CAP = 3  # max suggested-skill lines embedded in STATE.md (R9)
+
+# BAB 6.2's statement of the adaptive tail budget: the loader-safe total less the
+# fixed part (header, directives, active work session) and an 850-byte formatting
+# margin, with 2 000 bytes as the threshold under which no tail item is worth
+# filling. Section 8.5 and MEB CTX-01 -- which govern the runtime -- state the
+# same budget with an 800-byte margin and a 1 500-byte threshold, and `sync`
+# composes through that one (`adaptivetail.calculate_budget`). Neither is a FLOOR
+# (plan review KRITIK 3): `max(2000, ...)` here, like `max(1500, ...)` there,
+# handed the tail bytes past the loader's cut whenever the fixed part was large.
+MIN_ADAPTIVE_TAIL_BYTES = 2000
+ADAPTIVE_TAIL_MARGIN_BYTES = 850
+
+
+def calculate_adaptive_tail_budget(total_byte_limit: int = 24500,
+                                   fixed_bytes: int = 0) -> int:
+    """``max(0, total_byte_limit - fixed_bytes - 850)``: the bytes BAB 6.2 leaves
+    the tail once the fixed part of the digest is paid."""
+    return max(0, int(total_byte_limit) - int(fixed_bytes) - ADAPTIVE_TAIL_MARGIN_BYTES)
 
 
 def _short(s: str) -> str:
@@ -269,6 +290,10 @@ def build_ledger_entries(evs):
             body = mn_tasks.ledger_body(ev.payload)
         elif ev.type == "mindnet_phase" and isinstance(ev.payload, dict):
             body = mn_phases.ledger_body(ev.payload)
+        elif ev.type == "work_session" and isinstance(ev.payload, dict):
+            body = worksessions.ledger_body(ev.payload)
+        elif ev.type == "initiative_declared" and isinstance(ev.payload, dict):
+            body = initiatives.ledger_body(ev.payload)
         fname = f"{_ts_compact(ev.ts)}-{ev.type}-{_short(ev.ts + ev.type + body)}.md"
         content = (f"---\nts: {ev.ts}\ntype: {ev.type}\n"
                    f"tags: {','.join(ev.tags)}\nsession: {ev.session_id}\n---\n\n{body}\n")

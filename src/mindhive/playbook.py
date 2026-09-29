@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/playbook.py
 """MN-15 — the per-prompt playbook: which technique, which skills, which records.
 

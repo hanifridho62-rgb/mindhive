@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/consensus/contributions.py
 """The `contribution` append contract — one framed input from one subject.
 

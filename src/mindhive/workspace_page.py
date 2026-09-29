@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/workspace_page.py
 """MindParallel — the Workspace's parallel-terminal view.
 

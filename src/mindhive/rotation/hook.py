@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/rotation/hook.py
 """The Stop-hook decision: measure the session, and signal when it is full.
 

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Where replenished work lands.
 
 `replenish.py` decides WHAT is outstanding and refuses to know where it goes; a

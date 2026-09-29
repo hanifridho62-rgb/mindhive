@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/dashboard_css.py
 """The dashboard page's own stylesheet.
 
@@ -136,20 +137,28 @@ CSS = """\
      else meant returning to the top first.
 
      `align-self:start` is load-bearing rather than tidiness. A grid item
-     stretches by default, so nav was already as tall as the panel -- and an
-     element as tall as its scroll container has nowhere to stick to, so
+     stretches by default, so the rail was already as tall as the panel -- and
+     an element as tall as its scroll container has nowhere to stick to, so
      `position:sticky` alone would have changed nothing at all. `overflow-y`
      covers the other case: a rail taller than the viewport (26 buttons at a
      small window height) gets its own scrollport instead of clipping.
 
-     `sticky` is a POSITIONED value, so it goes on being the offsetParent that
-     `#navdot` resolves against and `markSection`'s offsetTop arithmetic is
-     untouched -- which is why the `position:relative` this replaces is gone
-     rather than kept beside it. */
-  nav { background:var(--rail); border-right:1px solid var(--line); padding:12px;
+     `#rail` is the grid item, not `nav`. Since the split (blueprint Bug 13) the
+     rail is two landmarks -- the sections `nav` and the `#actions` group under
+     it -- and one element has to carry the ground, the stickiness and the
+     scrollport for both. `sticky` is a POSITIONED value, so `#rail` is the
+     offsetParent that `#navdot` resolves against AND the one `markSection`'s
+     offsetTop arithmetic reads: the same box on both sides, which is what
+     keeps the bar on the button. */
+  #rail { background:var(--rail); border-right:1px solid var(--line);
     position:sticky; top:var(--headh); align-self:start;
     max-height:calc(100vh - var(--headh)); overflow-y:auto; }
-  nav .group { font-size:11px; text-transform:uppercase; letter-spacing:.6px; color:var(--dim);
+  nav { padding:12px; }
+  /* The commands, under the sections and visibly apart from them: the MEB's
+     `--border` where the landmark changes, and nothing else -- the ground and
+     the face are the rail's. */
+  #actions { padding:4px 12px 12px; border-top:1px solid var(--border); }
+  nav .group, #actions .group { font-size:11px; text-transform:uppercase; letter-spacing:.6px; color:var(--dim);
     margin:14px 6px 4px; }
   /* A `button` does NOT inherit the document font. Every other control here was
      told to (`input, select, textarea { font:inherit }` below); buttons never
@@ -171,15 +180,18 @@ CSS = """\
     transition: background-color .15s ease, border-color .15s ease; }
   button:hover { background:var(--hover); border-color:var(--accent-edge); }
   button:active { translate:0 1px; }
-  nav button { display:block; width:100%; text-align:left; margin:4px 0; padding:8px 10px;
+  nav button, #actions button { display:block; width:100%; text-align:left; margin:4px 0; padding:8px 10px;
     background:var(--raised); color:var(--text); border:1px solid var(--line); border-radius:6px; cursor:pointer;
     /* Weight and tracking, not size: the rail is fixed at 220px and a larger
        label would wrap "Skill & Plugin" onto two lines. 500 reads as firm at
        14px without the smearing 600 gives at this size on Windows. */
-    font-weight:500; letter-spacing:.15px;
-    /* Compositor-only movement plus two colour fades. `translate` is its own
-       property here rather than a `transform` shorthand so nothing later has to
-       rewrite the whole transform to add a second track. */
+    font-weight:500; letter-spacing:.15px; }
+  /* Compositor-only movement plus two colour fades. `translate` is its own
+     property here rather than a `transform` shorthand so nothing later has to
+     rewrite the whole transform to add a second track. The sections' alone: a
+     command does not go anywhere, so `#actions button` keeps the two fades
+     every `button` carries and declares no travel of its own. */
+  nav button {
     transition: background-color .15s ease, border-color .15s ease, translate .15s ease; }
   nav button:hover { border-color:var(--accent-edge); translate:2px 0; }
   nav button:active { translate:1px 0; }
@@ -205,11 +217,16 @@ CSS = """\
   /* Sixteen of these buttons take you somewhere; ten of them DO something, and
      all twenty-six wore one face. The actions step back -- no ground, quieter
      label -- so the rail reads as navigation with commands under it rather than
-     twenty-six equal choices. `:not([data-sec])` is the same attribute the
-     active marker keys on, so there is one definition of "this button owns a
-     section" and not two. Stepping back is not being disabled: the hover, the
-     focus ring and the travel are all still theirs. */
-  nav button:not([data-sec]) { background:transparent; color:var(--muted); }
+     twenty-six equal choices. They used to be told apart by a missing
+     `data-sec` inside one `nav`; since the split (blueprint Bug 13) they stand
+     in their own landmark, so the rule keys on WHERE a button is and
+     `[data-sec]` stays the active marker's key alone -- one definition of
+     "this button owns a section", said by the markup. Stepping back is not
+     being disabled: the hover and the focus ring are still theirs; the 2px
+     travel is the sections' (a command does not go anywhere), so the hover
+     brightens the label instead. */
+  #actions button { background:transparent; color:var(--muted); }
+  #actions button:hover { border-color:var(--accent-edge); color:var(--text); }
   /* WHICH section is on screen -- the one thing a 26-button rail could not say.
      Recessed rather than brightened: `--sunken` reads as pressed into the rail,
      and it leaves `--hover` free to go on meaning "under the pointer" instead
@@ -423,6 +440,23 @@ CSS = """\
   .pill.triclaude { color:var(--link); border-color:#2c4a75; font-weight:700; }
   .pill.tridism { color:var(--faint); }
   .pill.sr { color:#c9a6ff; border-color:#5b3f8a; background:#191227; }
+  /* Work sessions (blueprint P1b, BAB 5.5). The phase pill's blip pulses only
+     while the session is online; an initiative badge is never styled like an
+     ordinary pill, because an autonomous step has to read as one at a glance
+     -- its own ink and ground say so. Its edge is the MEB `--border`, the
+     element K12 names for that token, where it carried a literal violet.
+     The usage bar fills with the MEB accent and ticks the safe budget. */
+  .pill.wsphase { color:var(--link); }
+  .pill.wsphase .blip { animation: pulse 1.6s infinite; color:var(--ok); }
+  .pill.wstag { color:var(--muted); display:inline-block; max-width:44ch;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; vertical-align:bottom; }
+  .pill.wsinit { color:#5ad1e6; border-color:var(--border); background:#13182a; }
+  .wsflag { color:var(--accent); }
+  .usagebar { position:relative; display:inline-block; width:140px; height:6px;
+    vertical-align:middle; background:var(--sunken); border:1px solid var(--line);
+    border-radius:3px; overflow:hidden; }
+  .usagefill { display:block; height:100%; background:var(--accent); }
+  .usagesafe { position:absolute; top:0; bottom:0; width:2px; background:var(--warn); }
   /* A READING COLUMN, not the width of the window. Measured on the real store
      at 1440px: a change-log row ran 1176 px wide and its prose came to 152
      characters per line, which is a shade under twice the widest line anybody
@@ -532,6 +566,19 @@ CSS = """\
   .statusDot.sok { color:var(--ok-strong); }
   .statusDot.sbad { color:var(--bad-strong); }
   .statusDot.snone { color:var(--dot-idle); }
+  /* The MEB's three signal colours (blueprint K12), each on the one Oversee
+     outcome it names: a run that completed, a circuit breaker that tripped, a
+     run a native CI check failed. `sok`/`sbad` stay for the live states, the
+     plain failure, and every dot outside Oversee. Two of them also reach the
+     elements K12 names: the card a CI check failed wears `--danger` as its
+     edge, and a tripped run's status pill -- the breaker badge -- `--warning`.
+     Edges, not ink: a border is a non-text mark, and both clear 3:1 on the
+     ground they sit on. */
+  .statusDot.sdone { color:var(--success); }
+  .statusDot.strip { color:var(--warning); }
+  .statusDot.sci { color:var(--danger); }
+  .hits li.ovci { border-color:var(--danger); }
+  .pill.ovtrip { border-color:var(--warning); }
   /* called, but no outcome was ever witnessed (a slash invocation fires no
      tool, so nothing reads a result). `--warn` is the same colour `.pill.est`
      uses for "there is a number here, but it is not measured". */
@@ -649,7 +696,7 @@ CSS = """\
      page declares itself. Each of these animations is switched on by a rule at
      least as specific, and a media query adds no specificity — hence !important. */
   @media (prefers-reduced-motion: reduce) {
-    header .dot.busy, header #live .blip, .ovspin, .rmnode.rmactive,
+    header .dot.busy, header #live .blip, .pill.wsphase .blip, .ovspin, .rmnode.rmactive,
     .skel .bar, .skel .tile, .skel .line, .skel .pane,
     .cards.enter .card, .cards .big.bump,
     .types .pill b.bump, section.panel.swap { animation:none !important; }
@@ -681,7 +728,7 @@ CSS = """\
      section here, and it is legible in either direction. */
   @media (max-width: 860px) {
     main { grid-template-columns: 1fr; }
-    nav { border-right:0; border-bottom:1px solid var(--line);
+    #rail { border-right:0; border-bottom:1px solid var(--line);
       max-height:40vh; }
     #navdot { display:none; }
     /* The measure cap and the two-column row are both answers to having MORE

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/mindnet/autodeclare.py
 """MN-18 — decide whether a prompt should bring a MindNetwork task into existence.
 

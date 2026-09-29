@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/invoker.py
 """Invocation channel: make any installed skill/plugin callable from the
 dashboard by shelling out to a headless `claude` (the pattern reflect.py uses).

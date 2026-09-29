@@ -305,3 +305,362 @@ def test_state_md_and_the_digest_agree_within_one_sync(tmp_path):
     state = (paths.project_dir() / "STATE.md").read_text(encoding="utf-8")
     assert "SOP injection: pointers_only" in state
     assert "SOP injection: pointers_only" in content
+
+
+
+# --- the rollover notice and the adaptive tail (blueprint P1c) -----------------------------
+# The item caps still decide what the default digest shows; what they leave out is
+# now counted and pointed at the semantic index. The adaptive tail is opt-in: on,
+# the digest is sized to the composer's safe budget and Tier 1 is never cut.
+
+from mindhive import adaptivetail, context  # noqa: E402
+from mindhive.sync import DECISIONS_CAP, LESSONS_CAP  # noqa: E402
+
+
+def _history(n_caveats, n_decisions, pad=40):
+    def ts(day, i):
+        return f"2026-06-{day}T{i // 3600:02d}:{(i // 60) % 60:02d}:{i % 60:02d}Z"
+    for i in range(n_caveats):
+        events.append_event("caveat", {"text": f"caveat {i:03d}: watch edge case {i} in "
+                                               f"module {i * 3} " + "c" * pad},
+                            session_id="s", ts=ts(10, i))
+    for i in range(n_decisions):
+        events.append_event("decision", {"text": f"decision {i:03d}: keep approach {i} "
+                                                 f"for subsystem {i * 7} " + "d" * pad},
+                            session_id="s", ts=ts(11, i))
+
+
+def test_rollover_line_names_what_was_dropped(tmp_path):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    _history(15, 7)
+    content = sync(r"C:\TEMP\demo", project=None, home=fake_home).read_text(encoding="utf-8")
+    found = adaptivetail.find_rollover(content)
+    assert found is not None
+    assert found["count"] == (15 - LESSONS_CAP) + (7 - DECISIONS_CAP) == 7
+    # The notice closes the digest, after the sections whose items it counts.
+    assert content.index("## Key decisions") < found["start"]
+    assert content[found["end"]:].strip() == ""
+
+
+def test_no_rollover_line_when_the_caps_leave_nothing_out(tmp_path):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    _history(3, 2)
+    content = sync(r"C:\TEMP\demo", project=None, home=fake_home).read_text(encoding="utf-8")
+    assert adaptivetail.find_rollover(content) is None
+    assert "keputusan dan pelajaran" not in content
+
+
+def test_adaptive_fill_is_opt_in(tmp_path):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    _history(40, 40)
+    content = sync(r"C:\TEMP\demo", project=None, home=fake_home).read_text(encoding="utf-8")
+    assert content.count("- caveat ") == LESSONS_CAP
+    assert content.count("- decision ") == DECISIONS_CAP
+    assert "## Active work session" not in content
+    assert adaptivetail.find_rollover(content)["count"] == 80 - LESSONS_CAP - DECISIONS_CAP
+
+    context.save_adaptive_tail(None, enabled=True, lessons=30, decisions=20)
+    content = sync(r"C:\TEMP\demo", project=None, home=fake_home).read_text(encoding="utf-8")
+    assert content.count("] caveat ") == 30 and content.count("] decision ") == 20
+    assert adaptivetail.find_rollover(content)["count"] == 30
+    assert "- [2026-06-10] caveat 039:" in content and "caveat 009:" not in content
+
+
+def test_the_adaptive_digest_fits_the_safe_budget_and_keeps_tier_one(tmp_path):
+    from datetime import datetime, timezone
+    from mindhive import worksessions as ws
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    events.append_event("caveat", {"text": "NEVER disturb V17 --live"},
+                        session_id="s", tags=["pinned"], ts="2026-01-01T00:00:00Z")
+    _history(400, 400, pad=60)
+    _mandatory_sop("Run the whole suite before calling anything done.")
+    soul = incidents.soul_path()
+    soul.parent.mkdir(parents=True, exist_ok=True)
+    soul.write_text("- rule one: never push without green\n"
+                    "- rule two: log every change\n", encoding="utf-8")
+    step = ws.record_work_session_step("s-live", ws.create_work_session_step(
+        "execution", "TAIL_TRIM", False,
+        now_fn=lambda: datetime(2026, 9, 11, tzinfo=timezone.utc)))
+    context.save_adaptive_tail(None, enabled=True, lessons=1000, decisions=1000)
+
+    path = sync(r"C:\TEMP\demo", project=None, home=fake_home)
+    pressure = context.memory_pressure(path)
+    assert pressure["bytes"] <= adaptivetail.MAX_LOADER_BYTES, pressure
+    assert pressure["lines"] <= adaptivetail.MAX_LOADER_LINES, pressure
+    assert not pressure["truncated"] and not pressure["over_safe"]
+    assert pressure["managed"] and pressure["rollover_count"] > 0
+    content = path.read_text(encoding="utf-8")
+    assert "NEVER disturb V17 --live" in content                    # pinned
+    assert "rule two: log every change" in content                  # SOUL
+    assert "Execution discipline" in content                        # mandatory SOP
+    assert "## Active work session" in content and step.technical_action in content
+    shown = content.count("] caveat ") + content.count("] decision ")
+    assert shown > 0 and shown + pressure["rollover_count"] == 800
+
+
+def test_the_adaptive_digest_ends_before_a_lowered_loader_cut(tmp_path):
+    """`memory_lines` / `memory_bytes` set BELOW the composer's safe budget are
+    the cut `hive context --check` judges against, so the tail yields to them."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    _history(400, 400, pad=60)
+    context.save_adaptive_tail(None, enabled=True, lessons=1000, decisions=1000)
+    for cuts in ({"memory_lines": 150}, {"memory_lines": 200, "memory_bytes": 20_000}):
+        context.save_budget(1_000_000, **cuts)
+        path = sync(r"C:\TEMP\demo", project=None, home=fake_home)
+        pressure = context.memory_pressure(path)
+        assert not pressure["truncated"] and pressure["managed"], (cuts, pressure)
+        assert pressure["lines"] <= cuts["memory_lines"] - adaptivetail.LOADER_MARGIN_LINES
+        assert pressure["bytes"] <= cuts.get("memory_bytes", 25_000) - \
+            adaptivetail.LOADER_MARGIN_BYTES
+        content = path.read_text(encoding="utf-8")
+        shown = content.count("] caveat ") + content.count("] decision ")
+        assert shown > 0 and shown + pressure["rollover_count"] == 800
+
+
+def test_the_default_notice_never_gets_a_digest_cut(tmp_path, monkeypatch):
+    """A digest the loader reads whole WITHOUT the notice and not with it goes out
+    without it; any other digest that left items out carries it."""
+    from mindhive import projector, vectors
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    _history(LESSONS_CAP + 1, 2)                       # one caveat past the cap
+    pad = {"n": 1000}
+    monkeypatch.setattr(projector, "compose_state", lambda *a, **k: "x" * pad["n"] + "\n")
+    monkeypatch.setattr(vectors, "has_vectors_support", lambda: True)
+
+    def digest():
+        return sync(r"C:\TEMP\demo", project=None, home=fake_home)
+
+    with monkeypatch.context() as m:
+        m.setattr(adaptivetail, "rollover_notice", lambda *a, **k: "")
+        bare = context.memory_pressure(digest())["bytes"]
+    pad["n"] += 24_950 - bare                          # 24 950 bytes without the notice
+    path = digest()
+    pressure = context.memory_pressure(path)
+    assert pressure["bytes"] == 24_950 and not pressure["truncated"]
+    assert adaptivetail.find_rollover(path.read_text(encoding="utf-8")) is None
+
+    pad["n"] -= 400                                    # room for the notice: it is back
+    pressure = context.memory_pressure(digest())
+    assert not pressure["truncated"] and pressure["rollover_count"] == 1
+
+    pad["n"] += 500                                    # cut with or without the notice
+    pressure = context.memory_pressure(digest())
+    assert pressure["truncated"] and pressure["rollover_count"] == 1
+
+
+def test_the_adaptive_notice_never_gets_a_digest_cut(tmp_path, monkeypatch, capsys):
+    """Review round 2. The default path withheld a notice that would push the
+    digest past the loader cut; the adaptive path appended it regardless, so a
+    fixed part within a notice's length of the cut produced an UNMANAGED
+    truncation and `hive context --check` exit 1 -- from the notice alone. Same
+    rule on both paths now, in bytes and in lines."""
+    import mindhive.sync as sync_mod
+    from mindhive import __main__ as cli_mod
+    from mindhive import projector, vectors
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    _history(3, 2)
+    context.save_budget(1_000_000)
+    context.save_adaptive_tail(None, enabled=True)
+    # A fixed part this large leaves the tail no room in either dimension, so
+    # all five items roll whatever the padding below is tuned to.
+    pad = {"n": 23_500, "lines": 0}
+    monkeypatch.setattr(projector, "compose_state",
+                        lambda *a, **k: "x" * pad["n"] + "\n" + "l\n" * pad["lines"])
+    monkeypatch.setattr(vectors, "has_vectors_support", lambda: True)
+
+    def digest():
+        return sync(r"C:\TEMP\demo", project=None, home=fake_home)
+
+    def bare(key):
+        with monkeypatch.context() as m:
+            m.setattr(adaptivetail, "rollover_notice", lambda *a, **k: "")
+            return context.memory_pressure(digest())[key]
+
+    pad["n"] += 24_950 - bare("bytes")                 # 24 950 bytes without the notice
+    path = digest()
+    pressure = context.memory_pressure(path)
+    assert pressure["bytes"] == 24_950 and not pressure["truncated"]
+    assert adaptivetail.find_rollover(path.read_text(encoding="utf-8")) is None
+    monkeypatch.setattr(sync_mod, "native_memory_path", lambda folder, home=None: path)
+    assert cli_mod.main(["context", "--origin", "hive", "--check"]) == 0
+    assert "TRUNCATED" not in capsys.readouterr().err
+
+    pad["n"] -= 600                                    # room for the notice: it is back
+    pressure = context.memory_pressure(digest())
+    assert not pressure["truncated"] and pressure["rollover_count"] == 5
+
+    pad["n"], pad["lines"] = 1000, 185                 # the same window, in LINES
+    pad["lines"] += 199 - bare("lines")                # 199 lines without the notice
+    pressure = context.memory_pressure(digest())
+    assert pressure["lines"] == 199 and not pressure["truncated"]
+    assert pressure["rollover_count"] == 0
+
+    pad["lines"] -= 10                                 # room for its three lines: back
+    pressure = context.memory_pressure(digest())
+    assert not pressure["truncated"] and pressure["rollover_count"] == 5
+
+
+def test_a_fixed_part_that_leaves_no_room_still_passes_the_check(tmp_path, monkeypatch, capsys):
+    """Plan review KRITIK 3 end to end: fixed bytes that leave the tail 300 bytes
+    give a digest of the fixed part and the notice alone, under the safe
+    ceiling, and `hive context --check` passes it without a warning."""
+    import mindhive.sync as sync_mod
+    from mindhive import __main__ as cli_mod
+    from mindhive import projector, vectors
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    _history(20, 20)
+    context.save_budget(1_000_000)
+    context.save_adaptive_tail(None, enabled=True)
+    monkeypatch.setattr(projector, "compose_state", lambda *a, **k: "state\n")
+    monkeypatch.setattr(vectors, "has_vectors_support", lambda: False)   # the longer notice
+    head = "\n".join([USAGE_NOTE, "## Current State\n", "```\nstate\n```\n"])
+    want = adaptivetail.MAX_LOADER_BYTES - adaptivetail.SAFETY_MARGIN_BYTES - 300 \
+        - adaptivetail.lf_bytes(head)
+    rows, left = [], want                              # `want` bytes once "\n" closes it
+    while left > 0:
+        take = min(200, left)
+        rows.append("s" * (take - 1))
+        left -= take
+    soul = "\n".join(rows)
+    monkeypatch.setattr(incidents, "soul_block", lambda project=None: soul)
+    assert adaptivetail.calculate_budget(head, soul + "\n", "") == 300
+
+    path = sync(r"C:\TEMP\demo", project=None, home=fake_home)
+    content = path.read_text(encoding="utf-8")
+    assert "] caveat " not in content and "] decision " not in content
+    assert content.endswith(adaptivetail.rollover_notice(40, vectors_available=False))
+    pressure = context.memory_pressure(path)
+    assert pressure["bytes"] <= adaptivetail.MAX_LOADER_BYTES, pressure
+    assert not pressure["truncated"] and not pressure["over_safe"]
+    assert pressure["managed"] and pressure["rollover_count"] == 40
+
+    monkeypatch.setattr(sync_mod, "native_memory_path", lambda folder, home=None: path)
+    assert cli_mod.main(["context", "--origin", "hive", "--check"]) == 0
+    err = capsys.readouterr().err
+    assert "TRUNCATED" not in err and "WARNING" not in err
+
+
+# --- review round 2: what the adaptive path charges, filters and guards -------------------------
+
+def test_the_rules_block_and_the_active_session_are_charged_as_fixed_parts(
+        tmp_path, monkeypatch, capsys):
+    """Only the header and SOUL terms of the budget were pinned. Uncharged, thirty
+    prevention rules write a 202-line digest whose notice falls past the line cut
+    -- the unmanaged truncation the adaptive tail exists to prevent -- and an
+    uncharged work session takes it past the safe budget."""
+    from datetime import datetime, timezone
+    import mindhive.sync as sync_mod
+    from mindhive import __main__ as cli_mod
+    from mindhive import projector, worksessions as ws
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    _seed_reflected_rules(30)
+    _history(400, 400, pad=60)
+    ws.record_work_session_step("s-live", ws.create_work_session_step(
+        "execution", "x" * 120, True, initiative_reason="r" * 200,
+        now_fn=lambda: datetime(2026, 9, 11, tzinfo=timezone.utc)))
+    context.save_budget(1_000_000)
+    context.save_adaptive_tail(None, enabled=True, lessons=1000, decisions=1000)
+    monkeypatch.setattr(projector, "compose_state", lambda *a, **k: "state\n")
+    asked = {}
+    real = adaptivetail.compose_adaptive_parts
+
+    def spy(decisions, lessons, available_bytes, **kw):
+        asked.update(bytes=available_bytes, lines=kw["available_lines"])
+        return real(decisions, lessons, available_bytes, **kw)
+    monkeypatch.setattr(adaptivetail, "compose_adaptive_parts", spy)
+
+    path = sync(r"C:\TEMP\demo", project=None, home=fake_home)
+    evs = events.read_all()
+    rules = incidents.inject(None, evs=evs) + "\n"
+    active = adaptivetail.active_work_session_block(evs, None)
+    header = "\n".join([USAGE_NOTE, "## Current State\n", "```\nstate\n```\n"])
+    assert "avoid failure" in rules and active.startswith("## Active work session")
+    fixed = [header, rules, active]
+    assert asked["bytes"] == (adaptivetail.MAX_LOADER_BYTES - adaptivetail.SAFETY_MARGIN_BYTES
+                              - sum(adaptivetail.lf_bytes(part) for part in fixed))
+    assert asked["lines"] == (adaptivetail.MAX_LOADER_LINES - adaptivetail.SAFETY_MARGIN_LINES
+                              - sum(adaptivetail.line_count(part) for part in fixed))
+
+    content = path.read_text(encoding="utf-8")
+    assert rules in content and active in content
+    pressure = context.memory_pressure(path)
+    assert pressure["lines"] <= adaptivetail.MAX_LOADER_LINES, pressure
+    assert pressure["bytes"] <= adaptivetail.MAX_LOADER_BYTES, pressure
+    assert pressure["managed"] and not pressure["truncated"] and not pressure["over_safe"]
+    monkeypatch.setattr(sync_mod, "native_memory_path", lambda folder, home=None: path)
+    assert cli_mod.main(["context", "--origin", "hive", "--check"]) == 0
+    assert "TRUNCATED" not in capsys.readouterr().err
+
+
+def test_a_consolidated_memo_is_neither_shown_nor_counted_as_rolled_over(tmp_path):
+    """The adaptive path filters absorbed events itself, and the default path's
+    count depends on the same filter: a memo `hive consolidate` absorbed was not
+    "rolled over", and must not come back into the digest."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    for i in range(LESSONS_CAP + 2):
+        events.append_event("caveat", {"text": f"caveat {i:03d}: watch edge case {i}"},
+                            session_id="s", ts=f"2026-06-10T00:00:{i:02d}Z")
+    events.append_event("memory_consolidated",
+                        {"absorbed_ts": ["2026-06-10T00:00:10Z", "2026-06-10T00:00:11Z"]},
+                        session_id="s", ts="2026-06-12T00:00:00Z")
+
+    content = sync(r"C:\TEMP\demo", project=None, home=fake_home).read_text(encoding="utf-8")
+    assert content.count("- caveat ") == LESSONS_CAP
+    assert "caveat 010" not in content and "caveat 011" not in content
+    assert adaptivetail.find_rollover(content) is None      # ten visible, ten shown
+
+    context.save_adaptive_tail(None, enabled=True, lessons=100, decisions=100)
+    content = sync(r"C:\TEMP\demo", project=None, home=fake_home).read_text(encoding="utf-8")
+    assert content.count("] caveat ") == LESSONS_CAP
+    assert "caveat 010" not in content and "caveat 011" not in content
+    assert adaptivetail.find_rollover(content) is None
+
+
+def test_the_default_notice_guard_reads_the_line_cut_and_the_namespaces_own(
+        tmp_path, monkeypatch):
+    """The byte test above sits at the documented 25 000. The guard has a LINE
+    clause too, and both clauses read this namespace's cut (`memory_lines`), not
+    the constants: a digest of 197-200 lines goes out without the four-line
+    notice, and under ``memory_lines=150`` that window is 147-150."""
+    from mindhive import projector, vectors
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    _history(LESSONS_CAP + 1, 2)                       # one caveat past the cap
+    pad = {"n": 10}
+    monkeypatch.setattr(projector, "compose_state", lambda *a, **k: "x\n" * pad["n"])
+    monkeypatch.setattr(vectors, "has_vectors_support", lambda: True)
+
+    def digest():
+        return sync(r"C:\TEMP\demo", project=None, home=fake_home)
+
+    with monkeypatch.context() as m:
+        m.setattr(adaptivetail, "rollover_notice", lambda *a, **k: "")
+        bare = context.memory_pressure(digest())["lines"] - pad["n"]
+
+    def written(lines_without_the_notice):
+        pad["n"] = lines_without_the_notice - bare
+        path = digest()
+        return (context.memory_pressure(path),
+                adaptivetail.find_rollover(path.read_text(encoding="utf-8")))
+
+    for cut in (200, 150):
+        if cut != 200:
+            context.save_budget(1_000_000, memory_lines=cut)
+        pressure, notice = written(cut - 4)            # room for its four lines
+        assert notice and pressure["lines"] == cut and not pressure["truncated"], cut
+        for lines in (cut - 3, cut):                   # fits without it, not with it
+            pressure, notice = written(lines)
+            assert notice is None and pressure["lines"] == lines, (cut, lines)
+            assert not pressure["truncated"], (cut, lines)
+        pressure, notice = written(cut + 1)            # cut either way: still counted
+        assert notice and pressure["truncated"] and not pressure["managed"], cut

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/runlog.py
 """Run-artifact store: the durable home for one run's full output.
 

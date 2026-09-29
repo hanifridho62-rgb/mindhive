@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Real-transcript gate for smart-zone rotation.
 
     py scripts/rotation/real_session_gate.py

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/orchestrator/__init__.py
 """The lintester mission pipeline — one intent in, one `Mission` out.
 

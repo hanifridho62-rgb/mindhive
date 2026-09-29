@@ -943,14 +943,20 @@ def test_a_publish_with_nobody_listening_is_held_rather_than_discarded():
 def test_a_backlog_that_overflows_counts_the_loss_rather_than_hiding_it():
     """Bounded for the same reason a subscriber's queue is: a buffer that grows
     without a listener is a leak. The loss is COUNTED, which is the half the
-    silent return never did."""
+    silent return never did.
+
+    And it falls in the MIDDLE. This row read `n2, n3, n4` -- newest-only, the
+    live queue's rule -- which is the backlog losing its opening first, the
+    one thing blueprint §2.11 asks it to keep. Room for three keeps the first
+    (`capacity // 2`) and the two newest; `tests/test_orchestrator_board.py`
+    holds the full-size case."""
     bus = dash.EventBus(capacity=3)
     for i in range(5):
         bus.emit("note", text=f"n{i}")
     assert bus.published == 5
     assert bus.dropped == 2
     held = bus.drain()
-    assert [e.text for e in held] == ["n2", "n3", "n4"], "kept the wrong end"
+    assert [e.text for e in held] == ["n0", "n3", "n4"], "kept the wrong end"
     assert bus.drain() == (), "drain did not clear what it handed over"
 
 
@@ -999,8 +1005,12 @@ def test_a_gated_execute_mission_publishes_no_unknown_event(repo):
     mission = lint_mod.LintesterOrchestrator(
         root=repo, project="wb7-gate", lanes=2, decomposer=_two_units,
         runner=lambda e, ln: True, bus=bus,
+        # `allow_untested` because the property here is the EVENT SEAM, not the
+        # verdict: this repo is one `seed.txt` and the fake child changes
+        # nothing, so since P2 the gate would refuse every unit and the mission
+        # would end `partial` before the board ever reached PHASE_DONE.
         validator=gate_mod.SuiteGate(root=repo, project="wb7-gate",
-                                     runner=fake_suite),
+                                     runner=fake_suite, allow_untested=True),
     ).execute_mission("make the ledger writer retry", dry_run=False)
     for event in bus.drain():
         board.apply(event)
@@ -1034,8 +1044,10 @@ def test_a_merge_back_execute_mission_publishes_no_unknown_event(repo):
     mission = lint_mod.LintesterOrchestrator(
         root=repo, project="wb7-merge", lanes=2, decomposer=_two_units,
         runner=child, bus=bus, merge_back=True,
+        # `allow_untested`: the child writes `<task_id>.txt`, which no test
+        # could ever mention. See the note in the gated-mission test above.
         validator=gate_mod.SuiteGate(root=repo, project="wb7-merge",
-                                     runner=fake_suite),
+                                     runner=fake_suite, allow_untested=True),
     ).execute_mission("make the ledger writer retry", dry_run=False)
     for event in bus.drain():
         board.apply(event)
@@ -1734,3 +1746,215 @@ def test_a_board_with_neither_draws_neither_heading():
                                 intent="do it", units=1, lanes=1)[0])
     out = dash.render_plain(board)
     assert "WORKTREES" not in out and "STEALS" not in out, out
+
+
+# --- P5, blueprint §2.11: the display task is fail-safe as a WHOLE ------------
+#
+# §2.11 asks for the TUI render loop to sit inside a guard that cannot stop the
+# mission, and names the no-`rich` fallback's raw log lines as the path that
+# could throw into it. Each render STEP was guarded (`_tolerate`, `_paint`, the
+# `except` around `_run_live`); two `_say` calls in `_run` were not, `_say`
+# forgives only `OSError`/`ValueError`, and nothing guarded the loop as a
+# whole. Whatever left `_run` was re-raised by `aclose` -- inside the mission's
+# `async with self.observer()`, which `execute_mission` does not catch -- so a
+# display fault ended the mission with its lane worktrees still checked out.
+# The faults below are injected where a real run meets them: the sink the
+# fallback prints to, the live path's exit report, the fold, the `rich` probe.
+
+class RaisingStream:
+    """A sink whose every write raises what `_say` does not forgive.
+
+    `RuntimeError` because that is what CPython raises for ``reentrant call
+    inside <_io.BufferedWriter name='<stdout>'>`` -- a print landing while
+    another is mid-write -- and `_say` catches only `OSError` and `ValueError`.
+    `writes` counts the attempts, so a test can hold the runner's error count to
+    exactly the failures it caused."""
+
+    encoding = "utf-8"
+
+    def __init__(self):
+        self.writes = 0
+
+    def write(self, text) -> int:
+        self.writes += 1
+        raise RuntimeError("reentrant call inside "
+                           "<_io.BufferedWriter name='<stdout>'>")
+
+    def flush(self) -> None:
+        pass
+
+
+class BrokenFold(dash.Board):
+    """A board whose fold raises. `Board.apply` is total by contract, so this
+    stands for every fault no render step names -- the one way to reach the
+    loop's OWN guard rather than a step's. Everything else is a real `Board`,
+    so the closing render still has something honest to draw."""
+
+    def apply(self, event):
+        raise KeyError("the fold broke")
+
+
+def test_the_raising_fixtures_are_armed():
+    """The canary for every `# must not raise` below: surviving a fixture that
+    could not raise in the first place would prove nothing."""
+    with pytest.raises(RuntimeError):
+        print("probe", file=RaisingStream())
+    with pytest.raises(KeyError):
+        BrokenFold().apply(dash.Note(text="x"))
+
+
+def test_a_fallback_sink_that_raises_costs_its_lines_and_never_the_mission(
+        monkeypatch):
+    """THE DEFECT, on the path §2.11 names: no `rich`, one log line per event.
+    The first line `_run` prints -- the `[board]` degradation notice -- sat
+    outside every guard, so the sink's first failure left the display task and
+    `aclose` re-raised it into the mission's `async with`."""
+    monkeypatch.setattr(dash, "rich_available",
+                        lambda: (False, "rich is not installed here"))
+    stream = RaisingStream()
+    bus = dash.EventBus()
+
+    async def go():
+        async with dash.attach(bus, stream=stream) as runner:
+            bus.emit("mission_started", mission_id="m-1", intent="go",
+                     lanes=1, units=1)
+            bus.emit("task_finished", lane=0, task_id="t-1",
+                     state="validated")
+        return runner
+
+    runner = drive(go)                                  # must not raise
+
+    assert runner.plain is True, "precondition: this is the no-rich path"
+    assert runner.board.applied == 2, "the fold stopped at the first bad line"
+    assert stream.writes >= 3, "the lines after the first failure were not tried"
+    assert runner.render_errors == stream.writes, "a failed line escaped the count"
+    assert "RuntimeError" in runner.last_render_error
+
+
+def test_a_frozen_live_board_whose_exit_report_cannot_print_never_raises(
+        monkeypatch):
+    """The live path's twin. `test_a_frozen_live_board_says_so_when_it_exits`
+    made a frozen board report itself on the way out; that report is a bare
+    `_say` as well, so a sink that raised turned the report into the fault."""
+    async def frozen(self):
+        # The live board comes up, then every repaint fails.
+        self._layout = object()
+        self._paint(live=object())
+        self._paint(live=object())
+
+    monkeypatch.setattr(dash.Dashboard, "_run_live", frozen)
+    stream = RaisingStream()
+
+    async def go():
+        async with dash.attach(dash.EventBus(), plain=False,
+                               stream=stream) as runner:
+            pass
+        return runner
+
+    runner = drive(go)                                  # must not raise
+
+    assert runner.plain is False, "precondition: the live path ran"
+    assert stream.writes >= 1, "the exit report never reached the sink"
+    assert runner.render_errors == 2 + stream.writes
+    assert "RuntimeError" in runner.last_render_error
+
+
+def test_a_fault_outside_every_render_step_stays_inside_the_display_task():
+    """§2.11's 'wrap the WHOLE loop'. A guard on every step is not the same
+    claim: the fold between the steps had none, and neither does whatever the
+    next edit adds. The loop's own guard is what keeps the promise for code
+    nobody has written yet.
+
+    Absorbed is not enough: the operator is watching the board, and a board
+    that stops with nothing on screen saying why is the frozen-board symptom
+    `test_a_frozen_live_board_says_so_when_it_exits` exists to name. So the
+    net SAYS it stopped, and why -- `render_errors` and `last_render_error`
+    have no reader outside this module."""
+    bus = dash.EventBus()
+    sink = Stream()
+
+    async def go():
+        async with dash.attach(bus, board=BrokenFold(), plain=True,
+                               stream=sink) as runner:
+            bus.emit("task_started", lane=0, task_id="t-1", attempt=1)
+        return runner
+
+    runner = drive(go)                                  # must not raise
+
+    assert runner.render_errors >= 1, "the fault was absorbed but not counted"
+    assert "KeyError" in runner.last_render_error, runner.last_render_error
+    stopped = [ln for ln in sink.getvalue().splitlines()
+               if ln.startswith("[board] stopped")]
+    assert len(stopped) == 1, sink.getvalue()
+    assert "KeyError" in stopped[0] and "the fold broke" in stopped[0], stopped
+
+
+def test_a_stopped_board_whose_notice_cannot_print_never_raises():
+    """The notice above is one more print from inside the net, so it rides
+    `_tolerate` like every other: a sink that fails must cost the notice, not
+    the mission. A bare `_say` there would raise `RaisingStream`'s error out
+    of `_run`, and `aclose` would re-raise it into the mission's `async with`."""
+    bus = dash.EventBus()
+    stream = RaisingStream()
+
+    async def go():
+        async with dash.attach(bus, board=BrokenFold(), plain=True,
+                               stream=stream) as runner:
+            bus.emit("task_started", lane=0, task_id="t-1", attempt=1)
+        return runner
+
+    runner = drive(go)                                  # must not raise
+
+    # The `[board]` degradation line, then the stopped notice: both tried,
+    # both failed, both counted, beside the fold's own fault.
+    assert stream.writes == 2, stream.writes
+    assert runner.render_errors == 1 + stream.writes
+    assert "RuntimeError" in runner.last_render_error
+
+
+def test_a_mission_whose_board_cannot_print_still_finishes_its_work(repo):
+    """The claim §2.11 actually makes, end to end: a REAL mission, the board
+    wired through the real observer seam, a sink that fails every write -- and
+    the mission's outcome is its work's, not its display's."""
+    stream = RaisingStream()
+    bus = dash.EventBus()
+
+    mission = lint_mod.LintesterOrchestrator(
+        root=repo, project="p5-failsafe", lanes=2, decomposer=_two_units,
+        runner=lambda e, ln: True, bus=bus,
+        observer=lambda: dash.attach(bus, plain=True, stream=stream),
+    ).execute_mission("make the ledger writer retry", dry_run=False)
+
+    assert stream.writes >= 1, "precondition: the board really tried to print"
+    assert mission.outcome == "ok", mission.reason
+    assert len(mission.completed) == 2
+
+
+def test_a_rich_that_raises_on_import_is_reported_like_a_missing_one(
+        monkeypatch):
+    """The no-`rich` decision is on the mission's path too: `attach` builds the
+    `Dashboard` inside the mission's `async with`, and the constructor asks
+    `rich_available` -- which caught only `ImportError`. A `rich` that is
+    installed but raises anything else on import (a half-finished upgrade, a
+    corrupted file) is no more usable than a missing one, and must not be more
+    dangerous."""
+    import builtins
+
+    real = builtins.__import__
+
+    def broken(name, *args, **kwargs):
+        if name == "rich" or name.startswith("rich."):
+            raise RuntimeError("rich is half-installed")
+        return real(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", broken)
+    with pytest.raises(RuntimeError):                   # the seam is armed
+        builtins.__import__("rich")
+
+    available, reason = dash.rich_available()           # must not raise
+
+    assert available is False
+    assert "RuntimeError" in reason and "half-installed" in reason, reason
+    runner = dash.Dashboard(dash.EventBus(), stream=Stream())
+    assert runner.plain is True
+    assert "half-installed" in runner.degraded, runner.degraded

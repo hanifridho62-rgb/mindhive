@@ -51,7 +51,8 @@ def test_the_migrations_are_reachable_through_the_package():
         "001_schema.sql", "002_indexes.sql", "003_roles_and_views.sql",
         "004_mirror_state_view_and_ownership.sql",
         "005_drop_unmatchable_order_index.sql",
-        "006_event_embeddings.sql"]
+        "006_event_embeddings.sql",
+        "007_event_embeddings_hashes.sql"]
 
 
 def test_every_migration_has_readable_sql_behind_it():
@@ -67,7 +68,7 @@ def test_the_inventory_is_not_empty_and_the_emptiness_would_be_noticed():
     """CANARY for the whole file. Every assertion here is about a list, and an
     empty list satisfies most of them — which is precisely the packaging failure
     being guarded against: `apply_migrations` over zero files reports success."""
-    assert len(pgmirror.migration_files()) == 6
+    assert len(pgmirror.migration_files()) == 7
     assert pgmirror.migration_files() == sorted(pgmirror.migration_files()), \
         "lexicographic filename order IS the application order"
 

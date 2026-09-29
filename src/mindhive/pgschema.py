@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/pgschema.py
 """The map the model is given: the Postgres mirror described as data and as
 prose, in one place, so the eight AI tool descriptions cannot disagree with each
@@ -209,6 +210,18 @@ EMBEDDINGS_COLUMNS = (
            "see the note below.",
            "INTEGER, computed by the view; the raw bytea is deliberately "
            "absent from this projection."),
+    Column("prev_hash", "text",
+           "The chain head this event was appended onto, or NULL. You are "
+           "unlikely to want it: it is here so a similarity hit can be turned "
+           "back into a full record without re-reading the segment.",
+           "TEXT, nullable because the two writers know different things — "
+           "the storage SPI folds the segment and has it, `hive pg embed` "
+           "mirrors row by row and does not."),
+    Column("chain_hash", "text",
+           "This event's own chain hash. Present together with prev_hash or "
+           "not at all.",
+           "TEXT, nullable for the same reason as prev_hash; NOT NULL would "
+           "have made the existing loader unable to write a row."),
 )
 
 TABLES = (
@@ -232,7 +245,7 @@ TABLES = (
         EVENT_TYPES_COLUMNS,
     ),
     Table(
-        "mindhive_ro.event_embeddings", "006_event_embeddings.sql",
+        "mindhive_ro.event_embeddings", "007_event_embeddings_hashes.sql",
         "what the semantic index COVERS. Metadata only, one row per indexed "
         "event. Query it to answer \"is this searchable yet\", not to search.",
         EMBEDDINGS_COLUMNS,
@@ -665,6 +678,9 @@ EVENT_TYPE_CLASSES = {
     "contribution":        "semantic",
     "decision":            "semantic",
     "experiment_result":   "semantic",
+    # Work sessions (blueprint P1b): a step and an initiative are both memos a
+    # reader searches by meaning.
+    "initiative_declared": "semantic",
     "learning":            "semantic",
     "mindnet_phase":       "semantic",
     "mindnet_task":        "semantic",
@@ -673,6 +689,7 @@ EVENT_TYPE_CLASSES = {
     "roadmap":             "semantic",
     "sop":                 "semantic",
     "state_set":           "semantic",
+    "work_session":        "semantic",
     # deterministic — machine telemetry. Hashed like everything else (the chain
     # folds read_all with no type filter), but off the semantic layer.
     "assistant_response":  "deterministic",
@@ -680,8 +697,10 @@ EVENT_TYPE_CLASSES = {
     "command_run":         "deterministic",
     "compaction":          "deterministic",
     "enrich_toggled":      "deterministic",
+    "fabrication":         "deterministic",
     "file_touched":        "deterministic",
     "git_diff":            "deterministic",
+    "interceptor_signal":  "deterministic",
     "invoke_requested":    "deterministic",
     "invoke_result":       "deterministic",
     "job_abandoned":       "deterministic",
@@ -693,6 +712,9 @@ EVENT_TYPE_CLASSES = {
     "loop_run_end":        "deterministic",
     "loop_run_start":      "deterministic",
     "memory_consolidated": "deterministic",
+    "merge_conflict_detected": "deterministic",
+    "vector_sync_started":  "deterministic",
+    "vector_sync_completed": "deterministic",
     "mindnet_activity":    "deterministic",
     "mindnet_brief":       "deterministic",
     "plugin_catalog":      "deterministic",

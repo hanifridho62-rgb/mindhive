@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/consensus/records.py
 """The `consensus_record` append contract — a folded answer that can be argued
 with.

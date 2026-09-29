@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/autosync.py
 # Hook-free automation: harvest transcripts -> rebuild projections -> sync native MEMORY.md.
 # Driven by a Windows Scheduled Task (see hooks/autosync.ps1).

@@ -25,6 +25,7 @@ import subprocess
 import pytest
 
 from mindhive.orchestrator import metrics as m
+from mindhive.orchestrator import payoff as pf
 
 
 def _git(cwd, *args):
@@ -188,12 +189,37 @@ def test_all_three_terms_reach_the_total(repo):
     tel_mod.emit("history", tel_mod.STATUS_ACTIVE, task_id="t1", project="test")
     rows = list(ev_mod.read_types((tel_mod.EVENT_TYPE,), "test"))
 
+    # The three-term sum is the `linear` model since blueprint P4 (K3); the
+    # default fuses by `payoff.compute_calibrated_weight` (next test).
     got = m.calculate_workload_weight(target, root=repo, evs=rows,
-                                      usage_key="t1")
+                                      usage_key="t1", model="linear")
+    assert got.model == "linear"
     assert got.complexity == 3
     assert got.churn == 5, "BRANCHY is five lines, added once"
     assert got.usage == 1
     assert got.total == (m.W_COMPLEXITY * 3 + m.W_CHURN * 5 + m.W_USAGE * 1)
+
+
+def test_the_default_model_records_usage_but_fuses_complexity_and_churn(repo, monkeypatch):
+    """K3's weight has two terms. Usage is still measured and carried on the
+    record -- a lane plan that looks wrong is diagnosed by asking which term
+    did what -- but the total is `payoff.compute_calibrated_weight(cc, churn)`."""
+    from mindhive import events as ev_mod
+    from mindhive.mindnet import telemetry as tel_mod
+
+    monkeypatch.delenv("MINDHIVE_WEIGHT_MODEL", raising=False)
+    target = repo / "f.py"
+    target.write_text(BRANCHY, encoding="utf-8")
+    _git(repo, "add", "f.py")
+    _git(repo, "commit", "-qm", "one")
+    tel_mod.emit("history", tel_mod.STATUS_ACTIVE, task_id="t1", project="test")
+    rows = list(ev_mod.read_types((tel_mod.EVENT_TYPE,), "test"))
+
+    got = m.calculate_workload_weight(target, root=repo, evs=rows, usage_key="t1")
+    assert got.model == "log_linear"
+    assert (got.complexity, got.churn, got.usage) == (3, 5, 1)
+    assert got.total == pytest.approx(pf.compute_calibrated_weight(3, 5))
+    assert got.total != (m.W_COMPLEXITY * 3 + m.W_CHURN * 5 + m.W_USAGE * 1)
 
 
 def test_weigh_files_answers_the_shape_shard_plan_wants(tmp_path):
@@ -201,4 +227,6 @@ def test_weigh_files_answers_the_shape_shard_plan_wants(tmp_path):
     got = m.weigh_files(["a.py", "missing.py"], root=tmp_path)
     assert set(got) == {"a.py", "missing.py"}
     assert got["a.py"] > 0 and got["missing.py"] == 0
-    assert all(isinstance(v, int) for v in got.values())
+    # `shard_plan` casts each weight with `int()`: a real number, never a bool.
+    assert all(isinstance(v, (int, float)) and not isinstance(v, bool)
+               for v in got.values())

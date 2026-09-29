@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/injectors.py
 """T1-T4 — the injector registry, and the per-turn record of what reached Claude.
 
@@ -94,8 +95,9 @@ PIPELINE_ORDER = ("promptgate", "enrich", "mindnet", "premise",
 # By the time T12 came to look at it, that list named FIVE passes out of seven:
 # `sopgate` and `symbols` had both been added, both had gone in "before step 5"
 # exactly as the list instructed, and the list itself was never touched. It also
-# still credited `__main__.cmd_hook` with an order that had moved into
-# `run_pipeline`, and called `style` step 5 of 6 when it is step 7 of 7.
+# still credited `cmd_hook` (in `__main__.py` then, `commands/ledger.py` now)
+# with an order that had moved into `run_pipeline`, and called `style` step 5
+# of 6 when it is step 7 of 7.
 #
 # None of that was noticed by anything, because a prose list has nothing to
 # disagree with. `tests/test_cli_inject.py` now regenerates this table and
@@ -510,7 +512,8 @@ def run_pipeline(raw, spine=None):
     per pass for `record_turn`.
 
     **The ORDER is the contract, and this function is its one home.** It used to
-    exist only as the sequence of statements inside `__main__.cmd_hook`, which
+    exist only as the sequence of statements inside `cmd_hook` (then in
+    `__main__.py`, `commands/ledger.py` since the P9 split), which
     meant the single most load-bearing fact about the injection path -- that
     `style` runs LAST so its prepend survives truncation of anything earlier --
     was documented nowhere a reader would look. `docs/session-legend.md` names
@@ -792,10 +795,12 @@ def extract_doc_block(text, marker=DOC_MARKER) -> str:
 def cli(args) -> int:
     """`hive inject show [--turn last|N] [--project P] [--json]`.
 
-    The behaviour lives here rather than in `__main__.py` for the reason
-    `symbols.cli` gives: that file sits a handful of lines under its size
-    ratchet and `tests/test_file_size_cap.py` is explicit that the allowlist is
-    a ceiling and not a licence. `register()` below is the ONE line it gains."""
+    The behaviour lives here rather than in the parser module for the reason
+    `symbols.cli` gives: `__main__.py` sat a handful of lines under its size
+    ratchet when this was written, and `tests/test_file_size_cap.py` is explicit
+    that the allowlist is a ceiling and not a licence. Since the P9 split the
+    wiring is `commands/parsers/__init__.py`, capped at 500 lines; `register()`
+    below is the ONE line it gains."""
     as_json = bool(getattr(args, "json", False))
     rep = turn_report(getattr(args, "turn", None),
                       project=getattr(args, "project", None))
@@ -835,12 +840,14 @@ def cli_table(args) -> int:
 
 
 def register(subparsers) -> None:
-    """Wire the `inject` group onto ``__main__``'s subparser set.
+    """Wire the `inject` group onto the root subparser set built by
+    `commands.parsers._build_parser`.
 
     The fourth module to register itself this way, after `bench`, `pgcli` and
     `consensus.cli` -- the convention `docs/session-legend.md` records. It buys
-    `__main__.py` ONE line for this command instead of ten, and that file had
-    six lines of headroom under its ratchet, so ten was not available."""
+    the parser module ONE line for this command instead of ten; when this was
+    written that module was `__main__.py` with six lines of headroom under its
+    ratchet, so ten was not available."""
     ij = subparsers.add_parser(
         "inject", help="what the context-injection pipeline delivered this turn")
     isub = ij.add_subparsers(dest="inject_cmd", required=True)

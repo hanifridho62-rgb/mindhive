@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/premise.py
 """The premise gate: mechanical checking of the checkable claims a prompt makes.
 

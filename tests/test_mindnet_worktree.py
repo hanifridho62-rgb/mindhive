@@ -347,6 +347,143 @@ def test_changed_files_is_none_where_git_cannot_answer(tmp_path):
     assert wt.changed_files(tmp_path / "nowhere") is None
 
 
+def test_modified_tracked_leaves_the_untracked_half_out(repo):
+    """The distinction `changed_files` cannot make, and the one K13 is built
+    on: a test file the unit EDITED existed at HEAD; a test file the unit
+    CREATED did not. Merging them would refuse the greenfield flow for
+    following the instruction the gate itself handed out."""
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_a.py").write_text("x = 1\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "tests")
+
+    (repo / "tests" / "test_a.py").write_text("x = 2\n", encoding="utf-8")
+    (repo / "tests" / "test_new.py").write_text("n = 1\n", encoding="utf-8")
+    (repo / "seed.txt").write_text("changed\n", encoding="utf-8")
+
+    assert set(wt.changed_files(repo)) == {"tests/test_a.py",
+                                           "tests/test_new.py", "seed.txt"}
+    assert wt.modified_tracked(repo) == ("seed.txt", "tests/test_a.py")
+
+
+def test_a_staged_new_file_is_not_a_modification(repo):
+    """The lane a refused `commit_all` leaves behind: `git add -A` ran, the
+    commit did not, and the NEXT unit on that lane must not be refused for a
+    file an earlier, validated unit created. A plain `diff HEAD` lists a staged
+    new file; `--diff-filter=DMT` does not."""
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_new.py").write_text("n = 1\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+
+    assert "tests/test_new.py" in wt.changed_files(repo), "canary: it is staged"
+    assert wt.modified_tracked(repo) == ()
+
+
+def test_a_staged_edit_is_still_an_edit(repo):
+    (repo / "seed.txt").write_text("changed\n", encoding="utf-8")
+    _git(repo, "add", "seed.txt")
+    assert wt.modified_tracked(repo) == ("seed.txt",)
+
+
+def test_a_rename_names_the_path_that_existed(repo):
+    """`--no-renames`: moving the file that judges you is deleting it from
+    where it judged you, and that is the path the contract reports."""
+    _git(repo, "mv", "seed.txt", "moved.txt")
+    assert wt.modified_tracked(repo) == ("seed.txt",)
+
+
+def test_a_pinned_rev_still_sees_what_a_commit_since_then_changed(repo):
+    """The child-that-commits case. Against `HEAD` a committed edit has
+    vanished; against the commit the unit started from it is still there --
+    in both answers the gate reads."""
+    start = wt.rev_of(repo, "HEAD")
+    (repo / "seed.txt").write_text("edited and committed\n", encoding="utf-8")
+    (repo / "fresh.txt").write_text("new\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "the child committed")
+
+    assert wt.modified_tracked(repo) == ()
+    assert wt.changed_files(repo) == ()
+    assert wt.modified_tracked(repo, start) == ("seed.txt",)
+    assert set(wt.changed_files(repo, start)) == {"seed.txt", "fresh.txt"}
+
+
+def test_a_rev_that_reads_as_an_option_never_reaches_git(repo, monkeypatch):
+    """git parses an argument that starts with `-` as an option, and
+    `--output=<file>` makes `diff` WRITE one. Refused before anything runs."""
+    ran = []
+    monkeypatch.setattr(wt, "_git_bytes",
+                        lambda *a: ran.append(a) or (0, b"", b""))
+    for bad in ("--output=x", "-p", "", None):
+        assert wt.changed_files(repo, bad) is None
+        assert wt.modified_tracked(repo, bad) is None
+        assert wt.show_at(repo, "seed.txt", bad) is None
+        assert wt.tracked_at(repo, bad) is None
+    assert ran == []
+
+
+def test_an_unknown_rev_is_not_a_clean_answer(repo):
+    assert wt.changed_files(repo, "no-such-rev") is None
+    assert wt.modified_tracked(repo, "no-such-rev") is None
+    assert wt.tracked_at(repo, "no-such-rev") is None
+    assert wt.show_at(repo, "seed.txt", "no-such-rev") is None
+
+
+def test_show_at_answers_the_committed_bytes_not_the_working_copy(repo):
+    committed = wt.show_at(repo, "seed.txt")
+    (repo / "seed.txt").write_text("working copy\n", encoding="utf-8")
+
+    assert isinstance(committed, bytes)
+    assert committed.replace(b"\r\n", b"\n") == b"seed\n"
+    assert wt.show_at(repo, "seed.txt") == committed
+    assert wt.show_at(repo, "absent.txt") is None
+    assert wt.show_at(repo.parent / "nowhere", "seed.txt") is None
+
+
+def test_show_at_carries_bytes_no_codec_could_break(repo):
+    """File CONTENT, byte for byte -- including `0x81`, the byte cp1252 leaves
+    undefined, which is the one that killed a decoding reader thread."""
+    raw = "ā = 1\n".encode("utf-8") + b"\x81\xff\n"
+    (repo / "odd.py").write_bytes(raw)
+    _git(repo, "-c", "core.autocrlf=false", "add", "odd.py")
+    _git(repo, "commit", "-qm", "odd")
+    assert wt.show_at(repo, "odd.py") == raw
+
+
+def test_tracked_at_lists_what_a_rev_held_and_nothing_since(repo):
+    start = wt.rev_of(repo, "HEAD")
+    (repo / "later.txt").write_text("x\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "later")
+
+    assert wt.tracked_at(repo, start) == frozenset({"seed.txt"})
+    assert wt.tracked_at(repo) == frozenset({"seed.txt", "later.txt"})
+    assert wt.tracked_at(repo.parent / "nowhere") is None
+
+
+def test_a_name_the_locale_codec_cannot_decode_is_still_reported(repo):
+    """`ā` is UTF-8 `C4 81`, and cp1252 -- the locale codec on Windows --
+    leaves `0x81` undefined. Decoded inside `subprocess.run`, that byte killed
+    the pipe's reader thread, and git's answer came back EMPTY with exit 0:
+    the tree read as clean and every OTHER path was lost with it. Measured
+    RED on this machine before `_git_bytes`: `changed_files` answered `()`."""
+    (repo / "ā.txt").write_text("x\n", encoding="utf-8")
+    (repo / "plain.txt").write_text("y\n", encoding="utf-8")
+    assert set(wt.changed_files(repo)) == {"ā.txt", "plain.txt"}
+
+
+def test_a_deleted_tracked_file_is_still_a_modification(repo):
+    """Deleting the file that judges you is the same move as emptying it, so
+    the name has to come back rather than vanish with the file."""
+    (repo / "seed.txt").unlink()
+    assert wt.modified_tracked(repo) == ("seed.txt",)
+
+
+def test_a_clean_tree_and_an_unreadable_one_are_told_apart(repo, tmp_path):
+    assert wt.modified_tracked(repo) == ()
+    assert wt.modified_tracked(tmp_path / "nowhere") is None
+
+
 # --- the P0 a reviewer verified live in a throwaway repo ----------------------
 
 def test_add_refuses_to_reset_a_branch_that_holds_commits(repo):
@@ -801,3 +938,305 @@ def test_ignored_output_outside_a_cache_directory_is_still_work(repo):
     assert wt.state(p, got.base) == (True, 0)
     assert wt.retire(repo, p, got.branch, got.base).kept
     assert (p / "dist" / "out.bin").exists()
+
+
+# --- P2 round 2: exact names, two-commit diffs, and the top level -------------
+#
+# Three reads the judge (`orchestrator/judge.py`) depends on. Names come back
+# as git holds them (`-z`), because a path that comes back changed is a path
+# the gate compares against the wrong file. Two commits can be compared with
+# the working tree no part of the question, because `SuiteGate.begin` asks
+# that before trusting a later commit on a shared lane. And a directory INSIDE
+# a checkout is told apart from the checkout, because git asked there answers
+# for the tree around it -- and a lane whose `.git` link is gone is that case
+# one level up, answering for the main checkout.
+
+ODD_NAMES = ["del\x7f.txt", "nbsp.txt\N{NO-BREAK SPACE}",
+             "ls\N{LINE SEPARATOR}.txt", "nel\x85.txt", "ā.txt"]
+
+
+def _odd(repo, rel):
+    try:
+        (repo / rel).write_text("x\n", encoding="utf-8")
+    except (OSError, ValueError):
+        pytest.skip(f"this filesystem refuses {rel!r}")
+
+
+@pytest.mark.parametrize("rel", ODD_NAMES)
+def test_names_come_back_exactly_as_git_holds_them(repo, rel):
+    """DEL is C-quoted even under `core.quotepath=false`; `str.splitlines`
+    breaks at LINE SEPARATOR and NEL; `strip` eats a trailing NO-BREAK SPACE.
+    Read with `-z` and split on NUL, every name is the name."""
+    _odd(repo, rel)
+    assert wt.changed_files(repo) == (rel,), "untracked"
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "an odd name")
+    assert rel in wt.tracked_at(repo)
+    (repo / rel).write_text("y\n", encoding="utf-8")
+    assert wt.modified_tracked(repo) == (rel,)
+    assert wt.changed_files(repo) == (rel,)
+
+
+def test_a_rename_lists_the_path_that_was_and_the_path_that_is(repo):
+    """`diff --name-only` with rename detection names only the destination.
+    The gate targets tests by the modules a unit changed, and a moved module
+    changed at both ends: the tests naming the old path have to run too."""
+    _git(repo, "mv", "seed.txt", "moved.txt")
+    assert set(wt.changed_files(repo)) == {"seed.txt", "moved.txt"}
+
+
+def test_changes_between_compares_two_commits_and_nothing_else(repo):
+    start = wt.rev_of(repo, "HEAD")
+    (repo / "seed.txt").write_text("v2\n", encoding="utf-8")
+    (repo / "new.txt").write_text("n\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "second")
+    second = wt.rev_of(repo, "HEAD")
+    (repo / "seed.txt").unlink()
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "third")
+    third = wt.rev_of(repo, "HEAD")
+    _git(repo, "mv", "new.txt", "renamed.txt")
+    _git(repo, "commit", "-qm", "fourth")
+    fourth = wt.rev_of(repo, "HEAD")
+    (repo / "seed.txt").write_text("the working copy is no part of it\n",
+                                   encoding="utf-8")
+
+    assert wt.changes_between(repo, start, second) == (("A", "new.txt"),
+                                                       ("M", "seed.txt"))
+    assert wt.changes_between(repo, second, third) == (("D", "seed.txt"),)
+    assert wt.changes_between(repo, start, third) == (("A", "new.txt"),
+                                                      ("D", "seed.txt"))
+    assert wt.changes_between(repo, third, fourth) == (
+        ("D", "new.txt"), ("A", "renamed.txt")), "a rename is both ends"
+    assert wt.changes_between(repo, fourth, fourth) == ()
+    assert wt.changes_between(repo, start, "no-such-rev") is None
+    assert wt.changes_between(repo, "no-such-rev", start) is None
+    assert wt.changes_between(repo.parent / "nowhere", start, fourth) is None
+
+
+def test_changes_between_refuses_an_option_shaped_rev_before_git_runs(
+        repo, monkeypatch):
+    ran = []
+    monkeypatch.setattr(wt, "_git_bytes",
+                        lambda *a: ran.append(a) or (0, b"", b""))
+    for bad in ("--output=x", "-p", "", None):
+        assert wt.changes_between(repo, bad, "HEAD") is None
+        assert wt.changes_between(repo, "HEAD", bad) is None
+    assert ran == []
+
+
+def test_is_toplevel_tells_a_checkout_from_a_directory_inside_one(
+        repo, tmp_path, monkeypatch):
+    """git asked in a subdirectory answers for the checkout around it: every
+    path relative to a root the caller never named, `add -A -- .` staging a
+    part of a tree the commit then commits whole."""
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    (repo / "sub").mkdir()
+    assert wt.is_toplevel(repo) is True
+    assert wt.is_toplevel(str(repo)) is True
+    assert wt.is_toplevel(repo / "sub") is False
+    assert wt.is_toplevel(repo / "seed.txt") is False
+    assert wt.is_toplevel(tmp_path / "nowhere") is False
+    assert wt.is_toplevel(tmp_path) is False, "not a repository"
+    assert wt.is_toplevel("") is False
+    assert wt.is_toplevel(None) is False
+
+
+def test_a_linked_worktree_is_a_top_level_until_its_link_is_gone(repo):
+    """The lane case. With its `.git` file gone, git walks up out of the lane
+    and answers for the MAIN checkout -- a rollback there would empty the lane
+    as untracked files of the main tree. And a COPY of a lane carries a `.git`
+    file whose admin directory points back at the original: not the checkout
+    git registered, either."""
+    import shutil
+    got = wt.add(repo, "t1")
+    assert got.ok, got.reason
+    lane = Path(got.path)
+    assert wt.is_toplevel(lane) is True
+    copy = repo / "copy-of-the-lane"
+    shutil.copytree(lane, copy)
+    assert wt.is_toplevel(copy) is False
+    (lane / ".git").unlink()
+    assert wt.is_toplevel(lane) is False
+
+
+def test_commit_all_refuses_a_directory_inside_a_checkout(repo):
+    """`add -A -- .` in a subdirectory stages that subtree, and `commit` then
+    commits the WHOLE index -- whatever else was staged, under a message
+    about one lane's unit. A lane whose `.git` link is gone is the same call
+    made against the main checkout."""
+    (repo / "sub").mkdir()
+    (repo / "sub" / "new.txt").write_text("x\n", encoding="utf-8")
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    got = wt.commit_all(repo / "sub", "from inside")
+
+    assert got.ok is False and got.changed is False
+    assert "top level" in got.reason, got.reason
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == head
+    assert _git(repo, "diff", "--cached", "--name-only").stdout.strip() == ""
+
+
+# --- P2 round 2, review fixes: a link is not the lane; one question to git -------
+
+def _link_dir(target, link):
+    """A directory link at *link* naming *target*: a junction on Windows
+    (`_winapi.CreateJunction` needs no privilege), a symlink elsewhere. Skips
+    when the platform refuses either."""
+    import os
+    try:
+        if os.name == "nt":
+            import _winapi
+            _winapi.CreateJunction(str(target), str(link))
+        else:
+            os.symlink(str(target), str(link), target_is_directory=True)
+    except (OSError, ImportError, AttributeError, NotImplementedError) as exc:
+        pytest.skip(f"cannot link a directory here: {exc}")
+
+
+def test_a_link_standing_where_a_lane_should_be_is_not_the_lane(repo,
+                                                                tmp_path):
+    """A junction or symlink AT the lane's path passes every test of the
+    path's shape and resolves to whatever it names -- another mission's lane,
+    the main checkout -- which git then vouches for as a top level of its
+    own, and a rollback or a commit through the link acts on THAT tree. The
+    lane must BE the directory."""
+    got = wt.add(repo, "t1")
+    assert got.ok, got.reason
+    lane = Path(got.path)
+    link = tmp_path / "link-to-lane"
+    _link_dir(lane, link)
+    assert (link / "seed.txt").is_file(), "canary: the link resolves"
+    assert wt.is_toplevel(lane) is True, "canary"
+
+    assert wt.is_toplevel(link) is False
+    (link / "new.txt").write_text("x\n", encoding="utf-8")
+    got = wt.commit_all(link, "through the link")
+    assert got.ok is False and got.changed is False
+    assert "top level" in got.reason, got.reason
+    assert _git(lane, "diff", "--cached", "--name-only").stdout.strip() == ""
+
+
+def test_is_link_needs_nothing_only_windows_defines(repo, tmp_path,
+                                                    monkeypatch):
+    """`stat.IO_REPARSE_TAG_MOUNT_POINT` exists on Windows alone. Read
+    unguarded, `is_link` raised AttributeError on every call anywhere else,
+    and the judge's walk and `is_toplevel` ask it first -- on Linux every
+    lane read as broken. Without the constant a directory, a file and a
+    missing path are not links, a checkout is still its own top level, and
+    the question never raises."""
+    import stat
+    monkeypatch.delattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", raising=False)
+    plain = tmp_path / "plain.txt"
+    plain.write_text("x\n", encoding="utf-8")
+    assert wt.is_link(tmp_path) is False
+    assert wt.is_link(plain) is False
+    assert wt.is_link(tmp_path / "nowhere") is False
+    assert wt.is_toplevel(repo) is True
+
+
+def test_a_worktree_registered_with_relative_paths_is_a_top_level(repo,
+                                                                  tmp_path):
+    """git 2.48+ can write both links of a linked worktree relative
+    (`worktree.useRelativePaths`). The admin directory's `gitdir` back-pointer
+    is then `../../../rel-lane/.git`, and resolved against the process's
+    working directory it named nothing -- a legitimate lane read as not its
+    own."""
+    import os
+    lane = tmp_path / "rel-lane"
+    r = _git(repo, "-c", "worktree.useRelativePaths=true", "worktree", "add",
+             "-q", str(lane), "-b", "rel-lane", check=False)
+    if r.returncode != 0:
+        pytest.skip(f"no worktree.useRelativePaths here: {r.stderr.strip()}")
+    raw = (repo / ".git" / "worktrees" / "rel-lane" / "gitdir").read_text(
+        encoding="utf-8").strip()
+    if os.path.isabs(raw):
+        pytest.skip("git wrote an absolute back-pointer anyway")
+    assert wt.is_toplevel(lane) is True
+
+
+def test_is_toplevel_asks_git_once(repo, monkeypatch):
+    """Two questions, one spawn: `rev-parse` answers `--show-toplevel` and
+    `--absolute-git-dir` on consecutive lines. Every commit, rollback and
+    gate check asks this first, and an uncached answer is the point -- the
+    guard must see the link vanish -- so the spawn is what there is to
+    halve."""
+    ran, real = [], wt._git_bytes
+    monkeypatch.setattr(wt, "_git_bytes",
+                        lambda root, *a: ran.append(a) or real(root, *a))
+    assert wt.is_toplevel(repo) is True
+    assert len(ran) == 1, ran
+    assert "--show-toplevel" in ran[0] and "--absolute-git-dir" in ran[0]
+
+
+# --- the merge-back's provenance read ---------------------------------------------
+#
+# `orchestrator.integrate` delivers a lane only when every commit past the base
+# is one it stamped. This is the read that tells them apart -- git's own
+# trailer parser answering, not a substring search over messages.
+
+def _commit_with(repo, rel, message):
+    (repo / rel).write_text(f"{rel}\n", encoding="utf-8")
+    _git(repo, "add", rel)
+    _git(repo, "commit", "-qm", message)
+    return _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+
+def test_commits_since_reads_each_commit_with_the_trailer_git_sees(repo):
+    """Newest first, as `git log` prints them, each with the values of the one
+    trailer asked for as `git interpret-trailers` reads a message -- the LAST
+    paragraph, `Key: value` lines -- so the key mentioned in a body is not a
+    trailer, and two trailer lines are two values."""
+    start = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    stamped = _commit_with(repo, "a.txt", "lint(m) t-1: title\n\n"
+                           "Lintester-Task: t-1\n"
+                           "Co-Authored-By: Claude <noreply@anthropic.com>")
+    foreign = _commit_with(repo, "b.txt", "a child's own commit\n\n"
+                           "it mentions Lintester-Task: in the body\n\n"
+                           "and ends with prose")
+    twice = _commit_with(repo, "c.txt", "two\n\nLintester-Task: t-2\n"
+                         "Lintester-Task: t-3\n")
+
+    got = wt.commits_since(repo, start, "HEAD", "Lintester-Task")
+
+    assert got == (wt.LogEntry(twice, ("t-2", "t-3")),
+                   wt.LogEntry(foreign, ()),
+                   wt.LogEntry(stamped, ("t-1",)))
+    assert wt.commits_since(repo, start, start, "Lintester-Task") == ()
+    assert wt.commits_since(repo, twice, start, "Lintester-Task") == ()
+
+
+@pytest.mark.parametrize("base, ref, key", [
+    ("no-such-ref", "HEAD", "Lintester-Task"),
+    ("HEAD", "no-such-ref", "Lintester-Task"),
+    ("", "HEAD", "Lintester-Task"),
+    ("HEAD", "", "Lintester-Task"),
+    ("HEAD", "HEAD", ""),
+    ("HEAD", "HEAD", "Bad Key"),
+    ("HEAD", "HEAD", "key,valueonly"),
+])
+def test_commits_since_is_none_where_git_could_not_or_must_not_answer(
+        repo, base, ref, key):
+    """An unknown rev, and a key that is not a trailer token (git would read
+    the comma as its next format option): ``None``, never ``()`` -- the
+    caller reads ``()`` as "nothing foreign here" and merges."""
+    assert wt.commits_since(repo, base, ref, key) is None
+
+
+def test_commits_since_never_hands_git_an_option_as_a_rev(repo, monkeypatch):
+    """`git log --output=x..HEAD` WRITES a file named for the range. A rev
+    that reads as an option is refused before git is asked anything."""
+    calls = []
+    real = wt._git_rc
+    monkeypatch.setattr(wt, "_git_rc",
+                        lambda root, *a: calls.append(a) or real(root, *a))
+    assert wt.commits_since(repo, "--output=x", "HEAD", "Lintester-Task") is None
+    assert wt.commits_since(repo, "HEAD", "--all", "Lintester-Task") is None
+    assert calls == []
+    assert not list(Path(repo).glob("x*"))
+
+
+def test_commits_since_outside_a_repository_is_none(tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    assert wt.commits_since(tmp_path, "HEAD", "HEAD", "Lintester-Task") is None

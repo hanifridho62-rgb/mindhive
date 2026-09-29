@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/orchestrator/resilience.py
 """Sandboxing, per-target breaking, and the loop that repairs a failed run.
 
@@ -58,6 +59,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from .. import paths
+from . import driver
 from . import environment as env_mod
 
 # Imported into THIS module's globals on purpose. `run_sandboxed` and
@@ -187,8 +189,10 @@ def _run_capped(argv, job, fence, *, cwd, env, timeout, stdin_text,
     the unfenced control still took 20.11s. Two paths, one of them fixed, is how
     that survived being called done.
     """
+    from .. import advice as authorship     # P1d: no SOP process token in a sandbox
     proc = subprocess.Popen(
-        argv, cwd=cwd, env=env, shell=False,
+        argv, cwd=cwd, shell=False,
+        env=paths.no_bytecode_env(authorship.scrub_agent_env(env)),
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, creationflags=creationflags, **kwargs)
     if job is not None:
@@ -203,8 +207,19 @@ def _run_capped(argv, job, fence, *, cwd, env, timeout, stdin_text,
         # `run_sandboxed`'s `finally`, downstream of exactly that wait. Measured
         # at 20.1s against a 4s cap while reporting `enforcement=kernel` and
         # "killed at the 4s cap", and indistinguishable from an unfenced run.
-        proc.kill()
-        _terminate_job(job)              # the tree, before anything waits on it
+        if job is not None and fence.get("assigned"):
+            proc.kill()
+            _terminate_job(job)          # the tree, before anything waits on it
+        else:
+            # No job is holding this child (no ceiling asked for, a downgraded
+            # run, or an assignment that failed), so nothing above takes its
+            # tree. `driver.terminate_process_tree` does where it can: `taskkill
+            # /T` walks the tree on Windows. On POSIX this child shares the
+            # orchestrator's process group -- deliberately, so the terminal's
+            # Ctrl+C still reaches it -- and the driver then kills it alone,
+            # exactly as `proc.kill()` did; the drain grace below is the bound.
+            driver.terminate_process_tree(proc)
+            _terminate_job(job)
         try:
             out, err = proc.communicate(timeout=_DRAIN_GRACE_S)
             fence["drained"] = True

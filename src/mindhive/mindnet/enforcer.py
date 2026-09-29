@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/mindnet/enforcer.py
 """MN-4 — the teeth. Where the phase spine stops describing and starts refusing.
 

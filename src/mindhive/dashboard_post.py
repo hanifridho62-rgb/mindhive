@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/dashboard_post.py
 """Every POST route the dashboard serves, as a mixin on the request handler.
 
@@ -71,6 +72,17 @@ class PostRoutes:
         etype = body.get("type")
         raw = body.get("payload", "")
         tags = [t for t in (body.get("tags") or "").split(",") if t]
+        if etype == "sop":
+            # The server holding the SOP process token says nothing about who
+            # sent this request, so this door never stamps `sop-validated` and
+            # drops one the caller supplied (`advice.write_tags`).
+            from . import advice as authorship
+            # ...and with a secret configured it can verify NOTHING about its
+            # caller, while an unstamped row reads as the operator's: refuse.
+            refusal = authorship.http_door_refusal()
+            if refusal:
+                return self._json({"ok": False, "error": refusal}, 200)
+            tags = authorship.write_tags(tags, stamp=False)
         if not etype:
             return self._json({"ok": False, "error": "type is required"}, 200)
         # A structured body IS the payload; only a plain string is free

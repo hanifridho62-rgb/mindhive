@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/dashboard_js_skills.py
 """The Skill & Plugin section: the viewing panel over the skill database (U7) —
 the status strip, the sort/filter controls, the per-skill cards with their
@@ -356,16 +357,21 @@ JS = """\
           }).join('')+'</ul>';
     }
     // Discontinued: skills stopped by the improvements linkage (active
-    // prevention rule + failure streak) — shown with WHY so recovery is clear.
+    // prevention rule + failure streak) or, since blueprint P4 (K2), by the
+    // MEB's promotion rule alone (a three-streak, or a Laplace score under
+    // 0.50 after five calls; `rule` is null then) — shown with WHY so
+    // recovery is clear.
     const disc = PLUG_REC.discontinued || [];
     if (disc.length){
       html += '<h2 class="h">Discontinued <span class="lbl">excluded until the '
-        + 'incident resolves or a successful call breaks the streak</span></h2>'
+        + 'incident resolves, a successful call breaks the streak, or the '
+        + 'Laplace score recovers</span></h2>'
         + '<ul class="hits">'+disc.map(d =>
             '<li><div class="file"><span class="statusDot sbad">\\u2716</span>'
-            + recChip(d.name)+' \\u00b7 <span class="pill">'+d.fail_streak
-            + ' consecutive failures</span></div>'
-            + '<div class="snip"><b>Rule:</b> '+esc(d.rule)+'</div></li>').join('')
+            + recChip(d.name)+' \\u00b7 <span class="pill">'
+            + esc(d.reason || (d.fail_streak + ' consecutive failures'))+'</span></div>'
+            + (d.rule ? '<div class="snip"><b>Rule:</b> '+esc(d.rule)+'</div>' : '')
+            + '</li>').join('')
         + '</ul>';
     }
     return html;

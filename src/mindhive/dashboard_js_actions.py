@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/dashboard_js_actions.py
 """The six long operations as 202-accepted polled jobs (T13), the MN-13 faculty
 cat board's poll, and the boot sequence.
@@ -59,7 +60,18 @@ JS = """\
     const gap = dropped
       ? '[' + dropped + ' earlier bytes dropped \\u2014 the buffer is capped]\\n\\n'
       : '';
-    return head + '\\n\\n' + gap + tail;
+    // The bar is drawn from the NUMBER, never from the tail. A `\\r` frame
+    // never reaches the byte stream the tail is built from -- the ring holds
+    // the live one back and reports it as `progress_pct` (jobs.OutputRing),
+    // precisely so a reader does not have to re-parse carriage returns it
+    // cannot see. A finished job has no live frame, so it gets no bar.
+    const pct = (job.state !== 'finished'
+                 && typeof job.progress_pct === 'number') ? job.progress_pct : null;
+    const filled = (pct === null) ? 0 : Math.round(pct / 5);
+    const bar = (pct === null) ? ''
+      : '[' + '\\u2588'.repeat(filled) + '\\u00b7'.repeat(20 - filled)
+        + '] ' + pct + '%\\n\\n';
+    return head + '\\n\\n' + bar + gap + tail;
   }
 
   // Start the work and follow it to its end. Returns the finished job; throws

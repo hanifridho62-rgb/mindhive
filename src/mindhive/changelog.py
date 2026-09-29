@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/changelog.py
 """Mandatory code change-log: every change to mindhive's own code gets a
 categorized entry with a brief human-written explanation.
@@ -298,7 +299,7 @@ def _no_files_message() -> str:
 
 def validate_payload(payload) -> None:
     """Enforce the code_change contract on the raw-append surface. cmd_append
-    in __main__.py calls this for the type, so `hive append code_change …`
+    in commands/ledger.py calls this for the type, so `hive append code_change …`
     cannot smuggle an uncategorized or unexplained entry past the mandatory-
     log rule; the event store itself stays type-agnostic."""
     if not isinstance(payload, dict):

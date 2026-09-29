@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/mindnet/brief.py
 """Lintester Branch 1 — what a spawned agent is told about the task it was handed.
 

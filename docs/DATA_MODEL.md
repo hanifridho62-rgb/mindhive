@@ -34,8 +34,13 @@ the git main-repo directory name, normalized to a kebab-case slug
 | `handoff.md`              | Projection: portable export. | `export` | yes |
 | `harvest_state.json`      | Cursor: which transcript lines were already harvested. | `harvest` | no (cursor) |
 | `pending_review.json`, `pending_changelog.json` | Sidecar gates: files awaiting thermo-review / a mandatory change-log entry. | `review`, `changelog` | self-healing |
-| `chroma/`                 | Optional vector index for `--semantic` recall. | `vectors.embed` | yes |
+| `chroma/`                 | Optional vector index for `--semantic` recall: the `ledger` and `events` collections, plus the embedding watcher's `mindhive_<slug>` (§4.19). | `vectors.embed`, `vectors.embed_events`, `watcher` | yes (§4.19 names the one collection no command backfills) |
 | `orchestrator_memory.json` | Projection: the resolution set a lintester mission's breaker triggered, folded from `incidents.summaries`. The ledger stays the source of truth; delete this and `orchestrator.resilience.remember` rebuilds it byte-identically. | `orchestrator.resilience.remember` | yes |
+| `state/pending_embed.json` | Sidecar queue of semantic rows awaiting vector embedding: `{"entries": [{session_id, segment, seg_line, queued_at}]}`. `segment` is the basename actually written (`events.segment_name`, so a quarantined id names its `unsafe-*` slot); `seg_line` is the **1-based** physical line the row starts on. | `events._emit_pending_embed_marker` (`embedqueue`), inside the append lock after every `SEMANTIC_TYPES` append, fail-open; consumed and truncated by the background watcher only | yes — disposable: deleting it loses nothing, `hive embed` re-indexes from the ledger |
+
+`state/` (`paths.state_dir`, made on demand) is the namespace's directory for
+sidecars of that kind: neither the ledger nor a projection of it, written by
+the append path or a daemon, and never something a reader must consult.
 
 The auto-loaded memory file lives OUTSIDE the store:
 `~/.claude/projects/<encoded-folder>/memory/MEMORY.md`, composed by
@@ -66,10 +71,12 @@ for a project, `events.segment_name` for a session.
 
 Only the PATH is sanitised: the event keeps the raw value. Where a human types the
 value the refusal is loud instead. `cliparse.session_id_arg` and
-`cliparse.project_arg` accept exactly what the sink keeps, and the dashboard's
-`is_safe_project` asks the sink the same question, so an HTTP `project=` or
-`session_project=` the sink would rename is a 400 rather than a 200 from another
-directory.
+`cliparse.project_arg` accept only what the sink keeps on EVERY platform — the
+session validator asks `events.segment_name` at its strictest (`os_name="nt"`),
+so a Windows device name is refused on Linux too, because a store moves between
+machines — and the dashboard's `is_safe_project` asks the sink the same question,
+so an HTTP `project=` or `session_project=` the sink would rename is a 400 rather
+than a 200 from another directory.
 
 A root file is reached only through `paths.store_file`, which refuses a name not
 declared in `STORE_ROOT_FILES`; `tests/test_store_root_files.py` fails on any join
@@ -114,6 +121,39 @@ Every row in every `events/*.jsonl` segment:
 - `append_event` rejects unknown types. Reads never validate payload shape —
   **folds and projections must stay total** (skip junk, never raise).
 
+**Two session-id surfaces, one rule.** `append_event(..., strict_session=False)`
+— the default, and the hook path — quarantines a hostile id through
+`events.segment_name` and never raises (§1.1): `post_tool_use` fires on every
+tool call, and a hook that can throw is a hook that breaks the session.
+`strict_session=True` and `cliparse.session_id_arg` refuse instead, through
+`events.validate_session_id`: the anchored `SESSION_ID_REGEX` (applied with
+`fullmatch`, because `$` matches before a trailing newline) AND sink identity at
+the strictest platform, `segment_name(x, os_name="nt") == x + ".jsonl"`. The
+refusal is a `ValueError` whose message starts `Format session_id '…' tidak
+valid:`; the CLI wraps it as `invalid session id '…': …` and exits 2. A strict
+append validates the RESOLVED id before `events/` is made and before the append
+lock is taken, so a refusal writes nothing — not even the directory.
+
+**The physical row is unchanged; the chain coordinates live on a wrapper.** No
+row carries `prev_hash`, `chain_hash`, `seg_line` or `event_id` — every
+checkpoint on disk was folded over exactly the five keys above, and one extra
+key would move every head on the next append. `events.EventRecord` is a frozen
+RUNTIME wrapper that readers build from a row and nothing stores: `event_id` is
+`<session_id>:<seg_line>`, `prev_hash` is the head before the row and
+`chain_hash` the head after it. `events.compute_chain_hash(prev, canonical)` is
+`sha256((prev + canonical).encode("utf-8"))` over the str `canonical_json`
+returns — the same fold `chain.py` runs, not a second scheme — and
+`events.GENESIS_PREV_HASH` (64 zeros) equals `chain._ZERO`.
+
+**Two `seg_line`s, one off by one — deliberately.** The pending-embed marker's
+`seg_line` (§1, `state/pending_embed.json`) is **1-based**: the count of `\n`
+bytes in the segment before the write, plus one, so it names the physical line
+a human would `sed -n` for. The Postgres mirror's `seg_line` column
+(`pgmirror.scan_segments`, `events._segment_lines`, `corrupt_rows`) is
+**zero-based**, because it is a stored join key that must not be renumbered. A
+reader that consumes the marker and then joins against the mirror subtracts one;
+neither number is going to change to meet the other.
+
 ## 3. Event taxonomy and payload contracts
 
 Two classes (registered in `events.py`):
@@ -131,10 +171,12 @@ LEDGER, the hash chain, the Memory view, and keyword recall:
 | `state_set` | `{task, verified, next_step, open_questions[], deferred[]}` | last one wins; excluded from LEDGER |
 | `code_change` | `{text, category, files[]}` | mandatory change-log (`changelog.py`); category ∈ update, minor_change, deletion, reduction, major_change, replacement |
 | `learning` | `{text, …}` | Self-Reliant PRD report |
-| `sop` | `{action, sop_id, title?, text?}` | SOP lifecycle (`sop.py`); action ∈ add, update, delete; current registry = deterministic fold, delivered via the STATE.md SOP block |
+| `sop` | `{action, sop_id, title?, text?}` | SOP lifecycle (`sop.py`); action ∈ add, update, delete; current registry = deterministic fold, delivered via the STATE.md SOP block. CLI writes pass the authorship gate (`advice.sop_write_refusal`: process token against `MINDHIVE_ORCHESTRATION_SECRET`, else the orchestration-session rule); the dashboard's `POST /api/append` refuses the type while a secret is configured (`advice.http_door_refusal`). The tag `sop-validated` is stamped by the write path when the token matched — a caller-supplied one is dropped (`advice.write_tags`) — is accumulated by the fold over every applied write (record key `validated`, never cleared by a later unstamped edit or a delete), and is carried into `mandatory_sops.json` as the row key `validated`, which `advice.classify_author` reads as provenance `orchestrator` |
 | `roadmap` | `{action, plan_id, title?, prompt?, steps[]?, index?, status?, cause?, note?, reason?, work_branch?, work_pr?, work_commits[]?}` | Flat plan registry (`roadmap.py`); action ∈ set, step, interrupt, resume, complete, archive, link; `set` replaces the step list wholesale (≤ `MAX_STEPS` 50, no `parent_id`); `interrupt` projects the STATE.md out-of-usage marker; `archive` retires a plan whose last step nothing can verify and **requires `reason`**; `link` records the work link and touches nothing else. The three `work_*` keys may ride ANY action and MERGE into the record (an absent key keeps what is on file — `sync_from_todos` re-`set`s without one), so a plan stays pointed at its code across a re-plan. `roadmap.py` owns the contract; `repo.py` owns the probe that reads it |
 | `mindnet_task` | `{action, task_id, title?, parent_id?, description?, status?, on?, ref?, dependencies[]?, language_context[]?, validation_script?, faculty?, triviality_bypass?}` | MN-2 hierarchical task graph (`mindnet/tasks.py`); action ∈ declare, status, depend, reparent, evidence. **No `phase` action** — the phase axis has exactly one writer (see `mindnet_phase`). `triviality_bypass` is honoured on the FIRST declare only. The fold *refuses* cycle-closing / over-deep / settled-work edges and records the refusal in the record's `violations` rather than entering the bad state |
 | `mindnet_phase` | `{action, task_id, phase?, epoch?, evidence?{kind, ref?, result?, detail?}, detail?, verified_by}` | MN-1 phase spine (`mindnet/phases.py` contract, `mindnet/controller.py` fold); action ∈ declare, enter, satisfy, fall_back; phase ∈ brainstorm, plan, prd, execution, audit-bug, audit-code, audit-system, pr-green; evidence kind ∈ file, event, command, human; `verified_by` ∈ python, agent, human. **Two validators, deliberately:** `validate_payload` (the raw-append surface) REFUSES a payload carrying `verified_by`, and `validate_stored` (the writer, called just before `append_event`) REQUIRES it |
+| `work_session` | `{action, session_id, step_id, status, timestamp, phase?, ws_tag?, initiative_tag?, usage_tag?}` | Work Sessions (`worksessions.py`, blueprint P1b, BAB 5); action ∈ step_append, step_status; status ∈ active, completed, pending, blocked; `timestamp` is `%Y-%m-%dT%H:%M:%SZ`, every field zero-padded (a stamp `strptime` alone would take, such as `2026-9-1T0:0:0Z`, is refused: stamps sort as strings); `step_id` is letters, digits and `._:-` (at most 128). A `step_append` carries the whole blueprint §8.4 step: `phase` is one of the ten `worksessions.WORK_STAGES` (the methodology axis, which is deliberately a different axis from the MindNetwork spine above), and each tag must be exactly what its builder writes — `ws_tag` parses as `[WS: phase, action, stamp]` with the payload's own phase and timestamp, `initiative_tag` round-trips through `make_initiative_tag` or `make_user_spec_tag`, `usage_tag` is `[USAGE: …]`. The keys `reason`, `ref` and `tag` belong to `initiative_declared` and are refused here. A `step_status` carries only the session, the step, the new status and its timestamp. The EVENT's session is authoritative: the fold files a row under its event's session, skips a payload naming another session, and keeps the first row per step id (the writer suffixes a colliding id, checking and appending under `worksession_lock.record_lock` so concurrent writers cannot both take one id). Both types are `events.BOOKKEEPING_TYPES`: semantic, but never a session's liveness on the Oversee board or in the Sessions view, and rendered in the Memory view through their LEDGER body. A step whose `initiative_tag` is `[INITIATIVE: …]` is itself an initiative declaration. The fold is total and replays every row, so the type is exempt from consolidation and dedupe |
+| `initiative_declared` | `{reason, ref, tag}` | An autonomous initiative that is not one step, declared on its own row so it is never slipped in silently (BAB 5.3.2); owner `initiatives.py`, which is also this type's contract module. `reason` is non-empty and `reason`/`ref` are stored in the cleaned form a tag carries (no `[`, `]`, pipe or newline, whitespace folded, at most 200 characters), `tag` must equal `worksessions.make_initiative_tag(reason, ref)`, and the work-session keys (`action`, `step_id`, `phase`, `ws_tag` and the rest) are refused. Written by `hive worksession initiative`. `initiatives.initiatives` lists these rows together with every `[INITIATIVE: …]` step, oldest first; the Oversee Autonomous Initiatives group shows them newest first |
 
 **Deterministic** (`DETERMINISTIC_TYPES`) — machine-harvested telemetry:
 `file_touched`, `command_run`, `git_diff`, `session_start`, `session_end`,
@@ -159,12 +201,24 @@ unvalidated ledger string into the rendered trail), `memory_consolidated`,
 recorded enrichment acts and the default-on toggle's audit trail — the
 settings sidecar `enrich.json` is the source of truth),
 `autoresume` (`{action, plan_id, due?, attempt?, cooldown_hours?, cwd?,
-model?, timer?, outcome?, detail?}` — auto-resume delivery lifecycle,
-`autoresume.py`: action ∈ scheduled, fired, cancelled; after a usage-limit
-interruption the roadmap marker is scheduled to re-enter Claude once the
-~5h window reopens, and these events are the delivery audit trail; the
-roadmap events remain the semantic record),
-`mindnet_activity` (`{faculty, status, task_id?, phase?}` — MN-1's faculty feed
+model?, timer?, mode?, goal_dir?, checked_high?, outcome?, detail?}` —
+auto-resume delivery lifecycle, `autoresume.py`: action ∈ scheduled, fired,
+cancelled; after a usage-limit interruption the roadmap marker is scheduled
+to re-enter Claude once the ~5h window reopens — mode "prompt" as a one-shot
+headless session, mode "loop" by relaunching the loop engine on `goal_dir`
+(through `fabricate.run` when the plan is a fabrication's `fab_id`), whose
+re-arm carries `checked_high`, the most `fix_plan.md` items the chain has
+seen checked, so only a wake-up that checks off something new restarts the
+attempt count; these events are the delivery audit trail and the roadmap
+events remain the semantic record),
+`fabrication` (`{action, fab_id, goal_dir?, title?, steps?, source?, due?,
+timer?, cwd?, run_id?, reason?, iterations?}` — PRD assembly-line
+lifecycle, `fabricate.py` (blueprint P10, spec Bug 9): action ∈ compiled,
+dispatched, run; a PRD compiled into a loop goal dir + fabricate-tagged
+roadmap, armed on an OS timer, and executed unattended by the loop engine —
+`run_id` joins each launch to its `loop_*` telemetry; contract enforced at
+the raw append surfaces through `contracts._PAYLOAD_CONTRACTS`),
+`interceptor_signal` (`{tool_name, phase, action_type, pr_number, lane_commit_sha, merge_actor, merged, ci_status, reason, ts, exit_code?}` — one row per observed git-gateway act, blueprint P1f, `orchestrator/interceptor.py`. `action_type` ∈ pr_merge, pr_close, pr_create, git_merge; `merge_actor` ∈ claude_code, ci_bot, human_manual, unknown, "". The two empty-ish actors are distinct and neither may be rounded to `human_manual`, which is a claim about a person: `""` means no probe ran, `unknown` means one ran and could not tell. The `pre_tool_use` hook records the INTENT to a per-session sidecar (`state/interceptor_intent_<segment>.json`, expiring after `INTENT_TTL_S` = 600 s) and `post_tool_use` pairs the result with it, so a post for any other tool call costs one `stat` and no subprocess. Deterministic because the row carries no human intent — it is the answer to "who landed this", which a tool result cannot give), `merge_conflict_detected` (`{branch, conflicts, tree}` — one row per lane `mindnet/worktree.merge_probe` found colliding, written as the probe answers and best-effort: an unwritable ledger must never turn a probe that ANSWERED into one that raised. `tree` is the object name `git merge-tree` wrote while finding the conflicts, which is what separates a real collision from an unknown ref), `mindnet_activity` (`{faculty, status, task_id?, phase?}` — MN-1's faculty feed
 for MN-5's cat board, `mindnet/telemetry.py`: faculty ∈ skill-plugin, sop,
 improvements, history, task-graph, compatibility, pr-green; status ∈ active,
 idle; `task_id`/`phase` are decoration and are dropped when malformed rather
@@ -456,7 +510,7 @@ hive append / hive log / hive sop ──▶          │
  (state_set fold,  (1 file per     (hash chain     (dedup + caps)  (tag/entity
   notices, rules,   semantic ev)    over semantic)                  edges)
   SOP block)            │
-        │               └──────────▶ hive recall (keyword) / chroma (semantic)
+        │               └──────────▶ hive recall (keyword) / chroma (semantic, §4.19)
         ▼
     MEMORY.md  (sync.py — auto-loads into every session)
 ```
@@ -480,6 +534,15 @@ Key joins an AI reader should know:
   audit row to its work: the row explains WHY a step exists, the step IS the
   work. The key is optional on the row because a future sink need not land in a
   roadmap at all (the loop's checklist sink has no `plan_id`).
+- `fab_id` threads a fabrication's compiled/dispatched/run events into one
+  assembly-line record (`fabricate.fold`); it doubles as the roadmap
+  `plan_id` for the whole fabrication (`hive fabricate run` hands it to
+  `run_loop(plan_id=…)`, so a usage cap interrupts THAT plan and arms a
+  loop-mode `autoresume` on its `goal_dir`, instead of minting a per-run
+  plan; that wake-up runs back through `fabricate.run`, so it too records a
+  run event and can close the plan), and each run event's `run_id` joins the
+  launch to its
+  `loop_run_start`/`loop_iteration`/`loop_run_end` rows.
 - `work_branch` / `work_pr` / `work_commits[]` are the roadmap's join *outward*,
   to git and GitHub — the plan's only checkable link to the code it produced.
   All three are optional and independent (§4.15).
@@ -1581,14 +1644,20 @@ both used to degrade with nothing said.
 
 ```json
 {"budget": 51000, "memory_lines": 200, "memory_bytes": 25000,
+ "adaptive_tail": {"enabled": false, "lessons": 10, "decisions": 5},
  "set_at": "2026-08-13T00:00:00Z"}
 ```
 
 Config, not a projection: it is not rebuildable from the ledger, exactly like
 `rules/enforce.json`. `budget` is the namespace's estimated-token ceiling for the
 auto-loaded surface; `memory_lines` and `memory_bytes` are the two cuts the native
-loader applies to `MEMORY.md`. Writes **merge over all three**: these are set at
-three different moments, and setting one must never discard another. A missing,
+loader applies to `MEMORY.md`; `adaptive_tail` is the digest's adaptive-tail opt-in
+and its two item caps (`hive context --set-adaptive-tail`, blueprint P1c; a missing
+or corrupt value reads as off, with the digest's own caps of 10 and 5). Writes
+**merge over every key**: these are set at different moments, and setting one must
+never discard another (`save_budget` carries `adaptive_tail` forward,
+`adaptivetail.save_adaptive_tail` keeps the budgets). A command that exits 2 has
+written none of them. A missing,
 corrupt or non-positive value reads as unset (token budget) or as
 `context.MEMORY_LINE_BUDGET` / `context.MEMORY_BYTE_BUDGET` — a bad value must not
 silence a real measurement.
@@ -1598,8 +1667,9 @@ Those numbers bound different failures, which is why they are separate:
 | | Bounds | Past it |
 |---|---|---|
 | `budget` | **cost** — tokens spent before work starts | reported; `hive context --check` exits 1 |
-| `memory_lines` | **loss** — the loader reads only the first N lines | the digest's *tail sections* never arrive; `--check` exits 1 even with no token budget set |
+| `memory_lines` | **loss** — the loader reads only the first N lines | the digest's *tail sections* never arrive; `--check` exits 1 even with no token budget set — unless the truncation is MANAGED (the digest's rollover notice, outside any code fence, has its first line before the cut, so the session is told what moved to the semantic index), which prints `WARNING:` and keeps the exit code (2 with no token budget) |
 | `memory_bytes` | **loss** — and the cut that actually bit | same, and it is the one to check first: measured live at 404a7c0, the delivered digest stopped at LF byte ~24,900 |
+| composer safe budget (24,500 bytes / 195 lines, `adaptivetail.MAX_LOADER_*`) | **margin** — what the adaptive tail sizes the digest to: 500 bytes / 5 lines under the loader cut, and the same margin under a lower `memory_bytes` / `memory_lines` | the loader still reads the file whole; `--check` prints `WARNING:` (`memory_over_safe_budget`) and keeps the exit code |
 
 The loss case is the subtler one, and it has bitten twice for two different
 reasons. First: `sync` caps ITEM COUNTS (`LESSONS_CAP`, `DECISIONS_CAP`) and no
@@ -1648,7 +1718,7 @@ healthy digest is a notice every reader learns to skip. It enters at
 the STATE.md rebuild and the digest `sync` embeds in `MEMORY.md`; the latter is the
 file a session loads without being asked, and is the reason the notice is composed
 there rather than in `cmd_state`, which does not build STATE.md at all — it prints
-the file (`__main__.py:282-284`).
+the file (`commands/context_ops.py::cmd_state`).
 
 Three properties of that block are stated inside it rather than left to a reader:
 
@@ -2199,6 +2269,573 @@ unmatchable rather than merely unused (005).
   binaries unpacked into a temp directory). Nothing about a production
   deployment — TLS, real authentication, backups — has been exercised.
 
+### 4.19 The Chroma secondary projection (semantic recall)
+
+The vector index is the store's CQRS read side, and like every other projection
+in §1 it is **disposable**. The ledger is the write side and the only source;
+nothing is ever written to chroma that did not come from it, and deleting
+`chroma/` loses nothing that `hive embed` cannot rebuild (with the one exception
+named under *Three collections* below). It is optional as a whole: without
+`pip install -e .[vectors]` (chromadb, sentence-transformers) every path below
+answers structurally, naming the extra, and the lexical paths keep working
+(invariant 5). And a read never writes it: see *The read path* below.
+
+**What feeds it.** Only `events.SEMANTIC_TYPES` rows — decisions, experiment
+results, caveats, next steps, open questions, `state_set`, `code_change`,
+learnings, SOPs, roadmap and MindNetwork task/phase rows. Deterministic telemetry
+is never embedded, which includes the watcher's own `vector_sync_*` rows.
+
+**On disk** (all under `<store>/<project>/`, the namespace directory):
+
+| path | what it is | written by |
+|---|---|---|
+| `chroma/` | a `chromadb.PersistentClient` directory: `chroma.sqlite3` plus one HNSW segment directory per collection | `vectors._client` |
+| `chroma.lock` | the `core.locks.file_lock` every chroma **write** takes (wait 30 s, stale after 600 s; `vectors.CHROMA_LOCK_*`), because two processes writing one SQLite file on NTFS fail as `database is locked` | `vectors.chroma_lock` |
+| `state/pending_embed.json` | the queue (§1) | `append_event`, inside the append lock, fail-open |
+| `state/processing_embed_<time_ns>.json` | one watcher's claim on the queue, taken by atomic rename | `watcher.run_once` |
+
+Every collection is created in cosine space with the tuning in
+`vectors.HNSW_METADATA` (`M=16`, `construction_ef=100`, `search_ef=32`), encoded
+by `all-MiniLM-L6-v2` (384 dimensions) on the local CPU. chroma ignores the
+metadata argument for a collection that already exists, so an embed path that
+finds a collection whose tuning drifted (`vectors.hnsw_drift`) drops and refills
+it; a query path takes whatever is there. `import mindhive.vectors` bounds the
+encoder's threads with `setdefault` (`OMP`/`MKL`/`OPENBLAS`/`VECLIB`/`NUMEXPR` = 2,
+`TOKENIZERS_PARALLELISM=false`), so an exported value still wins.
+
+**Three collections, two writers, and one of them no search reads.**
+
+| collection | one vector per | id | written by | read by |
+|---|---|---|---|---|
+| `ledger` | `LEDGER/*.md` file | the file name | `hive embed` (`vectors.embed`), delete-before-add | `hive recall --semantic`, as the fallback; the semantic graph (`graph.build(semantic=True)`) |
+| `events` | semantic event | `sha256` of the event's canonical JSON, first 32 hex (`vectors.event_id`), so a re-run skips what is present | `hive embed` (`vectors.embed_events`), incremental | `hive recall --semantic` and the dashboard's `/api/recall`, first |
+| `mindhive_<slug>` (`vectors.collection_name`) | queued semantic row | `"<session_id>:<seg_line>"`, metadata `session_id`, `seg_line`, `chain_hash`, `event_type`, `timestamp`, `provenance` | the embedding watcher (`VectorStoreManager.embed_batch`, batches of 32 with a 50 ms yield, under `chroma.lock`) | no search: `VectorStoreManager.semantic_query` has no caller in `src/`; the watcher's own id probe (`VectorStoreManager.already_indexed`) reads it, from a copy, to skip rows already embedded |
+
+**The write paths.**
+
+1. `append_event` appends the row, then (still inside the append lock) queues
+   `{session_id, segment, seg_line, queued_at}` in `state/pending_embed.json`
+   (`embedqueue`). A failure to queue is swallowed: the append is what must
+   not be lost.
+2. The embedding watcher (`watcher.py`) claims the queue by renaming it to
+   `processing_embed_<time_ns>.json` (backoff `0.02, 0.04, 0.08, 0.16, 0.32` s),
+   reads each physical record, embeds the batch into `mindhive_<slug>`,
+   appends `vector_sync_started` / `vector_sync_completed`
+   (`{marker, count, duration_s}`), and deletes the claim. A failed embed leaves
+   its claim on disk; `recover_stale_markers` returns a claim older than
+   `STALE_MARKER_S` (600 s) to the queue after reconciling it against the index.
+   It runs as a daemon thread inside `hive dashboard` and `hive ui` (which
+   recover stale claims at boot, then start it; poll `MINDHIVE_WATCHER_POLL_S`,
+   default 2 s), or by hand as `hive watcher run [--once]`.
+3. `hive embed [--project P] [--rebuild]` fills `ledger` and `events`
+   straight from the ledger and its projections, independently of the queue;
+   it never writes the watcher's collection, `--rebuild` included.
+   `--rebuild` drops both first. `--project` names the namespace verbatim,
+   as the repair messages below name it. `--force` does not rebuild
+   anything: it only overrides `LIVE_LOCK` (`guard.ensure_safe`).
+
+Writers — `hive embed`, the watcher, `LocalVectorIndex.embed_batch` — open the
+index directly and serialise on `vectors.chroma_lock`.
+
+**The read path.** Read paths may NOT mutate the index. Every read — `hive
+recall --semantic`, the dashboard's `/api/recall`, `graph.build(semantic=True)`,
+`VectorStoreManager.semantic_query`, the watcher's id probe
+`VectorStoreManager.already_indexed`, `LocalVectorIndex.query` — goes through
+`vectors._read_view`, which queries a private byte copy of the index taken by
+`vector_snapshot.reading`. A reader never takes `chroma_lock` and never
+creates, drops or re-tunes a collection: `_open(..., client=...)` only looks a
+collection up, and an index that does not hold it answers empty. (The id probe
+used to reach the live index through `get_or_create_collection`, so probing a
+slug never embedded minted an empty collection, and every probe wrote.)
+
+**Reads and the index files.** The decision has to be enforced by a copy
+because chromadb 1.5.9 has no read-only client, and a read through an ordinary
+one writes. Measured on a scratch store (and pinned by
+`tests/test_vector_snapshot.py`, whose byte-identity test fails in exactly
+this way when `vectors._reading` is pointed at the live directory): one
+`hive recall decision --semantic` changed the sha256 of `chroma.sqlite3` and
+of the queried collection's `data_level0.bin` and `length.bin`. Only that
+collection's segment moves: re-measured on a two-collection scratch store, a
+read of `events` left every file of the `ledger` segment byte-identical. Two
+mechanisms, both inside chromadb:
+
+- every client open commits an `acquire_write` row to `chroma.sqlite3`,
+  whether or not the caller ever writes;
+- an HNSW segment is persisted only after `hnsw:sync_threshold` (default 1000)
+  rows, so below that every reader re-initialises the segment files and
+  replays the embeddings queue into them.
+
+A reader mutating the index is not a cosmetic problem: it is a write that takes
+no `chroma_lock`, racing the watcher's embed batches on one SQLite file, and
+it turns every audit of "did anything change the index" into noise.
+
+The copy is checked, not locked. `vector_snapshot` fingerprints the source
+(every file's size and mtime, plus SQLite's file change counter, header bytes
+24–27) before and after `copytree`; a copy whose fingerprints disagree is
+discarded and retaken, and after `COPY_ATTEMPTS` (5) the read fails with a
+`snapshot` error naming the busy writer rather than answering from a torn copy.
+An unchanged index is copied once per process and the open client reused; a
+changed one gets a fresh copy, and the old copy is closed and deleted when its
+last reader is done. Measured against the real 9.8 MB index: fingerprint
+1.1 ms, a checked copy 13.5 ms median (19.8 ms worst of five). Under
+contention (a scratch writer adding rows while readers looped) a plain
+`copytree` accepted 1 torn copy in 179 and raised on 12 more; the checked copy
+accepted none in 234, and failed with `snapshot` on 15% of reads only while the
+writer never paused (2 in 609 with 0.3 s between writes). Each file is copied
+with `shutil.copyfile`, not `copytree`'s default `copy2`: under Python 3.14 on
+Windows `copy2` copies through CopyFile2, which denies every other opener write
+access to the file while it copies — measured, a writer opening a 32 MB segment
+file during three copies was refused with `PermissionError` 225 times, and the
+writer refused is `hive embed` or the watcher persisting a segment. `copyfile`
+shares the file for writing; its handle does not share deletion, which SQLite
+retries when it deletes its journal.
+
+Copies live in the temp directory as `mindhive-chroma-read-<pid>-*`, and none
+is left behind silently. A delete Windows refuses — a closed client not yet
+letting go of a file; under a busy writer 8 closed 9.4 MB copies were seen
+left on disk — is retried `REMOVE_ATTEMPTS` times, then logged and retried on
+the next fresh copy and at exit. The first fresh copy a process takes also
+deletes every copy whose owning pid is certainly gone (a process killed before
+its `atexit` hook); a running process's copy is never touched.
+
+**A failed read is an error, never an empty answer.** Each step that can break
+raises `vectors.SemanticQueryError` (a `RuntimeError`) whose `stage` names it —
+`snapshot`, `open`, `count`, `encode` or `query` — with the collection name and
+the original exception as `__cause__`. It lives in `vector_errors`, with the
+remedy and the judge below, and `vectors` re-exports it. A panic in chromadb's
+Rust core is such a failure too: on a malformed SQLite page pyo3 raises
+`pyo3_runtime.PanicException`, a `BaseException`, and it went past every
+`except Exception` of the read path — a raw traceback from `hive recall
+--semantic`, every other namespace's hits lost from a HIVE MIND search, the
+client that panicked left in service. `vector_errors.as_failure` wraps it like
+any other failure; an interrupt (`KeyboardInterrupt`, `SystemExit`) is raised
+again as it is. `[]` means only "nothing matched",
+"nothing is indexed", or a limit below 1 — a search for no hits, answered before
+anything is copied or opened, as `PgVectorIndex.query` answers a `top_k` of 0.
+(`LocalVectorIndex.query` has a third meaning, logged as a warning: every hit
+was a row `hive embed` wrote, too thin to rebuild a record from.) A client that
+answered can still fail a read, as stage `query`: with a hit it returned
+without its document (`MissingDocument`, raised by `vector_errors.text_of` —
+chromadb answers `None` for a stored document it cannot decode, measured on
+invalid UTF-8), or with no hits from a collection holding rows the query could
+have returned (`UnansweredQuery`). Measured on a scratch index whose
+`collections.dimension` was set to NULL: `count` answered 1,300 and every query
+answered nothing, with no error, and `recall` fell back to the file index in
+silence, as it does for an event index never embedded.
+So when a query comes back empty, `vectors._ask` asks the collection for one
+row its `where` matches, or for its count when there is no `where`, and a
+positive answer is the failure. Neither is the client's own failure, so the
+judge claims neither: the copy stays in service, and each read of the same
+bytes fails the same way until they are repaired. The message
+names the project namespace and a remedy chosen by what broke, because the
+repairs differ and one of them does nothing on the wrong damage. A repair that
+runs `hive embed` names the namespace as `--project <ns>`, verbatim: the
+command would read `MINDHIVE_PROJECT` through `paths.normalize`, which turns
+`my_proj` into `my-proj`, and the advice repaired another namespace. Except a
+quarantined namespace: a name `paths.namespace_name` refuses to use as is — the
+reserved `unsafe-` prefix, or on Windows a device name such as `aux` — lives in
+a directory named `unsafe-<hash>`, and `--project` refuses both that name and
+the one quarantined there (`cliparse.project_arg` takes only a name that is its
+own namespace name; exit 2). There the message offers no `--project` and says
+to run `hive embed` the way the project was selected — from its checkout, or
+with the same `MINDHIVE_PROJECT` — which reaches the same directory. A checkout
+of a repository whose name starts with `unsafe-` is enough to meet it.
+
+| stage | what broke | remedy the message gives |
+|---|---|---|
+| `snapshot` | `SnapshotError.reason` `busy` | retry when `hive embed` or the watcher has finished |
+| `snapshot` | `copy` | free space in the temp directory, or retry if a writer held a file |
+| `snapshot` | `space` | the temp directory is full or not writable |
+| `encode` | the embedding model | none on the index: the model failed to load or run |
+| `query` | an argument chromadb refused before touching the index — `ValueError`, `TypeError`, `OverflowError` (an `n_results` past 2**32 − 1), `DuplicateIDError` (an id named twice in one request) | none: the index is not at fault |
+| `query` | the collection — a damaged one, one another model built (a query of the wrong width: `InvalidDimensionException`, or `InvalidArgumentError` "Collection expecting embedding with dimension of 8, got 384"), or a log chromadb cannot read | `hive embed --rebuild --project <ns>`; if the read still fails, delete the `chroma/` directory it names and run `hive embed --project <ns>` |
+| `query` | rows the client answered without — a hit without its document (`MissingDocument`), or no hits from a collection holding rows the query could have returned (`UnansweredQuery`) | the same: `--rebuild` first, then the delete. Not claimed by the judge: the client answered |
+| `count` | the collection — whatever the exception, since a count takes no argument a caller chose | the same: `--rebuild` first, then the delete |
+| `open` | a cut `header.bin` in a persisted segment of the `ledger` or `events` collection read (`DamagedSegment`, whose `collection` is that one) | the same: `--rebuild` first, then the delete |
+| `open` | anything else — files chromadb cannot open (a `chroma.sqlite3` that is not a database, a collection configuration it cannot deserialize, which fails every read, since a read lists every collection), or a cut segment whose owner the copy's catalogue could not name | delete the `chroma/` directory it names and run `hive embed --project <ns>` — not `--rebuild`, which needs the files open too and fails on them (below) |
+| `open`, `count`, `query` | the watcher's `mindhive_<slug>` collection | delete the `chroma/` directory and run `hive embed --project <ns>` for `ledger` and `events`; the watcher's collection refills only with rows appended after that. `hive embed` never writes it, `--rebuild` included, so no rebuild is offered |
+| any of the above | a read refused past `POISON_LIMIT` (`IndexUnreadable`, `capped`) | the repair of its row, with a restart of this process after the rebuild or the delete — past the cap an index with a failure no read has got past is not read again until the process restarts (item 4 below) — and the delete, after a rebuild, only if a read after the restart still fails |
+
+**Why the rebuild comes first where it does.** `hive embed --rebuild` asks
+chromadb for `ledger` and then `events` by name — `get_or_create_collection`,
+each through a client of its own — then drops each with `delete_collection`
+and fills a new one: it never reads the dropped collection's segment. (A read
+lists every collection first, `list_collections`, and then asks for the one it
+reads.) Measured on scratch copies of one
+three-collection index (chromadb 1.5.9; `events` 1,300 rows of width 8, its
+HNSW segment persisted), each damaged one way, read, rebuilt and read again:
+with the `events` segment's `header.bin` cut to 7 bytes or overwritten with
+garbage, its `index_metadata.pickle` cut, its `segments` row deleted, or its
+`link_lists.bin` cut (whose read hung past 150 s), the rebuild exited 0 and
+every read after it answered, the watcher's collection intact; the same for a
+cut `data_level0.bin`, which every read before it had answered without an
+error, and for a cut or a garbage `ledger` header. A garbage `max_seq_id` failed the count and
+the queries with `InternalError` "Error reading from metadata segment reader";
+the rebuild mended `ledger` and `events` and not the watcher's collection,
+which it never writes. So with a `collections.dimension` set to NULL: before,
+the count answered 1,300 and the damaged collection's queries nothing; the
+rebuild mended `ledger` and `events`, and the watcher's collection still
+answered nothing. Where chromadb cannot open the files the rebuild fails too:
+at its first open on a `chroma.sqlite3` whose first 100 bytes are garbage
+("file is not a database"), and on an `events` configuration it cannot
+deserialize it rebuilt `ledger` and then failed on `events` ("Could not fetch
+collections: Could not deserialize configuration"). That failure went out of
+`hive` as a traceback; `hive embed` now prints one `error:` line — what it
+wrote before the failure, and `vector_errors.embed_failure`'s repair: the
+delete after a failed rebuild, the rebuild first after a failed plain embed, a
+retry behind another writer's lock — and exits 1. A cut segment of the
+watcher's collection still refused every read of it after the rebuild.
+chromadb leaves a dropped collection's segment directory on disk,
+which the catalogue no longer names, so `check_segments` judges only the
+segments the copy's `chroma.sqlite3` names: judging every directory, the cut
+header the rebuild had just dropped refused every read after it.
+`tests/test_vector_snapshot.py` rebuilds a cut `events` segment in a child
+process and requires the count to answer. The rebuild is not always a drop:
+`hive embed` returns before it opens the index when there is no
+`LEDGER/*.md`, or no event of a semantic type, so that collection is left as
+it was — one reason every rebuild-first remedy names the delete as well.
+
+A refused argument is recognised only at `query`, and never by
+`InvalidArgumentError`: chromadb 1.5.9 raises that class for a log it cannot
+read as well — "Error executing plan: Error sending backfill request to
+compactor: Failed to pull logs from the log store", measured on damaged rows of
+the embeddings queue at the count and at the query, the count passing chromadb
+nothing but the collection's id, tenant and database. Taken for a refused
+argument, a damaged index was reported as not at fault, with no repair, and
+its client was never poisoned: kept in service, it failed every later read.
+
+A missing extras install is not a `SemanticQueryError`: it stays the
+`RuntimeError` refusal, raised before anything is copied or opened.
+
+`recall.recall` refuses LIVE_LOCK before it opens anything, answers a limit
+below 1 with `[]` (in both modes: the keyword path's `[:-3]` was all but the
+last three hits), then asks `indexed_event_count(strict=True)`, so a broken
+event index raises instead of reading as 0 and falling back to the file index
+in silence; the non-strict count, for callers that only display it, logs the
+failure and answers 0. An event query that answers nothing from an index
+holding rows it could have returned raises as well (`UnansweredQuery`,
+above), where it fell back to the file index in silence; the file index
+answers only an event query that matched nothing or an event index that holds
+nothing. `hive recall --limit` refuses a value below 1 as a usage
+error (exit 2). `hive recall --semantic` exits **1** on a `SemanticQueryError`;
+it and `hive embed` exit **2** on a refusal (LIVE_LOCK, extras missing), each
+with `error: …` on stderr. `/api/recall` answers a failure with a 500 and the
+recall view throws it, so `run()` paints `Recall failed: …` and announces the
+search failed — painted by hand, the status chip read "ready" over the error.
+In HIVE MIND view the search goes through `recall.recall_across`: a namespace
+whose index could not be read answers one `{project, error}` row in place of
+its hits, and the view names it beside the other namespaces' hits; only when
+no namespace could be read is the first failure raised, and a refusal is
+raised as is. The watcher's id probe asks each id once, `ID_PROBE_BATCH` (256)
+at a time. Once: a claim recovered twice queues its rows twice, and chromadb
+refuses a `get` that names an id twice with `DuplicateIDError`, raised in
+Python before the index is read — claimed as damage, it poisoned a healthy
+index, and it is now a refused argument (the table above). At a time: chromadb
+binds one SQL variable per id, and 40,000 in one `get` raised "too many SQL
+variables" as an `InternalError`, the class a damaged index raises. It answers
+an empty set on any failure, logged: it only decides what to re-embed, and an
+`add` of an id the collection already holds is a no-op in chromadb 1.5.9
+(measured: no exception, count and stored vector unchanged), so a probe that
+failed costs encodes, never vectors.
+
+A semantic graph build that failed returns the deterministic graph with no
+semantic edges at all: the pairs are added only once every query has answered,
+so a pass that failed half-way keeps none of the links it had found — it kept
+them, under a banner saying there were none. It records a non-empty
+`semantic_error` in the result (the exception's type when its message is empty,
+which would otherwise hide the banner) and logs a warning; the page rendered
+from that result — `hive graph export --semantic`, the dashboard's
+`/api/graph?semantic=1` — shows it as a banner, inserted as text, never markup.
+`graph.json` does not keep the error: a semantic view is always rebuilt, so the
+file is what a later plain viewer is served, and a failure written into it
+would outlive the index that caused it. A semantic build that succeeded does
+write its edges into `graph.json`, where a later plain viewer is served them
+with the rest; that is not settled here.
+
+**A read that fails inside chromadb.** Measured on a scratch index whose
+persisted HNSW `header.bin` was cut to 7 bytes (a whole one is 100): the count
+fails, and then ANY teardown of that client — `close()`, dropping its last
+reference, interpreter exit — corrupts the heap (exit `0xC0000374`). So the
+defence is layered, from cheapest to last resort:
+
+1. `vector_snapshot.check_segments` refuses a read of a collection whose
+   persisted segment (one with `index_metadata.pickle`) is shorter than its
+   own header says it must be, before chromadb reads it; that surfaces as
+   stage `open`. `header.bin` is chroma-hnswlib's 100-byte `saveIndex`
+   header (`HNSW_HEADER`, `struct` `<i6QiI3QdQ`: the persistence version;
+   `offsetLevel0`, `max_elements`, `cur_element_count`,
+   `size_data_per_element`, `label_offset`, `offsetData`; `maxlevel`,
+   `enterpoint_node`; `maxM`, `maxM0`, `M`; `mult`, `ef_construction`), and
+   the other files' lengths follow from it: `data_level0.bin` holds
+   `cur_element_count` elements of `size_data_per_element` bytes (`maxM0*4+4`
+   of level-0 links, the vector, the 8-byte label), `length.bin` four bytes
+   per element, and `link_lists.bin` one `[u32 size][links]` record per
+   element whose size is a multiple of `maxM*4+4` and at most `maxlevel` of
+   them. Deleted rows stay counted, and a segment sized for `max_elements`
+   and never grown is longer than it needs to be; both pass. Refused, each
+   named with the bytes found and the bytes needed: a `header.bin` under 100
+   bytes or at odds with itself (more elements than room, a size of 0, an
+   offset past the element); `data_level0.bin` or `length.bin` missing or
+   shorter than the elements need; `link_lists.bin` missing, cut inside an
+   element, or with an element claiming more levels than the header allows.
+   Walking the link lists of 40k elements costs 13.7 ms, once per copy.
+   Measured in a child process on a 1,300-row `events` segment persisted
+   whole (`tests/test_vector_snapshot.py`): `data_level0.bin`, `length.bin`
+   and `link_lists.bin` each cut in half are refused at the open naming
+   `events`, three reads of three, `ledger` answering beside them; the whole
+   segment passes and counts 1,300. Before the length checks the cut data
+   file answered without an error, missing its best hits, and the cut link
+   file crashed or hung the process (*What the check could not see*, below).
+   It is the reader's check (`reading(check=…)`), asked for
+   the collection read, not the open's: chromadb loads a collection's HNSW
+   segment only once that collection is counted or queried, so with a cut
+   `events` segment `ledger` is read from the same copy, whose client, never
+   having loaded the cut segment, closes as any other.
+   `tests/test_vector_snapshot.py` reads `ledger` beside each of three
+   refused reads of `events` in a child process that closes the copy at exit
+   and lives — 5 runs of 5. Asked at the open, the check refused the whole
+   copy, and with it every read of `ledger` for a cut `events` segment. The
+   answer is kept on the copy, per collection (`_Snapshot.checked`): the
+   copy's bytes do not change, so neither does the answer, and a read of the
+   same copy is refused the same way until the source changes. A refused read
+   read nothing: it is not the client's failure, is never judged, and is not
+   remembered past its copy. A never-persisted segment with a short header is
+   harmless and passes, and so does the directory of a segment the copy's
+   `chroma.sqlite3` no longer names — a dropped collection's, which chromadb
+   leaves behind and never opens (`_live_segments`, which compares segment
+   ids in one form, `_canonical`: chromadb finds a segment's directory by
+   parsing its id as a UUID). A catalogue that cannot be read names no owner,
+   and every segment is judged, whichever collection is read:
+   `DamagedSegment.collection` is then None and the repair is the delete.
+   Otherwise it names the collection read, and the repair is that
+   collection's — the rebuild for `ledger` and `events`, the delete for the
+   watcher's.
+2. A failure `vector_errors.judge` claims as the client's own — stage `open`,
+   `count` or `query`, with a cause other than an argument chromadb refused
+   before touching the index (the first `query` row of the table above), and
+   other than rows the client answered without (`MissingDocument`,
+   `UnansweredQuery`: the client answered, so it did not fail, and held for
+   good it would count a readable client toward the cap) —
+   poisons that copy. Read in-process, its client is never closed and never
+   freed (`_immortalise`), and the copy is left for a later process's
+   dead-pid sweep; read through the reading process (below), nothing in this
+   process touched the damage, so the client is closed — the child killed if
+   it will not go — and the copy deleted. A panic counts: before `as_failure` wrapped it, it reached no judge
+   and its client stayed in service. Claimed, a refused argument poisoned a
+   HEALTHY index: its client kept for good and every later read of it refused.
+3. The failure is remembered per (index, collection) against the bytes it
+   happened on, each fingerprint in a memo of its own: while those bytes are
+   unchanged, the next read of that collection is
+   refused (`IndexUnreadable`, reported as the original stage and cause) instead
+   of copied and opened again, until `FAILED_RETRY_S` (600 s) pass — a hiccup
+   on an index nobody writes to must not end semantic search for the life of a
+   dashboard. One memo per collection held only the last failure: a failure
+   on older bytes replaced the one on newer bytes, which the next reader of
+   those copied, opened and failed on again. The memo is asked on the way in, again once the copy is taken,
+   and again before the new client is installed: asked only on the way in,
+   every reader that overlapped one failure — copied before it, installed
+   after — went on to open, read and fail on the same bytes, and kept one more
+   client. A reader refused after its copy opens nothing; one refused at
+   install has read nothing, and its client is closed and its copy deleted.
+   Measured on copies with a cut or a garbage `header.bin`, a cut
+   `data_level0.bin` or `link_lists.bin`: a client that never read closed
+   cleanly in each of 5 runs, where one whose count had failed on the cut
+   header corrupted the heap as it closed (`0xC0000374`). Only the way in
+   forgets, and only a memo older than `FAILED_RETRY_S`, never a live memo of
+   other bytes: a copy taken before a writer came by is older than a failure
+   on what the writer left, and those bytes may still be the source's. A copy
+   never replaces a newer one: each records when its fingerprint was taken
+   (`_Snapshot.taken`), and one opened while a newer copy was installed
+   serves the reader that took it and is closed after it — installed, it took
+   the newer copy's place and closed it, and the next read of the newer bytes
+   copied the index again.
+4. Every poisoned in-process client is held until the process ends — a
+   failure through the reading process holds nothing, so the cap is a frozen
+   build's — so once
+   `POISON_LIMIT` (16) are held, a source is not read again until the process
+   restarts while it has a standing failure — one of any of its collections
+   that no read of that collection has got past since — and the message says
+   so. Per source, not per (index, collection): capped per collection, each
+   sibling of a failed collection was copied, opened, failed and kept one
+   more client past the limit. A way in that no memo refuses marks its
+   collection passed at the moment its fingerprint was taken (`_PASSED`), and
+   failures recorded before that count toward no cap, though they still
+   refuse their own bytes until they expire: kept for good, a failure refused
+   a source that was repaired and read fine since, until the process
+   restarted. One recorded after it may be of bytes that fingerprint never saw
+   — a writer came by, and a reader failed on what it left — so it counts.
+   The refusal is reported as the failure of a collection that failed, with
+   that collection's stage and repair: the one read, when it has a standing
+   failure itself, else the latest standing failure of its source. Its repair
+   names the restart (the capped row of the table above): past the cap a read
+   after the rebuild is refused as well, so without the restart the rebuild is
+   never read, and "if the read still fails, delete" would delete an index the
+   rebuild had repaired. A source that first fails after the limit is reached
+   still keeps one, so the bound is the limit plus one per source.
+
+A failed `PersistentClient` open leaves chromadb's own registry holding the
+half-built system (`SharedSystemClient._identifier_to_system`, measured: one
+entry per failed open, the copy's files still deletable); `open_chroma` pops
+it. On the same damage with fewer rows waiting in the queue — 130 rows at
+`sync_threshold` 100, 35 at 10 — runs of the count with the header check
+stubbed out crashed the process, hung past two minutes, or failed, the outcome
+varying between runs. The check contains all of them: it refuses each read
+of the damaged collection before chromadb reads the segment, and
+`tests/test_vector_snapshot.py` builds both indexes and requires every read of
+`events` to fail as stage `open`, every read of `ledger` beside it to answer,
+and the process to live — 5 runs of 5 under the per-collection check. Damage the check cannot see is met after the fact only where chromadb
+raises on it: a `header.bin` of whole length but garbage bytes failed the count
+with `InternalError`, which the judge claims, so the client is poisoned.
+
+**What the check could not see.** Measured on four scratch indexes through
+the read path before the length checks, chromadb 1.5.9: a `link_lists.bin`
+cut in half crashed the reading process with a segfault in 19 of 23 reads,
+hung it past 150 s in 2, and failed with a judged `InternalError` in 2 — and
+under `python -X faulthandler`, which neither the CLI nor the dashboard sets,
+4 reads of 4 failed with `InternalError` instead: the outcome follows the
+memory layout. A segfault reaches no judge and no `{project, error}` row: in
+the dashboard, one semantic search, HIVE MIND search or semantic graph over
+that namespace took the server down. A `data_level0.bin` cut in half answered
+every read but one count, which segfaulted, without an error; the one answer
+compared with the whole index's had silently lost its two best hits. Known,
+either cut is repaired — `hive embed --rebuild` left both cut `events`
+indexes answering, measured with the rest above — but the read that would
+make it known was one the process did not survive, or, for the cut data file,
+one that reported nothing. Two things contain that now. The length checks of
+item 1 refuse both cuts before chromadb opens them, as stage `open` with the
+rebuild-first repair. And the read runs in a process of its own (next), so
+damage of the right lengths that chromadb crashes or hangs on is `ReaderDied`
+or `ReaderHung` in the caller — a failed `count` or `query`, judged as the
+client's own, with the rebuild-first repair — and the caller lives:
+`tests/test_vector_snapshot.py` cuts `link_lists.bin` with the length checks
+stubbed out and requires each of three reads to fail at the count and the
+reading process to live, no copy left behind; through the reading process the
+same cut, 9 trials, failed 6 with `InternalError` relayed, 1 with a segfault
+as `ReaderDied` and 2 with hangs as `ReaderHung` after the timeout. Not
+contained: a wrong answer given without an error — bytes of the right length
+that chromadb answers from — which no guard can tell from a right one; the
+unanswered-query guard catches a query that answers nothing, never one that
+answers without its best hits.
+
+**The read runs in a process of its own** (`vector_reader`;
+`vector_snapshot.ISOLATE_READS`). `vector_snapshot.opener` hands `reading`
+`open_isolated` in place of `open_chroma`: the copy is opened by a child
+interpreter — a plain `python -c` subprocess, never `multiprocessing`, whose
+spawn re-runs the parent's `__main__` — that reads the address of a named
+pipe (`AF_PIPE` on Windows, `AF_UNIX` elsewhere), a 16-byte key and the
+parent's pid from its stdin (not the command line, which any process can
+list), connects back through `multiprocessing.connection`'s HMAC challenge,
+takes the parent's `sys.path` so it imports the same `mindhive`, and answers
+the calls a read path makes: `list_collections`, `get_collection`, and a
+collection's `count`, `query` and `get`. Each call is waited for
+`READ_TIMEOUT_S` (30 s: a query over 40k rows answers in milliseconds, and
+the first read of a copy, which replays the queued rows, in well under a
+second), the open, `import chromadb` included, for `START_TIMEOUT_S` (60 s).
+A child that dies is `ReaderDied`, naming the call, the exit status and the
+child's last stderr lines; one that does not answer in time is killed and is
+`ReaderHung`; either refuses every later call at once. What the child raises
+is relayed by module, name and message and rebuilt as that class when it is
+chromadb's, the interpreter's own, `sqlite3`'s or this package's, else as a
+stand-in of the same name and module — a pyo3 `PanicException` included,
+which `vector_errors` knows by name — so the judge and the remedy read a
+relayed failure as they read an in-process one. A failed read through the
+child keeps nothing: the client is closed, the child killed if it will not
+go, and the copy deleted (item 2), and the memo of item 3 still refuses the
+same bytes. The child ends with `os._exit`: tearing down a client whose read
+failed corrupts the heap (exit `0xC0000374`), and in the child that costs
+nobody anything. A thread of the child waits for the parent to go — on the
+parent's process handle on Windows, on the end of its stdin elsewhere — and
+ends the child, so a parent killed without its `atexit` (`taskkill`, a
+crashed dashboard) leaves no reader behind, even one busy in a call that
+hangs (`tests/test_vector_reader.py`: a child sleeping 60 s in a call is
+gone within 15 of its parent's death). It does not wait by reading its
+stdin: measured, with a read pending on that pipe from another thread — even
+a bare `ReadFile` — `import numpy` in the child never returned, and took
+0.1 s with the thread waiting on an event or on the parent's handle instead.
+Cost, measured on a 1,300-row scratch index: starting a child takes 1.2–1.9 s,
+0.9 s of it `import chromadb`, once per copy, since `vector_snapshot` keeps
+the copy and its client while the index is unchanged; a read through it then
+costs about what one in-process does (1.2 ms median against 1.2 ms; the first
+read of a copy 22 ms against 63 ms), and a close 0.2 s. Through `hive bench
+recall-semantic --reps 7` on a copy of the real index (9.76 MB, 654 indexed
+events, three queries): the warm query median was 9.8 ms in-process and
+10.9 ms through the child — two isolated runs gave 10.9 and 14.0 ms, so the
+difference is inside the run-to-run spread — the cold first query 159 ms
+either way (the encoder's warm-up), and the semantic open, which the bench
+times apart (deps import, copy, model load, index open, the child's start
+inside it), 8.6 and 8.4 s isolated against 10.5 s in-process, that run first
+with its disk cache cold: the model load hides the child's start. A frozen
+build (`sys.frozen`) has no interpreter to start, and reads in-process there.
+
+**Not done here:** the writer side still leaves an index below
+`sync_threshold` unpersisted, so a copy's first open replays the queue.
+Lowering the threshold needs no rebuild — measured on chromadb 1.5.9,
+`collection.modify(configuration={"hnsw": {"sync_threshold": n}})` changes it
+in place, the new value survives a reopen, and the next write past it persists
+the segment — but it cannot go through `HNSW_METADATA`: `modify(metadata=…)`
+with `hnsw:` keys is refused, and a key added there would make `hnsw_drift`
+report every existing collection as drifted and rebuild it. Left as its own
+change.
+
+**The bench reads the same way.** `hive bench recall-semantic`
+(`bench_scenarios`) lists the collections through `vectors._read_view`,
+routes as `recall.recall` routes and times the same functions, so its queries
+run on the reader's private copy: one copy for the whole run while the index
+is unchanged, a fresh one if a writer lands mid-run. The copy's size, the time
+it took and whether it is gone afterwards come from `vector_snapshot.held` and
+`dispose_all`. A broken index makes the semantic row `unavailable` with the
+`SemanticQueryError` message, stage and repair included; a message longer than
+the report keeps both ends. The bench used to copy `chroma/` itself, point
+`MINDHIVE_HOME` at the copy, and empty chromadb's client registry
+(`clear_system_cache`) to delete it. Merged with the read path, that copied
+the copy, and the registry it emptied is the one every client
+`vector_snapshot` holds looks its system up in.
+
+**Rebuilding it from the ledger.** The repair depends on what broke, and the
+error names it (the remedy table above). A failed `count` or `query` on
+`ledger` or `events`, or a cut segment of either, is rebuilt first: `hive
+embed --rebuild --project <ns>` drops the collection without reading it and
+fills a new one. Where that does not mend it — and where chromadb cannot open
+the files at all (any other `open`, which the rebuild opens the same way) or
+the damage is the watcher's collection, which the rebuild never writes — the
+files are deleted: stop every process that writes the index (the dashboard
+and `hive ui`, which run the watcher, and `hive watcher run`), delete
+`chroma/`, and run `hive embed --project <ns>`. Readers need not be stopped:
+they hold only their own copies in the temp directory. Then `hive watcher
+recover` and `hive watcher run --once` for the queue. The step-by-step form,
+with how to detect the failure and confirm the fix, is scenario 1 of
+`docs/RUNBOOK_RECOVERY.md`.
+
+**Where this differs from the spec (BAB 4).** The spec's one-way diagram runs
+`append_event → pending_embed.json → processing_embed_* → chroma → hive recall
+--semantic`, as one pipeline. In the code it is two:
+
+- The queue-and-watcher half ends in `mindhive_<slug>`, which no search reads;
+  only the watcher's own id probe does, to skip what it has embedded.
+- What `hive recall --semantic` reads is filled by `hive embed`, on demand.
+
+Two smaller differences:
+
+- The spec has the watcher writing the marker. The append path writes it; the
+  watcher only consumes it.
+- The spec promises that a deleted index recovers "100%, deterministically,
+  by replaying the ledger". That holds for `ledger` and `events`: rebuilt from
+  the ledger, with deterministic ids. It does not hold for `mindhive_<slug>`:
+  no command backfills it, and after a deletion it refills only as new rows
+  are queued.
+
+Closing that gap means either pointing recall at the watcher's collection or
+pointing the watcher at `events`. That is a code change, not a documentation
+one, and it is not made here.
+
+**The invariant.** The index is never the source of truth, and never consulted
+to decide what the ledger says: a hit is a pointer back to a ledger row (the
+`events` document carries the row's type, timestamp and session; the watcher's
+metadata carries its `chain_hash` so a hit can be verified against the chain).
+Anything that would make a chroma row the only copy of a fact — a write that
+does not start from the ledger, or a correction applied to the index instead of
+appended as an event — breaks this projection's contract.
+
 ## 5. Invariants — do not break these
 
 1. **Append-only, verbatim.** Never mutate, reorder, or delete ledger lines.
@@ -2220,7 +2857,10 @@ unmatchable rather than merely unused (005).
 5. **The semantic layer is optional.** Base install works without
    chromadb/sentence-transformers (`vectors._require_deps`). The Postgres
    mirror joins it under the same rule: `psycopg` and `mcp` are extras, and
-   `import mindhive.events` must not pay for either.
+   `import mindhive.events` must not pay for either. Optional is not silent:
+   once the extras are present, a semantic read that fails raises
+   `vectors.SemanticQueryError` rather than answering empty, and no read path
+   writes the index it reads (§4.19).
 6. **The Postgres mirror never becomes the source, and never re-derives the
    order.** The file ledger is the sole writer; `MINDHIVE_EVENT_BACKEND` stays
    `file` and nothing in `src/` may set it. The mirror's ordering contract is
@@ -2244,7 +2884,8 @@ unmatchable rather than merely unused (005).
    `DETERMINISTIC_TYPES` (telemetry), with a comment saying why it exists.
 2. Define its payload contract in a dedicated module (pattern:
    `changelog.py`, `sop.py`) with a `validate_payload` enforced in
-   `__main__.cmd_append` — the store stays type-agnostic; the contract lives
+   `commands.ledger.cmd_append` (re-exported as `__main__.cmd_append`) — the
+   store stays type-agnostic; the contract lives
    at the append surfaces.
 3. Decide merge semantics: an audit/registry type must be named in **both**
    `consolidate.NEVER_CONSOLIDATE` and `dedupe.NEVER_COLLAPSE` (§3.1).

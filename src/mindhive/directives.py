@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/directives.py
 """Canonical operating directives injected into each session by the
 session_start hook (ahead of STATE.md). This module is the single runtime

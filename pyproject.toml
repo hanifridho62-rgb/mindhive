@@ -2,6 +2,26 @@
 name = "mindhive"
 version = "0.1.0"
 description = "Deterministic event-sourced memory for long-running Claude sessions"
+# Blueprint P7 (spec section 2.14): the license as a PEP 639 SPDX expression,
+# with the file it names. No `License ::` classifier beside it -- setuptools
+# >= 77 rejects the pair outright (InvalidConfigError, reproduced on 81 and
+# 84), and the expression is what replaced the classifier. That is also why the
+# build-system floor below is 77: 68 through 76 read a string `license` as a
+# malformed table and fail the build.
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+# The versions and platforms the release matrix (.github/workflows/ci.yml)
+# actually runs. 3.13 is inside `requires-python` but no leg has run it, so it
+# is not claimed here.
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+]
 requires-python = ">=3.11"
 dependencies = []
 
@@ -33,12 +53,26 @@ mcp = ["mcp>=1.2"]
 # one-line-per-event log without it rather than failing the mission — which is
 # also the path CI takes, because `dev` does not pull this in.
 tui = ["rich>=13"]
+# `hive ui --asgi` (blueprint P1k, K11). A FOURTH extra, and the MEB's
+# FastAPI/uvicorn requirement met without spending the stdlib-only runtime:
+# `hive ui` itself serves through the dashboard's own `ThreadingHTTPServer`
+# and needs none of this. `server/asgi.py` is a BRIDGE over the existing
+# handler rather than a second implementation, so the two front ends cannot
+# drift; without the extras it exits 2 naming this line, and the bridge's own
+# tests run with neither package installed.
+ui = ["fastapi>=0.110", "uvicorn>=0.27"]
 
 [project.scripts]
 hive = "mindhive.__main__:main"
+# The MEB's own spelling (`mindhive db migrate`). Same entry point as `hive`,
+# because it is the same CLI -- an alias, not a second surface. It appears on
+# PATH only after the checkout is reinstalled; until then `python -m mindhive`
+# is the spelling that works, and the live dashboard is not restarted for it.
+mindhive = "mindhive.__main__:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+# 77: the first setuptools that reads a PEP 639 license expression.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
@@ -53,6 +87,12 @@ where = ["src"]
 # these patterns, so a typo'd package name or a `*.psql` cannot satisfy the
 # declaration while shipping nothing.
 [tool.setuptools.package-data]
+# `static/*.js` is the dashboard's own data file, read through
+# `importlib.resources` when `dashboard_page` is imported -- a wheel without it
+# has a dashboard that cannot import its own page.
+# `tests/test_static_dashboard_js.py` globs the pattern against the package
+# directory the way setuptools resolves it.
+"mindhive" = ["static/*.js"]
 "mindhive.pgmigrations" = ["*.sql"]
 
 [tool.pytest.ini_options]

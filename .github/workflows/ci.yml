@@ -1,9 +1,15 @@
 name: CI
 
+# The DAILY gate is `hive ci` (blueprint P1g), not this file: it runs the same
+# four gates in a git worktree of its own, on the operator's own machine, and
+# `hive ci hook-install` puts it on `pre-push` so nothing lands ungated. This
+# workflow is what you reach for deliberately — a release tag, or a run you ask
+# for by hand — because it is the only place the matrix, the pg service and the
+# browser tier actually exist.
 on:
+  workflow_dispatch:
   push:
-    branches: [master]
-  pull_request:
+    tags: ["v*"]
 
 # Cancel superseded runs for the same ref to save CI minutes.
 concurrency:

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/packs.py
 """Deterministic quality gates for stack content packs.
 

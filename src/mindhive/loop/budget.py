@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/loop/budget.py
 from dataclasses import dataclass
 

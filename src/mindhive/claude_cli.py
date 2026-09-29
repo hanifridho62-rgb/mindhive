@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/claude_cli.py
 """Shared headless `claude` invocation — one home for what the invoke channel
 (invoker.py) and the reflection engine (reflect.py) both need: resolving the
@@ -47,7 +48,16 @@ def _child_env(extra):
             else:
                 merged[str(key)] = str(value)
     merged["MINDHIVE_HEADLESS"] = "1"
-    return merged
+    # A headless agent runs Python tools in whatever tree it was pointed at; it
+    # must not leave `__pycache__` there (MEB risk 7). The operator's own value
+    # wins, which is why this is a default and the guard above is not.
+    from . import paths
+    merged = paths.no_bytecode_env(merged)
+    # The SOP process token never reaches a headless child either (blueprint
+    # P1d): withheld after the overlay, like the guard above. Imported here so
+    # this module stays a stdlib-only leaf at import time.
+    from . import advice as authorship
+    return authorship.scrub_agent_env(merged)
 
 
 def _envelope_extras(stdout: str) -> dict:

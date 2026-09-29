@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/orchestrator/dashboard.py
 """WB7 — the worker-cat board: a terminal view the mission publishes TO.
 
@@ -68,7 +69,8 @@ from dataclasses import dataclass
 # with a star so the surface is readable, and so `from .dashboard import Board`
 # keeps resolving for every existing caller and test.
 from .board import (                                     # noqa: F401
-    ASCII_ICONS, BRAIN_PHASE, BRAIN_PHASES, CIRCUIT_OPENED, DEFAULT_CAPACITY,
+    ASCII_ICONS, BACKLOG_HEAD, BRAIN_PHASE, BRAIN_PHASES, CIRCUIT_OPENED,
+    DEFAULT_CAPACITY,
     FALLBACK, FALLBACK_TRIGGERED, ICONS, IDLE, INJECTED_CAPTION, LABELS,
     LANE_OPENED, MAX_ALERTS, MAX_STEALS, MISSION_FINISHED, MISSION_STARTED,
     NOTE, PHASE_BRIEFING, PHASE_DECOMPOSING, PHASE_DONE, PHASE_IDLE,
@@ -160,6 +162,15 @@ def rich_available() -> tuple:
         return False, (f"the `rich` package is not installed "
                        f"({type(exc).__name__}: {exc}); install it with "
                        f"`pip install -e .[tui]` for the live board")
+    except Exception as exc:                            # noqa: BLE001
+        # Half-installed is not missing: a broken `rich` can raise something
+        # other than ImportError on import, and that raise would escape
+        # `Dashboard(...)` -- which `attach` builds inside the mission's
+        # `async with` -- so a board that could not start would take the
+        # mission down with it. Reported the way a missing one is.
+        return False, (f"the `rich` package could not be imported "
+                       f"({type(exc).__name__}: {exc}); reinstall it with "
+                       f"`pip install --force-reinstall rich` for the live board")
     return True, ""
 
 
@@ -346,6 +357,30 @@ class Dashboard:
             self._queue = None
 
     async def _run(self) -> None:
+        """The display task's body, and the last net under it.
+
+        `_tolerate` guards the render steps it wraps; this guards everything
+        else the task does -- a fold that raises, anything outside a wrapped
+        step -- because `aclose` re-raises whatever ended the task, and does so
+        inside the mission's `async with`. So a board that fails stops showing
+        and the mission it was watching carries on, the failure counted, named,
+        and SAID: `render_errors` has no reader outside this module, so a
+        count alone left the operator a board that froze with nothing on
+        screen saying why. The notice is one more print, so it rides
+        `_tolerate` like every other.
+
+        `CancelledError` is a BaseException and is deliberately NOT caught --
+        a cancelled board must stay cancelled."""
+        try:
+            await self._render()
+        except Exception as exc:                        # noqa: BLE001
+            self.render_errors += 1
+            self.last_render_error = f"{type(exc).__name__}: {exc}"
+            self._tolerate(lambda: self._say(
+                f"[board] stopped — {self.last_render_error}; "
+                f"the mission carries on without it"))
+
+    async def _render(self) -> None:
         if not self.plain:
             try:
                 await self._run_live()
@@ -378,13 +413,14 @@ class Dashboard:
                 # every successful run would be the noise that trains an
                 # operator to skim the line that matters.
                 if self.render_errors:
-                    self._say(f"[board] {self.render_errors} repaint(s) failed "
-                              f"and the frame above is stale — "
-                              f"{self.last_render_error}")
+                    self._tolerate(lambda: self._say(
+                        f"[board] {self.render_errors} repaint(s) failed "
+                        f"and the frame above is stale — "
+                        f"{self.last_render_error}"))
                     self._tolerate(
                         lambda: self._say(render_plain(self.board, self.icons)))
                 return
-        self._say(f"[board] {self.degraded}")
+        self._tolerate(lambda: self._say(f"[board] {self.degraded}"))
         await self._pump(None)
         self._tolerate(lambda: self._say(render_plain(self.board, self.icons)))
 

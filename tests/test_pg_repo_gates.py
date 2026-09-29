@@ -337,6 +337,7 @@ def test_the_write_scan_sees_the_admin_module_it_exempts():
     found = " ".join(_sql_writes(SRC / "pgmirror.py")).upper()
     assert "DELETE FROM" in found, "the scan cannot see pgmirror's own DELETE"
     assert "COPY" in found, "the scan cannot see pgmirror's own COPY"
+    assert "INSERT INTO" in found,         "the scan cannot see pgmirror's own INSERT (the single-row write seam)"
 
 
 def test_the_write_scan_would_catch_a_reintroduced_insert():

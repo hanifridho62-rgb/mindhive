@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/pgcli.py
 """The `hive pg` group: status, migrate, rebuild, refresh, embed, parity,
 tool, mcp.
@@ -17,13 +18,14 @@ human commands by necessity. Given the group is being created anyway, `status`
 and `tool` cost nothing extra and turn "the tool returned nothing" from a
 question you can only ask a model into one command with one stack trace.
 
-**This module registers its own parser** onto `__main__`'s subparsers, which
-`bench.register` introduced as a deliberate deviation. Its docstring said that
-if a second module ever registered this way the deviation stops being one and
-becomes the convention. This is that second module: `__main__.py` gets two lines
-instead of the ~180 an inline argparse block for six subcommands would cost, and
-the flags stay beside the code that reads them, so a new flag cannot be added to
-one and forgotten in the other.
+**This module registers its own parser** onto the root subparsers (built by
+`commands.parsers._build_parser` since the P9 split; `__main__.py` before it),
+which `bench.register` introduced as a deliberate deviation. Its docstring said
+that if a second module ever registered this way the deviation stops being one
+and becomes the convention. This is that second module: the parser module gets
+two lines instead of the ~180 an inline argparse block for six subcommands would
+cost, and the flags stay beside the code that reads them, so a new flag cannot
+be added to one and forgotten in the other.
 """
 import json
 
@@ -262,12 +264,14 @@ def cmd_mcp(args) -> int:
 
 
 def register(subparsers) -> None:
-    """Wire the `pg` group onto ``__main__``'s subparser set.
+    """Wire the `pg` group onto the root subparser set built by
+    `commands.parsers._build_parser`.
 
     The SECOND module to register itself this way (after `bench`), which is what
     turns that deviation into the documented convention for a new
     multi-subcommand group — see `docs/session-legend.md`. Two lines in
-    `__main__.py`, and every flag beside the handler that reads it."""
+    `commands/parsers/__init__.py`, and every flag beside the handler that
+    reads it."""
     pg = subparsers.add_parser(
         "pg", help="the Postgres read mirror: status, migrations, rebuild, "
                    "refresh, embed, parity, and the AI tools")

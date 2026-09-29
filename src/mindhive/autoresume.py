@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/autoresume.py
 """Auto-resume: deliver the interruption marker straight back into Claude.
 
@@ -22,8 +23,10 @@ roadmap events stay the semantic record):
   prompt (the ask, per-step progress, the NEXT pointer, and directives to
   keep the roadmap updated) and fed to a headless ``claude -p``. Outcome is
   ``delivered`` / ``still_limited`` / ``error`` / ``skipped``; a
-  still-limited delivery re-schedules itself with a short backoff until
-  MAX_ATTEMPTS.
+  still-limited delivery re-schedules itself until MAX_ATTEMPTS -- a
+  one-shot after a short backoff, a relaunched loop one cooldown after it
+  returned, where only a relaunch that checked off nothing new on its
+  fix_plan checklist spends an attempt.
 - ``cancelled`` — a human picked the plan back up (``hive roadmap resume`` /
   ``complete``), so the pending delivery and its OS timer are withdrawn.
 
@@ -35,6 +38,7 @@ import subprocess
 import sys
 import time
 import calendar
+import contextvars
 
 from . import events as ev_mod
 from . import claude_cli
@@ -44,6 +48,13 @@ from .sop import ID_RE
 
 ACTIONS = ("scheduled", "fired", "cancelled")
 OUTCOMES = ("delivered", "still_limited", "error", "skipped")
+
+# How a delivery re-enters Claude. "prompt" (default) composes the marker
+# into a one-shot headless `claude -p` — right for resuming interactive
+# work. "loop" relaunches the autonomous loop engine on the recorded
+# goal_dir — right for loop/fabrication runs, which get back the breaker,
+# budget gates, and exit contract a bare prompt lacks.
+MODES = ("prompt", "loop")
 
 # Claude usage windows reopen on a ~5-hour cycle; a still-limited delivery
 # retries hourly (clock skew, weekly caps) up to MAX_ATTEMPTS.
@@ -147,6 +158,21 @@ def validate_payload(payload) -> None:
         if timer is not None and timer not in ("windows_task", "none"):
             raise ValueError(
                 "autoresume timer must be 'windows_task' or 'none'")
+        mode = payload.get("mode")
+        if mode is not None and mode not in MODES:
+            raise ValueError(
+                "autoresume mode must be one of: " + ", ".join(MODES))
+        if len(str(payload.get("goal_dir") or "")) > MAX_PATH_CHARS:
+            raise ValueError(
+                f"autoresume goal_dir exceeds {MAX_PATH_CHARS} chars")
+        if mode == "loop" and not str(payload.get("goal_dir") or "").strip():
+            raise ValueError(
+                "autoresume mode 'loop' requires the goal_dir to relaunch")
+        high = payload.get("checked_high")
+        if high is not None and (not isinstance(high, int)
+                                 or isinstance(high, bool) or high < 0):
+            raise ValueError(
+                "autoresume checked_high must be an integer >= 0")
     elif action == "fired":
         if payload.get("outcome") not in OUTCOMES:
             raise ValueError(
@@ -163,8 +189,8 @@ def validate_payload(payload) -> None:
 def _blank(plan_id, ts) -> dict:
     return {"plan_id": plan_id, "status": "", "due": "", "attempt": 1,
             "cooldown_hours": COOLDOWN_HOURS, "cwd": "", "model": "",
-            "timer": "none", "outcome": "", "detail": "",
-            "created": ts, "updated": ts}
+            "timer": "none", "mode": "prompt", "goal_dir": "",
+            "outcome": "", "detail": "", "created": ts, "updated": ts}
 
 
 def fold(evs) -> dict:
@@ -197,7 +223,17 @@ def fold(evs) -> dict:
                 model=str(p.get("model") or "")[:MAX_MODEL_CHARS],
                 timer=p.get("timer") if p.get("timer") in
                 ("windows_task", "none") else "none",
+                mode=p.get("mode") if p.get("mode") in MODES else "prompt",
+                goal_dir=str(p.get("goal_dir") or "")[:MAX_PATH_CHARS],
                 outcome="", detail="")
+            # A loop chain's high-water mark rides only the schedule that
+            # carried it forward: one without it starts the count over.
+            high = p.get("checked_high")
+            if isinstance(high, int) and not isinstance(high, bool) \
+                    and high >= 0:
+                rec["checked_high"] = high
+            else:
+                rec.pop("checked_high", None)
         elif action == "fired":
             outcome = p.get("outcome")
             if outcome not in OUTCOMES:
@@ -345,54 +381,63 @@ def _run_powershell(script: str) -> bool:
         return False
 
 
-def _register_timer(plan_id, due_iso, cwd, project) -> str:
-    """Register a per-user Windows scheduled task that runs
-    ``hive autoresume fire <plan_id>`` at the due time (converted to local
-    time — Task Scheduler triggers are local). Returns the timer label for
-    the scheduled payload; "none" on any failure or off-platform, because
-    the scheduled event must still be recorded — `hive autoresume wait`
-    then delivers it."""
+def register_windows_task(task_name, due_iso, cwd, argument) -> str:
+    """Register a per-user Windows scheduled task running
+    ``<this python> <argument>`` at the due time (converted to local time —
+    Task Scheduler triggers are local). The one OS-timer primitive, shared
+    with fabricate.py's dispatcher. Returns "windows_task" on success,
+    "none" on any failure or off-platform — callers record their event
+    either way, because the ledger event is the source of truth and
+    `hive autoresume wait` is the delivery fallback."""
     if not _timer_enabled() or not sys.platform.startswith("win"):
         return "none"
     epoch = _parse_ts(due_iso)
     if epoch is None:
         return "none"
     local = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(epoch))
-    arg = f"-m mindhive autoresume fire {plan_id}"
-    if project:
-        arg += f" --project {project}"
     action = (f"$a=New-ScheduledTaskAction -Execute "
-              f"{_ps_quote(sys.executable)} -Argument {_ps_quote(arg)}")
+              f"{_ps_quote(sys.executable)} -Argument {_ps_quote(argument)}")
     if cwd:
         action += f" -WorkingDirectory {_ps_quote(cwd)}"
     script = (
         f"{action}; "
         f"$t=New-ScheduledTaskTrigger -Once -At ([datetime]::ParseExact("
         f"{_ps_quote(local)},'yyyy-MM-ddTHH:mm:ss',$null)); "
-        f"Register-ScheduledTask -TaskName {_ps_quote(_task_name(plan_id))} "
+        f"Register-ScheduledTask -TaskName {_ps_quote(task_name)} "
         f"-Action $a -Trigger $t -Force | Out-Null")
     return "windows_task" if _run_powershell(script) else "none"
 
 
-def _unregister_timer(plan_id) -> None:
+def unregister_windows_task(task_name) -> None:
     if not _timer_enabled() or not sys.platform.startswith("win"):
         return
     _run_powershell(
-        f"Unregister-ScheduledTask -TaskName "
-        f"{_ps_quote(_task_name(plan_id))} -Confirm:$false "
-        f"-ErrorAction SilentlyContinue")
+        f"Unregister-ScheduledTask -TaskName {_ps_quote(task_name)} "
+        f"-Confirm:$false -ErrorAction SilentlyContinue")
+
+
+def _register_timer(plan_id, due_iso, cwd, project) -> str:
+    arg = f"-m mindhive autoresume fire {plan_id}"
+    if project:
+        arg += f" --project {project}"
+    return register_windows_task(_task_name(plan_id), due_iso, cwd, arg)
+
+
+def _unregister_timer(plan_id) -> None:
+    unregister_windows_task(_task_name(plan_id))
 
 
 # --- lifecycle: schedule / cancel / fire / wait -------------------------------
 
 def schedule(plan_id, *, project=None, evs=None, cooldown_hours=None, at=None,
-             attempt=1, model=None, cwd=None, session_id=None, register=None,
-             now=None):
+             attempt=1, model=None, cwd=None, mode="prompt", goal_dir=None,
+             checked_high=None, session_id=None, register=None, now=None):
     """Schedule the plan's marker to re-enter Claude. Guards mirror
     roadmap.record: the plan must exist and be interrupted — auto-resume
     delivers interruption markers, nothing else. Re-scheduling replaces the
-    pending delivery (and the -Force'd OS task). Returns the appended
-    event."""
+    pending delivery (and the -Force'd OS task). ``checked_high`` carries a
+    loop chain's high-water mark of checked items from one wake-up to the
+    next (see `fire`). Returns the appended event."""
     if evs is None:
         evs = ev_mod.read_all(project)
     rec = roadmap.get(evs, plan_id)
@@ -432,7 +477,11 @@ def schedule(plan_id, *, project=None, evs=None, cooldown_hours=None, at=None,
     payload = {"action": "scheduled", "plan_id": plan_id, "due": due,
                "attempt": attempt, "cooldown_hours": float(cooldown),
                "cwd": cwd[:MAX_PATH_CHARS],
-               "model": str(model or "")[:MAX_MODEL_CHARS], "timer": timer}
+               "model": str(model or "")[:MAX_MODEL_CHARS], "timer": timer,
+               "mode": mode,
+               "goal_dir": str(goal_dir or "")[:MAX_PATH_CHARS]}
+    if checked_high is not None:
+        payload["checked_high"] = checked_high
     validate_payload(payload)
     return ev_mod.append_event("autoresume", payload, session_id=session_id,
                                tags=["autoresume"], project=project)
@@ -481,13 +530,95 @@ def _classify(res) -> tuple:
     return "error", err
 
 
+# The attempt of the loop-mode wake-up running in this context, None outside
+# one: `fire` sets it around the relaunch, and the engine's interruption
+# snapshot reads it through `waking_attempt` before re-arming anything.
+_WAKING = contextvars.ContextVar("mindhive_autoresume_waking", default=None)
+
+
+def waking_attempt():
+    """The attempt number of the loop-mode wake-up this code runs inside, or
+    None outside one. A relaunched run that is capped again must not re-arm
+    itself: its fresh schedule would restart the count at attempt 1 on every
+    relaunch -- a capped loop waking every cooldown with no end. Inside a
+    wake-up `fire` re-arms instead, and spends an attempt unless the
+    relaunch checked off something new on its checklist, until
+    MAX_ATTEMPTS."""
+    return _WAKING.get()
+
+
+def _checked_items(goal_dir):
+    """How many items the goal dir's fix_plan.md has checked off -- the
+    loop's own record of how far it got -- or None when it cannot be read.
+    Not the roadmap's done count: a session that adopts the interrupted plan
+    while the loop sleeps re-writes its steps with its own todos, and the
+    roadmap keeps at most roadmap.MAX_STEPS of them."""
+    from pathlib import Path
+    from .loop import task as task_mod
+    plan = Path(goal_dir) / "fix_plan.md"
+    try:
+        text = plan.read_text(encoding="utf-8", errors="replace") \
+            if plan.exists() else ""
+    except OSError:
+        return None
+    return len(task_mod.plan_items(text)["done"])
+
+
+def _run_loop_delivery(plan_id, goal_dir, project) -> tuple:
+    """Loop-mode delivery: relaunch the autonomous loop engine on its goal
+    dir — for loop-originated interruptions and fabrication runs, which get
+    back the breaker, budget gates, and exit contract a one-shot prompt
+    lacks. A plan that is a fabrication's fab_id wakes through
+    `fabricate.run` instead, so the launch records its `run` event and a
+    `completed` one closes the roadmap and drops the dispatch timer. Lazy
+    imports avoid a cycle (the engine and fabricate import this module)."""
+    from pathlib import Path
+    from . import fabricate as fabricate_mod
+    from .loop import config as loop_config
+    from .loop import driver as loop_driver
+    from .loop import engine as loop_engine
+    if (fabricate_mod.fold(ev_mod.read_all(project)).get(plan_id)
+            or {}).get("goal_dir"):
+        try:
+            p = fabricate_mod.run(plan_id, project=project)
+        except ValueError as e:              # PROMPT.md gone: not runnable
+            return "error", str(e)
+        reason = p["reason"]
+        detail = f"loop {reason} after {p['iterations']} iteration(s)"
+        if reason in ("spawn_failed", "guard_refused"):
+            return "error", detail
+        if reason in loop_engine.USAGE_INTERRUPT_REASONS:
+            return "still_limited", detail
+        return "delivered", detail
+    if not loop_driver.preflight("claude"):
+        return "error", "claude CLI not found"
+    cfg = loop_config.load_config(Path(goal_dir) / "loop.toml")
+    try:
+        result = loop_engine.run_loop(
+            project=project, loop_dir=Path(goal_dir), cfg=cfg,
+            driver=loop_driver.CLIDriver("claude"), plan_id=plan_id)
+    except RuntimeError as e:            # LIVE_LOCK guard refusal
+        return "error", str(e)
+    reason = result.get("reason", "")
+    detail = f"loop {reason} after {result.get('iterations', 0)} iteration(s)"
+    if reason in loop_engine.USAGE_INTERRUPT_REASONS:
+        return "still_limited", detail
+    return "delivered", detail
+
+
 def fire(plan_id, *, project=None, session_id=None, runner=None,
-         timeout_s=None, now=None, register=None, unregister=None) -> dict:
+         loop_runner=None, timeout_s=None, now=None, register=None,
+         unregister=None) -> dict:
     """Deliver the marker now (normally invoked by the OS timer at the due
     time). Re-checks the plan first: one resumed or completed by a human is
     skipped, never re-delivered. A still-limited delivery re-schedules
-    itself (RETRY_HOURS backoff) until MAX_ATTEMPTS. Returns the fired
-    payload."""
+    itself until MAX_ATTEMPTS: a one-shot RETRY_HOURS later, a relaunched
+    loop one cooldown after the relaunch returned. The relaunched run's own
+    snapshot leaves that re-arming to this call (`waking_attempt`), which
+    counts the attempts: a relaunch that left more items checked on its
+    fix_plan checklist than the chain had ever seen restarts the count, one
+    that did not spends one, and one cancelled while it ran is not re-armed
+    at all. Returns the fired payload."""
     evs = ev_mod.read_all(project)
     sched = fold(evs).get(plan_id)
     attempt = sched["attempt"] if sched else 1
@@ -505,6 +636,82 @@ def fire(plan_id, *, project=None, session_id=None, runner=None,
         except Exception:
             pass
         return payload
+    goal_dir = (sched or {}).get("goal_dir") or ""
+    if (sched or {}).get("mode") == "loop" and goal_dir \
+            and os.path.isdir(goal_dir):
+        before = _checked_items(goal_dir)
+        waking = _WAKING.set(attempt)
+        try:
+            outcome, detail = (loop_runner or _run_loop_delivery)(
+                plan_id, goal_dir, project)
+        except Exception as e:                          # noqa: BLE001
+            # The OS timer ran this once and will not again: whatever the
+            # delivery raised -- a malformed loop.toml, one it cannot read --
+            # is recorded as its outcome, so the plan never reads as
+            # scheduled while nothing is.
+            outcome, detail = "error", f"{type(e).__name__}: {e}"
+        finally:
+            _WAKING.reset(waking)
+        # What the relaunch left behind decides the next wake-up: its
+        # checklist, and any cancel a human issued while it ran -- the
+        # `fired` row lands only now, so a cancel meanwhile found the
+        # delivery still scheduled and succeeded.
+        after = ev_mod.read_all(project)
+        cancelled = sched["status"] != "cancelled" and \
+            (fold(after).get(plan_id) or {}).get("status") == "cancelled"
+        # Only a wake-up that checked off nothing new spends an attempt: the
+        # bound is for a loop capped without getting anywhere, not for one
+        # capped while it works through a plan longer than MAX_ATTEMPTS. New
+        # means past the most this chain has seen checked, so a step checked
+        # and un-checked by turns never counts twice, nor does work checked
+        # off between wake-ups.
+        seen = [n for n in (sched.get("checked_high"), before)
+                if n is not None]
+        checked = _checked_items(goal_dir)
+        progressed = checked is not None and bool(seen) \
+            and checked > max(seen)
+        high = max(seen + ([] if checked is None else [checked]),
+                   default=None)
+        next_attempt = 1 if progressed else attempt + 1
+        rearm = outcome == "still_limited" and not cancelled \
+            and next_attempt <= MAX_ATTEMPTS
+        if outcome == "still_limited" and not rearm:
+            detail = f"{detail} -- " + (
+                "not re-armed: cancelled while it ran" if cancelled else
+                f"gave up: {MAX_ATTEMPTS} wake-ups in a row checked off "
+                "nothing new")
+        payload = {"action": "fired", "plan_id": plan_id, "attempt": attempt,
+                   "outcome": outcome,
+                   "detail": str(detail)[:MAX_DETAIL_CHARS]}
+        validate_payload(payload)
+        ev_mod.append_event("autoresume", payload, session_id=session_id,
+                            tags=["autoresume"], project=project)
+        rearmed = False
+        if rearm:
+            # One cooldown after the relaunch returned: the window has just
+            # closed on it. Not after the recorded interruption -- a relaunch
+            # whose best-effort snapshot recorded none would re-arm off the
+            # old one, long past its cooldown, and wake a minute later into
+            # a window that is still closed.
+            back = time.time() if now is None else now
+            try:
+                schedule(plan_id, project=project, session_id=session_id,
+                         cooldown_hours=sched["cooldown_hours"],
+                         at=_iso(back + sched["cooldown_hours"] * 3600),
+                         attempt=next_attempt, cwd=sched["cwd"],
+                         mode="loop", goal_dir=goal_dir, checked_high=high,
+                         register=register, now=now)
+                rearmed = True
+            except ValueError:
+                pass            # no longer interrupted: nothing to re-arm
+        if not rearmed:
+            try:
+                (unregister or _unregister_timer)(plan_id)
+            except Exception:
+                pass
+        return payload
+    # Prompt-mode delivery (also the degrade path when a loop schedule's
+    # goal dir vanished: the composed marker still works as a one-shot).
     prompt = resume_prompt(rec, attempt=attempt)
     cwd = (sched or {}).get("cwd") or None
     if cwd and not os.path.isdir(cwd):

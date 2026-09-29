@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/dashboard_js_oversee.py
 """The Sessions and Oversee sections: live Claude work — loop runs, interactive
 sessions, roadmap panels — plus the prompt-enrichment panel that rides
@@ -41,10 +42,19 @@ JS = """\
   const RM_OPEN = new Set();
   const RM_NODE_OPEN = new Set();
   function ovStatus(r){
+    // BEFORE the chat branch, and that order is load-bearing: a native CI run
+    // (blueprint P1g) only ever attaches to an interactive card, and every
+    // interactive card has kind 'chat' -- so a failed branch placed after it
+    // would be unreachable by the only rows that can reach it.
+    // The dot wears the K12 signal colour of the outcome (`.statusDot.sci`,
+    // `.sdone`, `.strip` in the sheet); `sbad`/`sok` stay for the plain failure
+    // and the live states.
+    if (r.status === 'failed') return ['\\u2717', r.ci ? 'sci' : 'sbad',
+      r.ci ? ('CI \\u2717 PR #' + r.ci.pr_id) : 'failed'];
     if (r.kind === 'chat') return ['\\u25c9', r.online ? 'sok' : 'snone', 'chat session'];
     if (r.status === 'running') return ['\\u25b6', r.online ? 'sok' : 'snone', 'running'];
-    if (r.status === 'completed') return ['\\u2714', 'sok', 'completed'];
-    if (r.status === 'breaker_open') return ['\\u26a1', 'sbad', 'tripped'];
+    if (r.status === 'completed') return ['\\u2714', 'sdone', 'completed'];
+    if (r.status === 'breaker_open') return ['\\u26a1', 'strip', 'tripped'];
     return ['\\u25a0', 'snone', r.status || 'ended'];
   }
   // Provenance pill, shared by ovRow and rmPanel so the two surfaces cannot
@@ -186,6 +196,61 @@ JS = """\
       + ' <span class="pill">'+esc(p.status)+'</span></div>'
       + rmPanel(p, 'plan-'+p.plan_id)+'</li>';
   }
+  // --- Work sessions (blueprint P1b, BAB 5.5) --------------------------------
+  // The context bar: the synced MEMORY.md at four characters per token against
+  // the 200,000-token window, with a tick at the MEB safe line (160,000). Keyed
+  // by namespace, so under HIVE MIND each card reads its own project's figures.
+  // No digest found or readable means nothing drawn: "we could not measure"
+  // must never read as "0% used".
+  function wsUsage(proj){
+    const u = (WS_DATA && WS_DATA.usage) ? WS_DATA.usage[proj || PROJECT] : null;
+    if (!u || !u.measured || !u.context_budget_tokens) return '';
+    const budget = u.context_budget_tokens;
+    const clamp = x => Math.max(0, Math.min(100, x));
+    const pct = clamp((u.tokens_est || 0) / budget * 100);
+    const safe = clamp((u.safe_budget_tokens || 0) / budget * 100);
+    return ' <span class="usagebar" title="'+escAttr((u.tokens_est || 0).toLocaleString('en-US')
+        + ' of '+budget.toLocaleString('en-US')+' tokens (MEMORY.md at 4 chars/token); '
+        + 'the tick is the safe budget, '+(u.safe_budget_tokens || 0).toLocaleString('en-US')
+        + (u.truncated ? '; the digest is being truncated' : ''))+'">'
+      + '<span class="usagefill" style="width:'+pct.toFixed(1)+'%"></span>'
+      + '<span class="usagesafe" style="left:'+safe.toFixed(1)+'%"></span></span>'
+      + ' <span class="dup">'+pct.toFixed(1)+'% of '+budget.toLocaleString('en-US')
+      + ' tokens</span>';
+  }
+  // The phase pill (its blip pulses while the session is online), one badge per
+  // initiative (a declaration or an [INITIATIVE] step), then the context bar. A card that recorded no step and
+  // declared nothing gets the bar alone.
+  function wsPills(r){
+    let html = '';
+    if (r.phase){
+      html += ' <span class="pill wsphase" title="work-session phase (BAB 5.3.4)">'
+        + (r.online ? '<span class="blip">\\u25cf</span> ' : '')+esc(r.phase)+'</span>';
+    }
+    (r.initiatives || []).forEach(i => {
+      html += ' <span class="pill wsinit" title="'+escAttr(i.tag || i.reason || '')
+        + '">initiative</span>';
+    });
+    return html + wsUsage(r.project);
+  }
+  // Every initiative in view, newest first: an autonomous decision is never
+  // only a badge on a card that may already have left the board.
+  const WS_INIT_SHOW = 8;
+  function wsInitiatives(showProj){
+    const all = (WS_DATA && WS_DATA.initiatives) || [];
+    if (!all.length) return '';
+    const shown = all.slice(0, WS_INIT_SHOW);
+    return '<h2 class="h">Autonomous Initiatives <span class="dup">\\u00b7 newest '
+      + shown.length+' of '+all.length+'</span></h2><ul class="hits">'
+      + shown.map(i => '<li><div class="file"><span class="pill wsinit">initiative</span> '
+          + (showProj && i.project ? esc(i.project)+' \\u00b7 ' : '')
+          + esc(i.reason)+'</div><div class="snip dup">'
+          + (i.ref ? 'Ref: '+esc(i.ref)+' \\u00b7 ' : '')
+          + 'session '+esc(i.session_id)+' \\u00b7 '
+          + (i.step_id ? 'step '+esc(i.step_id)+' \\u00b7 ' : '')
+          + esc(fmtTs(i.ts))+'</div></li>').join('')
+      + '</ul>';
+  }
   function ovCard(r, showProj){
     const st = ovStatus(r);
     const open = OV_EXPANDED.has(r.run_id);
@@ -194,12 +259,19 @@ JS = """\
       + '<span class="ovtitle" style="cursor:pointer" title="click for progress detail">'
       + esc(r.title || r.run_id)+'</span>'
       + srPill(r.origin)
+      // The active step's [WS] tag rides the head; the earlier ones are in
+      // the expanded body.
+      + (r.ws_tags && r.ws_tags.length ? ' <span class="pill wstag" title="'
+          + escAttr(r.ws_tags[r.ws_tags.length-1])+'">'
+          + esc(r.ws_tags[r.ws_tags.length-1])+'</span>' : '')
       + '<button class="mini ovrm" data-rid="'+escAttr(r.run_id)
       + '" title="the ask, the plan, and how far along it is">roadmap</button>'
       + '<button class="mini ovdel" data-rid="'+escAttr(r.run_id)
       + '" data-proj="'+escAttr(r.project||'')+'">delete</button>';
     const chat = r.kind === 'chat';
-    const pills = '<span class="pill">'+esc(st[2])+'</span> '
+    // K12's breaker badge: the status pill of a tripped run takes `--warning`.
+    const pills = '<span class="pill'+(st[1] === 'strip' ? ' ovtrip' : '')+'">'
+      + esc(st[2])+'</span> '
       + '<span class="pill">'+(r.iterations||0)+(chat
           ? ' command'+((r.iterations||0)===1?'':'s')
           : ' iteration'+((r.iterations||0)===1?'':'s'))+'</span>'
@@ -213,7 +285,8 @@ JS = """\
           + 'added to this run\\u2019s plan from the record">'+r.injected_count
           + ' added to plan</span>' : '')
       + (r.online ? ' <span class="pill" style="color:var(--ok);border-color:var(--ok-edge)">'
-                    + (chat ? 'online \\u2014 working' : 'online')+'</span>' : '');
+                    + (chat ? 'online \\u2014 working' : 'online')+'</span>' : '')
+      + wsPills(r);
     let body = '';
     if (open){
       // The task FIRST, because it is the question the card exists to
@@ -230,6 +303,10 @@ JS = """\
       // reader is scanning for when the answer to 'how far along' is
       // 'stuck'.
       body += ovGroup(r.blockers, '\\u26a0', 'ovblock');
+      // The work-session trail: the steps before the active one (the head pill
+      // carries that one), then the initiatives this session declared.
+      body += ovGroup((r.ws_tags || []).slice(0, -1), '\\u25b8', 'ovdone', true)
+            + ovGroup((r.initiatives || []).map(i => i.tag || i.reason), '\\u2691', 'wsflag');
       body += ovSkills(r);
       body += '<div class="snip dup">started '+esc(fmtTs(r.started))
             + ' \\u00b7 last event '+esc(fmtTs(r.last_event_ts))+'</div>';
@@ -237,7 +314,9 @@ JS = """\
     if (RM_OPEN.has(r.run_id)){
       body += rmPanel(r.roadmap || rmFromCard(r), r.run_id);
     }
-    return '<li data-rid="'+escAttr(r.run_id)+'"><div class="file">'+head+'</div>'
+    // K12's red CI card: a run a CI check failed is edged in `--danger`.
+    return '<li'+(st[1] === 'sci' ? ' class="ovci"' : '')
+      + ' data-rid="'+escAttr(r.run_id)+'"><div class="file">'+head+'</div>'
       + '<div style="margin:4px 0">'+pills+'</div>'+body+'</li>';
   }
   // --- Prompt enrichment (Oversee): improve a draft prompt before spending a
@@ -359,6 +438,10 @@ JS = """\
     if (ta) ta.oninput = () => { EN_PROMPT = ta.value; };
   }
   let INJ_DATA = null;
+  // `/api/worksessions` (blueprint P1b): session summaries, declared
+  // initiatives and per-namespace context usage. Fetched beside the board and
+  // fail-open: null paints the board exactly as it was before the route.
+  let WS_DATA = null;
   // The row's own markup. `paintInjections` (cat_board.py) fills it after the
   // markup lands, for the same reason `paintCats` does: one implementation of
   // the cat, drawn from one place, so the two strips cannot drift into showing
@@ -381,7 +464,8 @@ JS = """\
         + '<ul class="hits">'+plans.map(p => rmPlanCard(p, showProj)).join('')+'</ul>'
       : '';
     if (!OV_DATA.runs.length && !plans.length){
-      showHTML(enPanel() + online + injRow() + '<h2 class="h">No work sessions \\u2014 interactive '
+      showHTML(enPanel() + online + injRow() + wsInitiatives(showProj)
+        + '<h2 class="h">No work sessions \\u2014 interactive '
         + 'Claude sessions appear here as their telemetry flows, and '
         + '<code>hive loop</code> runs join them. Finished sessions are '
         + 'removed automatically.</h2>');
@@ -389,7 +473,7 @@ JS = """\
       paintInjections(INJ_DATA);
       return;
     }
-    showHTML(enPanel() + online + injRow() + strip
+    showHTML(enPanel() + online + injRow() + strip + wsInitiatives(showProj)
       + (OV_DATA.runs.length
         ? '<h2 class="h">'+OV_DATA.runs.length+' work session'
           + (OV_DATA.runs.length===1?'':'s')
@@ -431,9 +515,10 @@ JS = """\
     // panel — a repaint would eat the caret and the click-in-progress.
     const ae = document.activeElement;
     if (ae && ae.closest && ae.closest('#enpanel')) return;
-    const [res, es, inj] = await Promise.all([apiGet('/api/oversee'),
+    const [res, es, inj, wsd] = await Promise.all([apiGet('/api/oversee'),
                                          apiGet('/api/enrich/settings'),
-                                         apiGet('/api/injection')]);
+                                         apiGet('/api/injection'),
+                                         apiGet('/api/worksessions').catch(() => null)]);
     // The clobber the user reported was this exact render landing late. Discard
     // before the throw too — see renderImprovements for why.
     if (!shouldPaint(liveFn, renderOversee)) return;   // newer section owns the panel
@@ -441,6 +526,7 @@ JS = """\
     OV_DATA = res;
     EN_SET = (es && typeof es.enabled === 'boolean') ? es : {enabled: true};
     INJ_DATA = inj;
+    WS_DATA = (wsd && wsd.ok) ? wsd : null;
     paintOversee();
   }
   async function deleteRun(rid, proj){

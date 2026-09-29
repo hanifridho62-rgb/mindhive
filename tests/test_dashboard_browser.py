@@ -2598,7 +2598,7 @@ MUTANTS = [
 
     ("this page's own reduced-motion guard is dropped (the cat sheet's stays)",
      probe_reduced_motion,
-     ("    header .dot.busy, header #live .blip, .ovspin, .rmnode.rmactive,\n"
+     ("    header .dot.busy, header #live .blip, .pill.wsphase .blip, .ovspin, .rmnode.rmactive,\n"
       "    .skel .bar, .skel .tile, .skel .line, .skel .pane,\n"
       "    .cards.enter .card, .cards .big.bump,\n"
       "    .types .pill b.bump, section.panel.swap { animation:none !important; }",

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/roadmap.py
 """Event-sourced roadmap registry: the ask, the plan, and the progress.
 
@@ -707,7 +708,8 @@ from .roadmap_auto import (  # noqa: E402,F401
 # renderers). Re-exported for the same reason as the block above: every caller
 # reaches them through this module -- `roadmap.notice` in `projector`,
 # `roadmap.ledger_body` in `projector` and `dashboard_get`, `roadmap.new_prefix`
-# in `autoresume` and `__main__`, `roadmap.NEW_MARKER` in `replenish_sinks`.
+# in `autoresume` and `commands/registry_roadmap`, `roadmap.NEW_MARKER` in
+# `replenish_sinks`.
 # `tests/test_roadmap_render.py` pins each one as the SAME object, because a
 # re-export that rebound the name would satisfy `hasattr` and defeat every
 # monkeypatch through it -- the failure the `dashboard.py` split shipped.

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """No-GPU synthetic trainer — the Self-Reliant test seam (plan U2/U3/U4, R12).
 
 Emits a fake ``val_bpb`` (or a failure) after a short delay so the experiment

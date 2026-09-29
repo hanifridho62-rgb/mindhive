@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Committed stand-in for a task's ``validation_script`` — MN-1 U6's test seam.
 
 The executor's whole job is to run a string an agent authored and turn what

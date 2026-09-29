@@ -589,3 +589,17 @@ def test_the_notice_never_carries_the_body_it_measured():
     measured = sopgate.probe(rows=[{"sop_id": "big", "title": "Big",
                                     "text": body}])
     assert "SECRET-BODY-TEXT" not in sopgate.notice(measured)
+
+
+def test_the_fence_at_its_fullest_is_a_fraction_of_the_digests_safe_ceiling():
+    """Plan 9.2 (<= 24 500 B). The fence is per-prompt context, not MEMORY.md, but
+    it lands in the same window on every prompt: `PROMPT_BUDGET` bounds the
+    bodies, and the pointers past it must not grow the block toward the size
+    the composer keeps the whole digest under."""
+    from mindhive import adaptivetail
+    for i in range(9):
+        _add(f"sop-{i}", f"Title {i}", "X" * 900, ts=f"2026-07-0{i + 1}T10:00:00Z")
+    block = sopgate.block_for("fix the parser")
+    assert block.count("X" * 900) == sopgate.PROMPT_BUDGET // 900 == 3
+    assert all(f"sop-{i}" in block for i in range(9))          # the rest as pointers
+    assert len(block.encode("utf-8")) <= adaptivetail.MAX_LOADER_BYTES // 4

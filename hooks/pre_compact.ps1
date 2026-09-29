@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # pre_compact — mark compaction + fold reminder. Hang-proof, never blocks.
 if ($env:MINDHIVE_HEADLESS -eq "1") { exit 0 }   # headless reflection session: no recursion, no phantom events
 $ErrorActionPreference = "SilentlyContinue"

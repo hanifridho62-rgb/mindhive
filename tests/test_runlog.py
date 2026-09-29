@@ -12,7 +12,6 @@ Every read is total: a missing, unreadable, or unwritable artifact degrades to
 None, never a raise — losing evidence must not break a consumer.
 """
 import threading
-import time
 
 from mindhive import paths, runlog
 
@@ -175,57 +174,98 @@ def test_artifact_outlives_the_writer():
 # --- concurrency: 16 agents can finish at once --------------------------------
 
 _RACE_TEXT = "z" * 200_000
+# A hang guard, not a pacing knob: the wait it bounds returns the moment the
+# reader has looked, so a passing run never spends it. It only caps how long a
+# harness whose reader has died can hang the suite.
+_SWEEP_TIMEOUT = 60
 
 
-def _finalise_race(monkeypatch, prefix):
-    """MAX_AGENTS artifacts finalised at once while a reader polls all of them.
-    Returns the reads that saw something other than the complete text.
+class _Sweeper:
+    """The race's one reader: polls all MAX_AGENTS keys over and over, and
+    counts the sweeps it completes so a writer can block until a whole sweep has
+    looked at its file.
+
+    That count is what makes the canary deterministic. A torn writer that only
+    sleeps between its halves bets that the reader is scheduled inside the
+    window; on a saturated machine the single GIL-bound reader lost that bet for
+    all 16 windows at once, and the canary reported a blind harness that was not
+    blind. A writer that waits for a sweep makes no bet."""
+
+    def __init__(self, prefix):
+        self.keys = [f"{prefix}-{i}" for i in range(16)]
+        self.torn = []                    # (key, chars) of every partial read
+        self.stop = threading.Event()
+        self._sweeps = 0
+        self._swept = threading.Condition()
+
+    def run(self):
+        while not self.stop.is_set():
+            for key in self.keys:
+                got = runlog.read(key)
+                if got is not None and got != _RACE_TEXT:
+                    self.torn.append((key, len(got)))
+            with self._swept:
+                self._sweeps += 1
+                self._swept.notify_all()
+
+    def wait_for_a_full_sweep(self, timeout=_SWEEP_TIMEOUT):
+        """Block until a sweep has run start to finish AFTER this call, so every
+        key was read while the caller's file stood as it stands now. The sweep
+        in progress at the call may already be past the caller's key — hence
+        two. False on timeout."""
+        with self._swept:
+            target = self._sweeps + 2
+            return self._swept.wait_for(lambda: self._sweeps >= target, timeout)
+
+
+def _finalise_race(monkeypatch, sweeper):
+    """MAX_AGENTS artifacts finalised at once while ``sweeper`` polls all of
+    them. Returns the reads that saw something other than the complete text.
 
     FLUSH_BYTES is raised out of reach so no in-flight sidecar exists: a partial
     read here can only come from finalise itself, which is the invariant under
     test. (Mid-run sidecar reads are legitimately partial — that is what
     test_output_is_readable_before_finalise covers.)"""
     monkeypatch.setattr(runlog, "FLUSH_BYTES", 10 ** 9)
-    keys = [f"{prefix}-{i}" for i in range(16)]
-    torn, stop = [], threading.Event()
 
     def writer(key):
         rl = _log(key)
         rl.append(_RACE_TEXT)
         rl.finalise()
 
-    def reader():
-        while not stop.is_set():
-            for key in keys:
-                got = runlog.read(key)
-                if got is not None and got != _RACE_TEXT:
-                    torn.append((key, len(got)))
-
-    r = threading.Thread(target=reader, daemon=True)
+    r = threading.Thread(target=sweeper.run, daemon=True)
     r.start()
-    threads = [threading.Thread(target=writer, args=(k,)) for k in keys]
+    threads = [threading.Thread(target=writer, args=(k,)) for k in sweeper.keys]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
-    stop.set()
+    sweeper.stop.set()
     r.join(timeout=5)
-    return keys, torn
+    return sweeper.torn
 
 
 def test_concurrent_finalises_never_yield_a_partial_read(monkeypatch):
     """Sixteen agents finishing together must not let a reader catch a
     half-written artifact — the invariant paths.write_text_atomic exists for."""
-    keys, torn = _finalise_race(monkeypatch, "ws-race")
+    sweeper = _Sweeper("ws-race")
+    torn = _finalise_race(monkeypatch, sweeper)
     assert torn == []
-    assert all(runlog.read(k) == _RACE_TEXT for k in keys)
+    assert all(runlog.read(k) == _RACE_TEXT for k in sweeper.keys)
 
 
 def test_the_race_harness_can_actually_catch_a_torn_write(monkeypatch):
     """Canary for the test above: a negative assertion is only meaningful from a
     harness that can speak. Swap in a deliberately non-atomic writer and the
     SAME reader loop must observe tearing — proving the clean run's silence is
-    evidence of atomicity, not of a reader that never looks."""
+    evidence of atomicity, not of a reader that never looks.
+
+    The torn writer holds its half-written state until the reader has swept past
+    it instead of sleeping for 10 ms and hoping: the sleep made this canary fail
+    whenever a loaded machine scheduled the reader past all 16 windows."""
+    sweeper = _Sweeper("ws-torn")
+    unswept = []
+
     def torn_write(path, text):
         p = runlog.Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -233,12 +273,18 @@ def test_the_race_harness_can_actually_catch_a_torn_write(monkeypatch):
         with open(p, "w", encoding="utf-8") as f:
             f.write(text[:half])
             f.flush()
-            time.sleep(0.01)
+            if not sweeper.wait_for_a_full_sweep():
+                unswept.append(p.stem)
             f.write(text[half:])
 
     monkeypatch.setattr(runlog.paths, "write_text_atomic", torn_write)
-    _keys, torn = _finalise_race(monkeypatch, "ws-torn")
-    assert torn, "the reader never caught a half-written artifact"
+    torn = _finalise_race(monkeypatch, sweeper)
+    assert unswept == [], (
+        f"the reader completed no sweep within {_SWEEP_TIMEOUT}s for {unswept}")
+    # Every writer, not merely one, and at exactly its half: a reader that
+    # skipped keys, or only ever saw the truncate-to-empty instant, fails here.
+    half = len(_RACE_TEXT) // 2
+    assert {key for key, chars in torn if chars == half} == set(sweeper.keys)
 
 
 def test_concurrent_appends_to_one_log_lose_nothing():

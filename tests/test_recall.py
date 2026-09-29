@@ -1,5 +1,7 @@
 # tests/test_recall.py
-from mindhive import events, projector, recall
+import pytest
+
+from mindhive import events, paths, projector, recall
 
 
 def test_recall_matches_all_terms():
@@ -181,9 +183,12 @@ def test_recall_regression_fee_tier_query():
 def _fake_vectors(monkeypatch, *, count, event_hits, file_hits):
     """Replace the vector layer wholesale. Records what was asked of it."""
     from mindhive import vectors
-    seen = {"events": 0, "files": 0}
+    seen = {"events": 0, "files": 0, "strict": []}
 
-    def _count(project=None):
+    def _count(project=None, *, strict=False):
+        seen["strict"].append(strict)
+        if isinstance(count, BaseException):
+            raise count
         return count
 
     def _events(query, project=None, limit=10, force=False, types=None):
@@ -210,7 +215,7 @@ def test_semantic_recall_prefers_the_event_index(monkeypatch):
                          file_hits=[_FILE_HIT])
     hits = recall.recall("postgres", semantic=True)
     assert hits == [_EVENT_HIT]
-    assert seen == {"events": 1, "files": 0}
+    assert seen == {"events": 1, "files": 0, "strict": [True]}
 
 
 def test_semantic_recall_falls_back_when_nothing_is_indexed(monkeypatch):
@@ -221,7 +226,7 @@ def test_semantic_recall_falls_back_when_nothing_is_indexed(monkeypatch):
                          file_hits=[_FILE_HIT])
     hits = recall.recall("postgres", semantic=True)
     assert hits == [_FILE_HIT]
-    assert seen == {"events": 0, "files": 1}, (
+    assert (seen["events"], seen["files"]) == (0, 1), (
         "the event index was queried despite being empty")
 
 
@@ -232,4 +237,221 @@ def test_semantic_recall_falls_back_when_the_event_index_has_no_answer(
     seen = _fake_vectors(monkeypatch, count=42, event_hits=[],
                          file_hits=[_FILE_HIT])
     assert recall.recall("postgres", semantic=True) == [_FILE_HIT]
-    assert seen == {"events": 1, "files": 1}
+    assert (seen["events"], seen["files"]) == (1, 1)
+
+
+# --- a failed semantic read is not an empty one -------------------------------
+#
+# The fallback above is for an index that is EMPTY. An index that is BROKEN used
+# to take the same road: `indexed_event_count` swallowed the failure as 0, the
+# file index answered, and the caller never learned the event index was gone.
+
+def _broken():
+    from mindhive import vectors
+    return vectors.SemanticQueryError(
+        "count", vectors.EVENT_COLLECTION, RuntimeError("Error loading hnsw"))
+
+
+def test_a_broken_event_index_is_raised_not_routed_around(monkeypatch):
+    from mindhive import vectors
+    seen = _fake_vectors(monkeypatch, count=_broken(), event_hits=[],
+                         file_hits=[_FILE_HIT])
+    with pytest.raises(vectors.SemanticQueryError):
+        recall.recall("postgres", semantic=True)
+    assert seen["strict"] == [True], "the count was not asked strictly"
+    assert seen["files"] == 0, "a broken event index fell back to the files"
+
+
+def test_live_lock_refuses_semantic_recall_before_the_index_is_touched(
+        monkeypatch):
+    seen = _fake_vectors(monkeypatch, count=42, event_hits=[_EVENT_HIT],
+                         file_hits=[_FILE_HIT])
+    paths.store_home().mkdir(parents=True, exist_ok=True)
+    (paths.store_home() / "LIVE_LOCK").write_text("x", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="LIVE_LOCK"):
+        recall.recall("postgres", semantic=True)
+    assert seen == {"events": 0, "files": 0, "strict": []}
+    seen = _fake_vectors(monkeypatch, count=42, event_hits=[_EVENT_HIT],
+                         file_hits=[_FILE_HIT])
+    assert recall.recall("postgres", semantic=True, force=True) == [_EVENT_HIT]
+
+
+# --- `hive recall --semantic`: the exit code says which failure it was ---------
+
+def _recall_args(semantic=True, force=False):
+    import argparse
+    return argparse.Namespace(query="postgres", semantic=semantic, limit=5,
+                              force=force, project=None)
+
+
+def test_the_cli_exits_one_on_a_broken_index_and_says_how_to_fix_it(
+        monkeypatch, capsys):
+    from mindhive.commands import maintenance
+    _fake_vectors(monkeypatch, count=_broken(), event_hits=[], file_hits=[])
+    assert maintenance.cmd_recall(_recall_args()) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: semantic count failed")
+    # A count that failed read a collection chromadb could open, which
+    # `--rebuild` drops unread: the rebuild comes first, and the directory it
+    # names is the delete if the read still fails.
+    assert "hive embed --rebuild" in err
+    assert str(paths.project_dir() / "chroma") in err
+
+
+def test_the_cli_exits_two_without_the_extras_and_opens_nothing(monkeypatch,
+                                                                capsys):
+    """No chromadb is a refusal, like LIVE_LOCK -- not a broken index."""
+    from mindhive import vectors
+    from mindhive.commands import maintenance
+    opened = []
+
+    def _missing():
+        raise RuntimeError("semantic layer needs extras: pip install -e .[vectors]")
+
+    monkeypatch.setattr(vectors, "_require_deps", _missing)
+    monkeypatch.setattr(vectors, "_reading",
+                        lambda *a, **k: opened.append(a) or pytest.fail(
+                            "the index was opened without the extras"))
+    assert maintenance.cmd_recall(_recall_args()) == 2
+    assert "needs extras" in capsys.readouterr().err
+    assert opened == []
+
+
+def test_the_cli_exits_two_on_live_lock(monkeypatch, capsys):
+    from mindhive.commands import maintenance
+    _fake_vectors(monkeypatch, count=42, event_hits=[], file_hits=[])
+    paths.store_home().mkdir(parents=True, exist_ok=True)
+    (paths.store_home() / "LIVE_LOCK").write_text("x", encoding="utf-8")
+    assert maintenance.cmd_recall(_recall_args()) == 2
+    assert "LIVE_LOCK" in capsys.readouterr().err
+
+
+def test_the_cli_still_prints_hits_and_exits_zero(monkeypatch, capsys):
+    from mindhive.commands import maintenance
+    _fake_vectors(monkeypatch, count=42, event_hits=[_EVENT_HIT], file_hits=[])
+    assert maintenance.cmd_recall(_recall_args()) is None
+    assert "the memo itself" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("limit", ["0", "-3"])
+def test_the_cli_refuses_a_limit_below_one(limit, capsys):
+    """`--limit 0` reads as "no limit" to whoever types it, and answered
+    nothing at all; `-3` cut the keyword answer to all but its last three.
+    Neither is a search, so neither runs."""
+    from mindhive.commands.parsers import _build_parser
+    with pytest.raises(SystemExit) as exc:
+        _build_parser().parse_args(["recall", "postgres", "--limit", limit])
+    assert exc.value.code == 2
+    assert "--limit" in capsys.readouterr().err
+
+
+def test_a_keyword_search_below_one_hit_answers_none():
+    """The library answers a limit below 1 alike in both modes: `[]`. The
+    keyword path sliced `[:-3]` into all but the last three hits."""
+    for n in range(5):
+        events.append_event("decision", {"text": f"ofi gate note {n}"},
+                            session_id="s", ts=f"2026-06-20T1{n}:00:00Z")
+    projector.project()
+    assert len(recall.recall("ofi gate")) == 5
+    assert recall.recall("ofi gate", limit=0) == []
+    assert recall.recall("ofi gate", limit=-3) == []
+
+
+@pytest.mark.parametrize("limit", [0, -3])
+def test_a_semantic_search_below_one_hit_asks_the_index_nothing(monkeypatch,
+                                                                 limit):
+    """`/api/recall?semantic=1&limit=0` reaches `recall.recall` unclamped --
+    only the CLI refuses the limit. A search for no hits asks nothing: not
+    the count, not either index. Asked, a broken index answered a search for
+    nothing with a 500 and advice to delete it."""
+    seen = _fake_vectors(monkeypatch, count=_broken(), event_hits=[_EVENT_HIT],
+                         file_hits=[_FILE_HIT])
+    assert recall.recall("postgres", semantic=True, limit=limit) == []
+    assert seen == {"events": 0, "files": 0, "strict": []}
+
+
+def test_the_dashboard_says_a_failed_search_failed():
+    """`/api/recall` answers a raised error with a 500 and `{"ok": false,
+    "error": ...}`, and `apiGet` never looks at the status -- so the view has
+    to tell an error body from a hit list itself, or a broken index reads as
+    'No matches'."""
+    from mindhive import dashboard_js_views
+    body = dashboard_js_views.JS.split("function runRecall(){", 1)[1]
+    body = body.split("function showGraph(){", 1)[0]
+    guard = body.index("if (!Array.isArray(hits))")
+    line = body[guard:body.index("\n", guard)]
+    assert "Recall failed" in line
+    # ...and THROWS it, ahead of the "No matches" branch: run() paints a thrown
+    # error with fail() and announces the run failed. Painted by hand, the
+    # status chip read "searching -- ready" over the error.
+    # `tests/test_recall_view_node.py` runs it.
+    assert "throw new Error(" in line and "showText" not in line
+    assert guard < body.index("if (!found.length && !notes)")
+
+
+# --- HIVE MIND: one namespace it could not read does not sink the rest ---------
+
+def _per_namespace(monkeypatch, broken=(), refused=None):
+    """`recall.recall` per namespace: hits, a `SemanticQueryError` for a
+    namespace in *broken*, or *refused* raised for every namespace."""
+    from mindhive import vectors
+
+    def fake(query, project=None, semantic=False, limit=10, force=False):
+        if refused is not None:
+            raise refused
+        if project in broken:
+            raise vectors.SemanticQueryError(
+                "count", vectors.EVENT_COLLECTION,
+                RuntimeError("Error loading hnsw index"), project)
+        return [{"file": f"{project}.md", "snippet": "chose postgres",
+                 "score": 1.0}]
+
+    monkeypatch.setattr(recall, "recall", fake)
+
+
+def test_hive_mind_recall_answers_around_a_namespace_it_could_not_read(
+        monkeypatch):
+    """HIVE MIND searched every namespace in one loop, so one unreadable
+    index -- or a writer busy on any one of them -- turned the whole search
+    into a 500 and threw the other namespaces' hits away."""
+    _per_namespace(monkeypatch, broken={"bad"})
+    rows = recall.recall_across("postgres", ["bad", "good"], semantic=True)
+    assert [r for r in rows if "error" not in r] == [
+        {"file": "good.md", "snippet": "chose postgres", "score": 1.0,
+         "project": "good"}]
+    [row] = [r for r in rows if "error" in r]
+    assert row["project"] == "bad"
+    assert "hnsw" in row["error"] and "hive embed --project bad" in row["error"]
+
+
+def test_hive_mind_recall_that_read_nothing_is_the_error(monkeypatch):
+    from mindhive import vectors
+    _per_namespace(monkeypatch, broken={"a", "b"})
+    with pytest.raises(vectors.SemanticQueryError, match="project 'a'"):
+        recall.recall_across("postgres", ["a", "b"], semantic=True)
+
+
+def test_a_refusal_still_refuses_the_whole_hive_mind_search(monkeypatch):
+    """LIVE_LOCK and missing extras refuse every namespace alike: that is one
+    answer for the search, not one row per namespace."""
+    _per_namespace(monkeypatch, refused=RuntimeError("LIVE_LOCK present"))
+    with pytest.raises(RuntimeError, match="LIVE_LOCK"):
+        recall.recall_across("postgres", ["a", "b"], semantic=True)
+
+
+def test_the_hive_mind_route_serves_every_namespace_it_could_read(
+        monkeypatch):
+    from mindhive import dashboard_get
+    _per_namespace(monkeypatch, broken={"bad"})
+    monkeypatch.setattr(dashboard_get, "_all_projects", lambda: ["bad", "good"])
+    sent = []
+
+    class _Route:
+        def _json(self, obj):
+            sent.append(obj)
+
+    dashboard_get.GetRoutes._get_recall(
+        _Route(), None, True, {"q": ["postgres"], "semantic": ["1"]})
+    [rows] = sent
+    assert [(r["project"], "error" in r) for r in rows] == [
+        ("bad", True), ("good", False)]

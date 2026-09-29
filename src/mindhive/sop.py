@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/sop.py
 """Managed standard operating procedures (SOPs).
 
@@ -174,6 +175,9 @@ def fold(evs):
     return active, deleted
 
 
+_VALIDATED_TAG = "sop-validated"      # == advice.VALIDATED_TAG (pinned by a test)
+
+
 def _fold(evs):
     """`fold`, plus the writes it APPLIED: ``(active, deleted, written)``.
 
@@ -210,6 +214,7 @@ def _fold(evs):
                 "mandatory": bool(p.get("mandatory")),
                 "created": ev.ts, "updated": ev.ts, "version": 1,
                 "session_id": ev.session_id, "tags": list(ev.tags or []),
+                "validated": _VALIDATED_TAG in (ev.tags or ()),
             }
             written.append((sop_id, ev.session_id))
             continue
@@ -229,6 +234,11 @@ def _fold(evs):
         rec["version"] = rec["version"] + 1
         rec["session_id"] = ev.session_id
         rec["tags"] = list(ev.tags or [])
+        # ACCUMULATED, like the agent flag and for its reason: `tags` above is
+        # the LAST event's, so one unstamped title-only edit would relabel a
+        # token-validated body as the operator's. It survives a delete too --
+        # a revival keeps what the reviving event does not replace.
+        rec["validated"] = bool(rec.get("validated")) or _VALIDATED_TAG in (ev.tags or ())
         deleted.pop(sop_id, None)
         active[sop_id] = rec
         written.append((sop_id, ev.session_id))
@@ -404,14 +414,21 @@ def _project_rows(project, evs) -> list:
 
     Absent on an older sidecar, deliberately -- `sopgate.is_agent_authored`
     falls back to the prefix test when the key is missing, so a sidecar written
-    before this change behaves exactly as it did rather than failing shut."""
+    before this change behaves exactly as it did rather than failing shut.
+
+    `validated` rides along for the same reason (blueprint P1d): the row's tags
+    stay in the ledger, `sopgate` may not fold it, and `advice.classify_author`
+    needs to know ANY applied write was stamped `sop-validated` to label the body
+    `[SYSTEM SOP - SYSTEM VALIDATED]`. Absent on an older sidecar, where the
+    row reads as the operator's -- the label it had before there were labels."""
     name = project or paths.detect_project()
     tainted = agent_touched_ids(evs)
     return [{"project": name, "sop_id": r["sop_id"], "title": r["title"],
              "text": r["text"], "version": r["version"],
              "session_id": str(r.get("session_id") or ""),
              "agent_authored": bool(is_agent_authored(r)
-                                    or r["sop_id"] in tainted)}
+                                    or r["sop_id"] in tainted),
+             "validated": r.get("validated") is True}
             for r in mandatory(evs)]
 
 
@@ -490,15 +507,18 @@ def read_sidecar(project=None) -> dict:
 
 
 def _rows_current(rows) -> bool:
-    """Every row a dict carrying a boolean `agent_authored`."""
+    """Every row a dict carrying a boolean `agent_authored` and a boolean
+    `validated` -- the two keys `sopgate` labels a row from without folding."""
     return all(isinstance(r, dict) and isinstance(r.get("agent_authored"), bool)
-               for r in rows)
+               and isinstance(r.get("validated"), bool) for r in rows)
 
 
 def _slice_key(rows) -> list:
     """What a slice of sidecar rows DELIVERS, as comparable data: one
-    ``(sop_id, version, agent_authored)`` per row, None for a non-dict row."""
-    return [(r.get("sop_id"), r.get("version"), r.get("agent_authored"))
+    ``(sop_id, version, agent_authored, validated)`` per row, None for a
+    non-dict row."""
+    return [(r.get("sop_id"), r.get("version"), r.get("agent_authored"),
+             r.get("validated"))
             if isinstance(r, dict) else None for r in (rows or [])]
 
 
@@ -521,9 +541,14 @@ def heal_sidecar(project=None) -> bool:
     missing file left such a store delivering the laundered body until some
     unrelated `hive sop` write happened to rebuild it.
 
+    STALE, too, is a row without a boolean `validated` (blueprint P1d): a build
+    from before the key rewrites the sidecar without it, and such a row would
+    be labelled HUMAN VERIFIED over a ledger that says SYSTEM VALIDATED.
+
     MISSING, too, is a slice of the global file that no longer DELIVERS what the
-    per-project file does, compared as `(sop_id, version, agent_authored)` per
-    row. `write_sidecar`'s read-modify-write can drop one project's slice when
+    per-project file does, compared per row as `(sop_id, version,
+    agent_authored, validated)`. `write_sidecar`'s read-modify-write can drop
+    one project's slice when
     two projects write at once, and a check of the rows alone passed the empty
     slice as current -- so the prompt fence went without this project's
     mandatory procedures until an unrelated write rebuilt them.
@@ -600,8 +625,16 @@ def safe_title(value) -> str:
     in `provenance.safe_line` and this is a named, width-bound view of it: five
     surfaces needed the same collapse, and five copies of it is the same drift
     at a larger scale. Behaviour is unchanged -- `provenance.TITLE_CHARS` is
-    120 and the cut is still bare."""
-    return provenance.safe_line(value, provenance.TITLE_CHARS)
+    120 and the cut is still bare.
+
+    A title is also where a forged provenance label rides (blueprint P1d,
+    review round 3): every surface that shows one -- STATE.md, MEMORY.md,
+    `hive sop preflight|list|show`, the briefing, the prompt fence -- reads it
+    through here, so this is where `provenance.defang_title` runs, AFTER the
+    collapse (a label split across lines is one line by then) and the cut. The
+    swap is bracket for parenthesis, so the cap still holds."""
+    return provenance.defang_title(
+        provenance.safe_line(value, provenance.TITLE_CHARS))
 
 
 def is_agent_authored(row) -> bool:
@@ -735,8 +768,10 @@ def preflight_mandatory(evs) -> dict:
       indistinguishable from a registry that was always empty, and a bare count
       says something is missing without saying what to go and read.
 
-    Here rather than in `__main__`: it is rendering policy shared with `block`
-    and `digest_block`, and that file is on a size ratchet."""
+    Here rather than beside the handler that prints it
+    (`commands/registry_sop.py`; `__main__.py` before the P9 split): it is
+    rendering policy shared with `block` and `digest_block`, and the handler
+    modules are on a size cap."""
     rows = [r for r in (mandatory(evs) or []) if isinstance(r, dict)]
     composed, withheld = partition_authored(rows, evs)
     kept = {id(r) for r in composed}
@@ -809,14 +844,17 @@ def block(evs) -> str:
         for i, r in enumerate(must, 1):
             out.append(f"### MANDATORY SOP {i}: {safe_title(r['title'])}  "
                        f"`[{r['sop_id']} v{r['version']}]`")
-            out.append(r["text"])
+            # Verbatim, unless the body carries a label-shaped bracket: this
+            # surface shows no provenance label, so a forged one would be
+            # the only one a reader sees (blueprint P1d, review round 3).
+            out.append(provenance.defang_labels(r["text"]))
             out.append("")
     spent = 0
     for i, r in enumerate(rest, 1):
         out.append(f"## SOP {i}: {safe_title(r['title'])}  "
                    f"`[{r['sop_id']} v{r['version']}]`")
         if spent + len(r["text"]) <= BLOCK_FULL_BUDGET:
-            out.append(r["text"])
+            out.append(provenance.defang_labels(r["text"]))
             spent += len(r["text"])
         else:
             out.append(f"_(body elided for context budget — read it with: "
@@ -889,7 +927,7 @@ def digest_block(evs, injected_ids=()) -> str:
                            "re-asserts it verbatim every turn — read it with: "
                            f"`hive sop show {r['sop_id']}`._")
             else:
-                out.append(r["text"])
+                out.append(provenance.defang_labels(r["text"]))
             out.append("")
     if rest:
         out += ["## Scope-matched SOPs — follow when the task falls in scope",

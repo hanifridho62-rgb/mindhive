@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # user_prompt_submit — the prompt-quality gate. Reads the UserPromptSubmit
 # payload on stdin and, when the typed prompt is underspecified AND trained
 # trigger rules exist (rules/triggers.json), emits additionalContext JSON on

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """One vocabulary for "did that actually do anything?", and a registry of the
 surfaces that answer it.
 

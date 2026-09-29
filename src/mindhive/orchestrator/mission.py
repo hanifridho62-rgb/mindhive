@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/orchestrator/mission.py
 """`Mission` -- what one `execute_mission` did, in full -- and the four words
 for where its unit list came from.

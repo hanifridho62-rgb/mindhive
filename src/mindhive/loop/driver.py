@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/loop/driver.py
 import json
 import shutil
@@ -117,10 +118,14 @@ class CLIDriver:
         output_format = "stream-json" if live else "json"
         argv = build_argv(self.cmd, loop_context, allowed_tools,
                           output_format, session_id, model, permission_mode)
+        # The SOP process token never reaches a loop agent (blueprint P1d).
+        # `None` while this process holds no token, so a host without one
+        # spawns exactly as before.
+        from .. import advice as authorship
         try:
             proc = subprocess.run(
                 argv, capture_output=True, text=True, timeout=timeout_s,
-                input=prompt,
+                input=prompt, env=authorship.scrub_agent_env(None),
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except subprocess.TimeoutExpired:

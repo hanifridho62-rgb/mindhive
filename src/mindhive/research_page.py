@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/research_page.py
 """Self-Reliant — the autonomous autoresearch section (plan U7).
 

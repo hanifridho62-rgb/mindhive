@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/cat_board.py
 """MN-13 — the faculty cat board as ONE fragment, usable on any page.
 

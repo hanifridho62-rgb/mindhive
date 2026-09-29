@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/orchestrator/worktree.py
 """Lane-scoped physical isolation: `.worktrees/lane-N`, one per lane, for life.
 
@@ -180,6 +181,10 @@ def rollback(root, lane_worktree) -> RolledBack:
       `<root>/.worktrees/lane-N` with a numeric N. The main checkout, the
       incumbent's task-keyed trees under `.claude/worktrees`, and anything a
       caller merely claims is a lane are all refused, with a reason.
+      Behind the path, git's own answer: a lane whose `.git` link is gone is
+      a directory inside the MAIN checkout, from where every file in it is
+      untracked and `clean -fd` would empty it, so a directory
+      `mindnet.worktree.is_toplevel` does not vouch for is refused too.
     * **commits are never touched.** `checkout -- .` and `clean -fd` discard
       what was never committed. A lane that committed its work keeps every
       commit, and `release` still refuses to reset a branch holding them.
@@ -203,19 +208,34 @@ def rollback(root, lane_worktree) -> RolledBack:
     # `add` and `retire` take it — a linked worktree's checkout writes into the
     # common git directory, where a concurrent prune is waiting to race it.
     #
-    # Both seams are taken INSIDE the guard, not just the import. Reaching for
-    # another module's privates is a drift risk this comment already names, and
-    # a rename on the incumbent's side would otherwise raise an AttributeError
-    # out of a function whose docstring promises it answers a value — from
-    # inside a repair loop, where the caller can least afford a surprise.
+    # All three seams are taken INSIDE the guard, not just the import. Reaching
+    # for another module's privates is a drift risk this comment already names,
+    # and a rename on the incumbent's side would otherwise raise an
+    # AttributeError out of a function whose docstring promises it answers a
+    # value — from inside a repair loop, where the caller can least afford a
+    # surprise.
     try:
         from ..mindnet import worktree as mn_wt
-        git, lock = mn_wt._git, mn_wt._GIT_LOCK
+        git, lock, is_toplevel = mn_wt._git, mn_wt._GIT_LOCK, mn_wt.is_toplevel
     except Exception as exc:                            # noqa: BLE001
         return RolledBack(lane_id=lane_id,
                           reason=f"cannot load the worktree driver: "
                                  f"{type(exc).__name__}: {exc}")
+    # `is_lane_path` is a test of the PATH. With the lane's `.git` link gone,
+    # git asked there walks up and answers for the MAIN checkout, from where
+    # every file in the lane is untracked -- and `clean -fd` then empties it.
+    # The guard behind the path guard is git's own answer about the top level,
+    # asked only of a directory that exists: a lane that is not on disk is
+    # left to `status` to refuse, which is a different fact. Asked UNDER the
+    # lock, because between its answer and `checkout -- .` nothing may change
+    # what git answers for the path, and a prune on another thread takes the
+    # same lock; the lock is re-entrant, and the guard takes it again itself.
     with lock:
+        if Path(path).is_dir() and not is_toplevel(path):
+            return RolledBack(lane_id=lane_id,
+                              reason=(f"{path} is not a checkout of its own: "
+                                      f"git there answers for another tree; "
+                                      f"discarding nothing"))
         ok, out, err = git(path, "status", "--porcelain")
         if not ok:
             return RolledBack(lane_id=lane_id,
@@ -235,14 +255,91 @@ def rollback(root, lane_worktree) -> RolledBack:
                       reason="uncommitted work discarded; commits kept")
 
 
-def acquire_lanes(root, count, mission_id="") -> list:
+_WRITE_BITS = 0o222
+
+
+def _chmod_tests(path, writable) -> tuple:
+    """Set or clear the write bits on every file of the JUDGE under *path*:
+    `judge.judge_files`, the very list the gate compares, so what is protected
+    and what is checked cannot drift apart -- everything under `tests/`, every
+    `conftest.py` pytest would load, the root pytest config.
+
+    Not the shared config files (`pyproject.toml`, `setup.cfg`, `tox.ini`): a
+    child may bump a dependency there, and `judge.tests_mutated` judges those
+    by their pytest section alone, which no file mode can express. Not a
+    symlink either, whose mode is its target's and may lie outside the lane.
+
+    Only the write bits move, from each file's own mode. A fixed 0o444 would
+    drop an executable fixture's `x` bit, git would see the mode change, and
+    the lock itself would then read as a test edit.
+
+    Sorted lane-relative paths of what was actually changed. Total: a file the
+    OS will not let us touch is skipped, because this is a deterrent layer and
+    the gate's own check is the one that decides."""
+    import os
+    import stat
+
+    from . import judge                                 # lazy, like the rest
+
+    text = str(path or "")
+    if not text:                                        # `Path("")` is the cwd
+        return ()
+    root = Path(text)
+    done = []
+    for rel in judge.judge_files(text):
+        target = root / rel
+        try:
+            if target.is_symlink():
+                continue
+            mode = stat.S_IMODE(os.stat(target).st_mode)
+            os.chmod(target, (mode | stat.S_IWRITE) if writable
+                     else (mode & ~_WRITE_BITS))
+            done.append(rel)
+        except OSError:                                 # pragma: no cover - odd fs
+            continue
+    return tuple(done)
+
+
+def lock_tests_readonly(path) -> tuple:
+    """Make the lane's judge files read-only for the child (MEB K13).
+
+    Only the FILES, never the `tests/` directory: a read-only directory stops
+    pytest writing `__pycache__` there, and the point is to slow a child down,
+    not to break the suite it is judged by. A child running as the same user
+    can chmod this back, which is why it is the deterrent and not the gate --
+    `judge.tests_mutated` compares against a commit pinned before the child
+    ran, which the orchestrator holds and the lane does not."""
+    return _chmod_tests(path, writable=False)
+
+
+def unlock_tests(path) -> tuple:
+    """The undo. Called on teardown WHATEVER the policy was, because a
+    read-only file is one more thing that can make a removal fail on Windows
+    and re-granting a bit that is already granted costs nothing."""
+    return _chmod_tests(path, writable=True)
+
+
+#: Whether `acquire_lanes` locks each new lane's tests. Off by default and set
+#: by `orchestrator/cli.py` from `--immutable-tests`, because the only caller
+#: between them is `lintester.py`, which this blueprint does not touch.
+LOCK_TESTS = False
+
+
+def acquire_lanes(root, count, mission_id="", lock_tests=None) -> list:
     """One `LaneWorktree` per lane, in lane order.
 
     Failures are returned, not raised and not skipped: a mission that got three
     of four trees should run three lanes and SAY the fourth is missing, and a
     silently shortened list makes that indistinguishable from a mission that only
     ever wanted three."""
-    return [acquire(root, i, mission_id) for i in range(max(0, int(count or 0)))]
+    want = LOCK_TESTS if lock_tests is None else bool(lock_tests)
+    out = []
+    for i in range(max(0, int(count or 0))):
+        lane = acquire(root, i, mission_id)
+        if want and getattr(lane, "ok", False) and getattr(lane, "path", ""):
+            lock_tests_readonly(lane.path)
+        out.append(lane)
+    return out
 
 
 def release_lanes(root, lane_worktrees) -> list:
@@ -251,5 +348,7 @@ def release_lanes(root, lane_worktrees) -> list:
     for lw in lane_worktrees or ():
         if not getattr(lw, "ok", False):
             continue
+        if getattr(lw, "path", ""):
+            unlock_tests(lw.path)
         out.append(release(root, lw))
     return out

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/taskview.py
 """Backend + page fragments for the Sessions notification center.
 

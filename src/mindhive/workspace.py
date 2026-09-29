@@ -1,4 +1,4 @@
-# src/mindhive/workspace.py
+# SPDX-License-Identifier: Apache-2.0
 """Workspace backend: parallel Claude Code agents feeding the Mind Hive ledger.
 
 One Manager owns up to MAX_AGENTS agents. Each agent is a headless `claude`
@@ -87,7 +87,7 @@ SWARM_FACULTY = "task-graph"
 #
 # Re-asserting is explicitly sanctioned: `telemetry.emit`'s docstring notes that
 # "the fold is idempotent under repeats, so a duplicate `active` is harmless".
-# It also repairs the shared-faculty case — `orchestrator` and `__main__` write
+# It also repairs the shared-faculty case — `orchestrator` and `mindnet_tasks` write
 # `task-graph` too, and a `busy` block closing mid-mission would otherwise
 # extinguish this cat permanently, since an edge that already fired cannot fire
 # again.
@@ -708,6 +708,8 @@ class Manager:
         # Its OWN session, never the operator's: see `runlog.workspace_session`
         # for both reasons (a private ledger segment, and honest authorship).
         env["MINDHIVE_SESSION"] = runlog.workspace_session(a.id)
+        from . import advice as authorship  # P1d: the SOP process token never
+        env = authorship.scrub_agent_env(env)   # reaches a board agent; withheld LAST
         cwd = _folder_for_project(a.project)
         try:
             a.proc = self._spawn(argv, env, cwd)

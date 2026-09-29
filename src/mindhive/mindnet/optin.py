@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/mindnet/optin.py
 """MN-6 — the blast-radius gate. MindNetwork enforcement is opt-in, per checkout.
 

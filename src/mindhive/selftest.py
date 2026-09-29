@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/selftest.py
 """`hive selftest` — run the suite, and RECORD that it ran.
 
@@ -77,11 +78,16 @@ def child_env(root):
     Prepended rather than assigned: whatever the operator put on `PYTHONPATH` is
     still theirs, and the checkout under test only has to win the lookup.
     ``None`` when there is no `<root>/src` to point at — a wheel install has
-    none, and inventing one would break the import this exists to fix."""
+    none, and inventing one would break the import this exists to fix.
+
+    A checkout's child also runs with ``PYTHONDONTWRITEBYTECODE=1`` unless the
+    operator chose a value (`paths.no_bytecode_env`): the suite must not write
+    `__pycache__` into the tree it is judging. (`verify._stream` applies the
+    same default to the inherited environment, so the wheel case has it too.)"""
     src = Path(root) / "src"
     if not src.is_dir():
         return None
-    env = dict(os.environ)
+    env = paths.no_bytecode_env()
     prior = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = str(src) + ((os.pathsep + prior) if prior else "")
     return env

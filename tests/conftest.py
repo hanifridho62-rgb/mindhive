@@ -33,6 +33,17 @@ def isolate_store(tmp_path, monkeypatch):
     # rail -- a false regression caused by a documented, supported
     # setting. Pinned ON here; the tests that need it off set it in-body.
     monkeypatch.setenv("MINDHIVE_MINDSWARM", "1")
+    # The SOP authorship gate (`mindhive.advice`, blueprint P1d) reads three
+    # AMBIENT variables, and two supported setups make them hostile to a green
+    # suite: a host that configured `MINDHIVE_ORCHESTRATION_SECRET` refuses
+    # every `hive sop add` a test makes unless the token matches, and a suite run
+    # by an orchestration agent inherits `MINDHIVE_SESSION=lm-...`, which the
+    # fallback rule refuses by design. Cleared here for the MINDSWARM reason
+    # above -- a documented setting must not read as a regression; the tests
+    # that need one set it in-body.
+    for ambient in ("MINDHIVE_ORCHESTRATION_SECRET", "MINDHIVE_PROCESS_TOKEN",
+                    "MINDHIVE_SESSION"):
+        monkeypatch.delenv(ambient, raising=False)
     yield
     # The isolation is only as good as the last line of the test. A blanket
     # `monkeypatch.undo()` inside a test body -- reached for to restore one
@@ -64,3 +75,76 @@ def isolate_store(tmp_path, monkeypatch):
         "function-scoped monkeypatch; restore the one attribute you patched "
         "instead, or scope it with `with monkeypatch.context() as m:`."
         % (home or "unset -> ~/.mindhive"))
+
+
+# --------------------------------------------------------------------------
+# The CHECKOUT is not a scratch directory either
+# --------------------------------------------------------------------------
+#
+# `isolate_store` keeps the suite out of the developer's ~/.mindhive. This
+# keeps it out of the working copy, which is the other place a test scribbles
+# by accident and nothing notices: pytest runs with the repo root as the
+# working directory, so any code under test handed a RELATIVE path, and any
+# subprocess spawned without `cwd=`, writes here.
+#
+# The failure it is built for is a quiet one. Six stray files
+# (`b.bin`, `d/in.txt`, `f.txt`, `n.txt`, `s.txt`, `z.txt`) sat untracked in
+# this worktree for most of a day, and the cost was not the disk: every
+# `git status` read as dirty, so `git add -A` became unsafe and the debris had
+# to be excluded by hand on every commit. Nothing failed. Nothing reported it.
+#
+# Cost is two directory listings PER RUN -- not per test -- and it names the
+# entries, so the finding is actionable rather than "something changed".
+# Session scope, not function scope, on purpose: a per-test check would be the
+# precise one (it would name the test), but it would also pay 9500 listings to
+# find a thing that has happened once, and a guard expensive enough to be
+# turned off guards nothing. What this reports is enough to bisect by hand.
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+#: Churn the tooling writes into the root by design. `.pytest_cache` is the
+#: one that matters -- a default run creates it, `-p no:cacheprovider` does
+#: not, and a guard that disagreed with itself between those two spellings
+#: would be noise.
+REPO_ROOT_IGNORED = frozenset({
+    "__pycache__", ".pytest_cache", ".hypothesis", ".mypy_cache",
+    ".ruff_cache", ".tox", ".coverage",
+})
+
+
+def repo_root_entries(root=None):
+    """The checkout's top-level entry names, minus the tooling's own churn.
+
+    Names, not paths, and not recursive: a stray file lands AT the root or in
+    a directory it created there, and both show up as one new top-level name.
+    A missing root answers empty rather than raising -- the guard must never
+    be the thing that fails a run."""
+    root = REPO_ROOT if root is None else Path(root)
+    try:
+        names = {entry.name for entry in root.iterdir()}
+    except OSError:
+        return set()
+    return {n for n in names
+            if n not in REPO_ROOT_IGNORED and not n.startswith(".coverage.")}
+
+
+@pytest.fixture(scope="session", autouse=True)
+def repo_root_stays_clean():
+    """Fail the run that left a new entry in the checkout's root.
+
+    Snapshot-and-compare rather than an allow-list of what MAY be there: a
+    developer's `.venv`, `notes.md` or editor directory is their business,
+    and a guard that fails on those is one they learn to delete. What is not
+    their business is the suite adding something while it runs."""
+    before = repo_root_entries()
+    yield
+    new = sorted(repo_root_entries() - before)
+    assert not new, (
+        "the suite left %d new entr(y/ies) in the repository root: %s. "
+        "Something under test was handed a RELATIVE path, or a subprocess was "
+        "spawned without `cwd=`; pytest's working directory is the checkout, "
+        "so that is where it landed. Write under `tmp_path`, or "
+        "`monkeypatch.chdir(tmp_path)` first. (If the run was interleaved with "
+        "a hand-run script, that script is the likelier author -- check the "
+        "mtimes before bisecting the suite.)"
+        % (len(new), ", ".join(new)))

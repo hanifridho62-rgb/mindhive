@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/paths.py
 import hashlib
 import itertools
@@ -13,6 +14,23 @@ from pathlib import Path
 # (the dashboard runs via pythonw / detached) pops a fresh console window for a
 # split second. CREATE_NO_WINDOW suppresses it. No-op flag (0) elsewhere.
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+# A Python child that writes `__pycache__` into a lane or a checkout under test
+# leaves litter the merge-back reads as work (MEB operational risk 7). Every
+# environment this package builds for a child carries this variable.
+NO_BYTECODE_ENV = "PYTHONDONTWRITEBYTECODE"
+
+
+def no_bytecode_env(env=None) -> dict:
+    """A copy of *env* (``None``: this process's) with `NO_BYTECODE_ENV` set to
+    ``"1"`` unless it already carries a value -- the operator's choice wins,
+    even an empty one. The name is matched the way the platform matches it:
+    case-blind on Windows, where a second spelling would be a duplicate key."""
+    merged = dict(os.environ if env is None else env)
+    names = {str(k).upper() for k in merged} if os.name == "nt" else set(merged)
+    if NO_BYTECODE_ENV not in names:
+        merged[NO_BYTECODE_ENV] = "1"
+    return merged
 
 
 def store_home() -> Path:
@@ -457,6 +475,22 @@ def project_dir(project: str | None = None) -> Path:
 
 def events_dir(project: str | None = None) -> Path:
     return project_dir(project) / "events"
+
+
+def state_dir(project: str | None = None) -> Path:
+    """The namespace's directory for sidecars that are neither the ledger nor
+    a projection of it -- the pending-embed queue first -- made on demand.
+
+    Through `project_dir`, never a join of its own, so a hostile project lands
+    inside the quarantined namespace like everything else in the store (and
+    `tests/test_store_root_files.py`'s root-join guard has nothing new to
+    allow). It mkdirs, unlike `events_dir`, because every caller is about to
+    write; call it only then. `is_freshly_minted` probes `project_dir()` for
+    existence, and a probe that minted the namespace on the way would answer
+    "not fresh" to the very read it exists to warn about."""
+    d = project_dir(project) / "state"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def runs_dir(project: str | None = None) -> Path:

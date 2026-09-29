@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/mindnet/telemetry.py
 """MN-1 U10 — the faculty activity feed: which MindNetwork faculty is awake.
 
@@ -70,14 +71,16 @@ This list is the whole producer set. A faculty absent from it has a labelled cat
 and nothing that lights it, which is the one way R16's "a missing cat means a
 real bug" can be false for a reason that is not a bug:
 
-- `__main__._mn_work` — a mutating `hive mindnet` command (`task-graph`).
+- `commands.mindnet_tasks._mn_work` (reached as `__main__._mn_work` through the
+  shim's re-export) — a mutating `hive mindnet` command (`task-graph`).
 - `orchestrator` — an executed wave (`task-graph`) and the completion gate
   (`pr-green`).
 - `enforce.hook_decision` — MN-4's language lock (`compatibility`).
 - `promptgate.record_direction` — the prompt catalog, via `playbook.engaged`
   (`skill-plugin`, `history`).
-- `__main__`'s UserPromptSubmit hook — the consulted spine, via
-  `inject.engaged_faculties` (`sop`, `improvements`).
+- `commands.ledger.cmd_hook`'s UserPromptSubmit stage (re-exported as
+  `__main__.cmd_hook`) — the consulted spine, via `inject.engaged_faculties`
+  (`sop`, `improvements`).
 - `workspace.Manager._sync_faculty` — a running MindSwarm mission
   (`task-graph`).
 

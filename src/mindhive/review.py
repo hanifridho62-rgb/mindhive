@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/review.py
 """Thermo-nuclear review queue: turn a session's file_touched events into a
 pending-review marker the next session can act on.

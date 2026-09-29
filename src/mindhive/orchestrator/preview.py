@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/orchestrator/preview.py
 """The dry run's local decomposer, and the row shape every decomposer answers.
 

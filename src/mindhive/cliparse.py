@@ -1,11 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/cliparse.py
 """Argparse behaviour shared by the whole `hive` surface.
 
-Separate from `__main__.py` on purpose. That file is the CLI's *wiring* — one
-`add_parser` block and one handler per command — and it is already four times
-the review threshold. This is not wiring: it is how the parser behaves when the
-wiring is given something it does not recognise, it applies to all 21 subparser
-groups at once, and it is testable without constructing the 39-command parser.
+Separate from `commands/parsers/` on purpose (it was `__main__.py` until the P9
+split). That package is the CLI's *wiring* — one `add_<command>(sub)` per
+command — and this is not wiring: it is how the parser behaves when the wiring
+is given something it does not recognise, it applies to every subparser group
+at once (24 today), and it is testable without constructing the full 46-command
+parser.
 
 Everything here is agent-facing ergonomics. `hive`'s primary user is a Claude
 session, and argparse's stock answer to an unknown command spends 78 names to
@@ -76,10 +78,11 @@ class SuggestingParser(argparse.ArgumentParser):
 def session_id_arg(value):
     """argparse ``type=`` for every ``--session``: the id, or a usage error.
 
-    Here rather than in ``__main__`` for this module's founding reason: it is
-    parser BEHAVIOUR shared by every ``--session`` argument across the surface,
-    not the per-command wiring that file holds -- and that file is on a size
-    ratchet whose failure message says to shrink it, not to raise the number.
+    Here rather than in ``commands/parsers/`` for this module's founding reason:
+    it is parser BEHAVIOUR shared by every ``--session`` argument across the
+    surface, not the per-command wiring that package holds -- and each of its
+    modules is under a 500-line cap (`tests/test_commands_reexport.py`) whose
+    failure message says to split, not to raise the number.
 
     No count in this sentence, deliberately. It used to read "all 32", which was
     ``__main__.py``'s number and not the surface's: `consensus/cli.py` and
@@ -97,25 +100,32 @@ def session_id_arg(value):
     them is a worse answer than refusing the id. Two layers, each matched to its
     surface -- not a redundant check.
 
-    **It accepts exactly what the sink takes at face value**, asked of the sink
-    itself: ``segment_name(value) == value + ".jsonl"``. The whitelist alone
-    (``events.SESSION_ID_RE``, shared with ``hooks/lib.sh`` and
-    ``hooks/lib.ps1``) was the first spelling, and the sink outgrew it: it also
-    reserves the quarantine prefix in any case and, on Windows, refuses device
-    names. So ``--session unsafe-9cdf6a50100a862e`` passed this check, exited 0
-    and was filed under a DIFFERENT hash -- the silent answer this function
-    exists to replace. Delegating the accept test cannot fall behind the sink.
-    ``ArgumentTypeError`` makes argparse exit 2 with the message before any
-    handler runs, so a refused id writes nothing at all."""
-    if isinstance(value, str) and events.segment_name(value) == value + ".jsonl":
-        return value
-    raise argparse.ArgumentTypeError(
-        "invalid session id %r: it names a ledger segment file, so it must be "
-        "1-128 characters of letters, digits, '.', '_' or '-', starting with a "
-        "letter or digit (no path separators, '..', drive letters or "
-        "wildcards), must not start with the reserved 'unsafe-' in any case, "
-        "and on Windows must not be a device name such as CON, NUL or COM1"
-        % (value,))
+    **The accept test is ``events.validate_session_id``, by delegation.** That
+    is the anchored whitelist (``events.SESSION_ID_REGEX``) AND the sink's own
+    answer at its strictest platform, ``segment_name(value, os_name="nt") ==
+    value + ".jsonl"``. The whitelist alone (``events.SESSION_ID_RE``, shared
+    with ``hooks/lib.sh`` and ``hooks/lib.ps1``) was the first spelling, and
+    the sink outgrew it: it also reserves the quarantine prefix in any case and,
+    on Windows, refuses device names. So ``--session unsafe-9cdf6a50100a862e``
+    passed this check, exited 0 and was filed under a DIFFERENT hash -- the
+    silent answer this function exists to replace. Asking the sink at ``nt``
+    on every platform is what makes ``CON`` refused on Linux too: a store moves
+    between machines, and an id a Windows runner would quarantine is a
+    different segment the day the store is opened there. An accept at ``nt``
+    implies an accept on the runner in hand, which is what keeps
+    `tests/test_cli_arg_wiring.py`'s accept-implies-sink-identity invariant.
+
+    The message composes BOTH texts: the ``invalid session id`` phrase two
+    test files pin in stderr, and the ``ValueError`` text so the operator sees
+    the rule they broke rather than a paraphrase of it. Chained from the
+    ``ValueError`` -- one rule, stated once. ``ArgumentTypeError`` makes
+    argparse exit 2 with the message before any handler runs, so a refused id
+    writes nothing at all."""
+    try:
+        return events.validate_session_id(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(
+            "invalid session id %r: %s" % (value, e)) from e
 
 
 def project_arg(value):

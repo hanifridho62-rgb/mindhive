@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/incidentfile.py
 """The incident record's on-disk Markdown format: parse it, and render it.
 

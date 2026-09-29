@@ -100,6 +100,48 @@ def _graph_blob(html):
     return m.group(1)
 
 
+def test_a_semantic_failure_reaches_the_page_that_asked_for_it():
+    """`/api/graph?semantic=1` renders whatever `build` returned. The error
+    rode in the dict and was dropped here, so a view that asked for semantic
+    links and got none said nothing about why."""
+    msg = "semantic query failed on the 'ledger' index: <b>hnsw</b>"
+    html = graphview.render_html(dict(_graph(), semantic_error=msg))
+    assert json.loads(_graph_blob(html))["semantic_error"] == msg
+    assert "<b>hnsw" not in html, "the error reached the page unescaped"
+    plain = graphview.render_html(_graph())
+    assert "semantic_error" not in json.loads(_graph_blob(plain))
+
+
+def _banner_block():
+    """The renderer's `if (data.semantic_error) {...}`, by brace matching.
+    Its CSS and its text are in every page, error or not, so only the block
+    itself says whether a banner is drawn."""
+    js = graphview._RENDERER_JS
+    at = js.index("if (data.semantic_error) {")
+    depth = 0
+    for j in range(js.index("{", at), len(js)):
+        depth += {"{": 1, "}": -1}.get(js[j], 0)
+        if depth == 0:
+            return js[at:j + 1]
+    raise AssertionError("the banner block has unbalanced braces")
+
+
+def test_the_banner_is_drawn_into_the_stage():
+    block = _banner_block()
+    assert 'semerr.id = "semerr"' in block
+    assert "Semantic links unavailable" in block
+    assert 'document.getElementById("stage").appendChild(semerr)' in block
+
+
+def test_the_banner_is_written_as_text_never_as_markup():
+    """The message carries ledger-adjacent text (paths, exception strings);
+    the renderer puts it in with textContent, so no string in it is ever
+    parsed as HTML."""
+    block = _banner_block()
+    assert "textContent" in block and "innerHTML" not in block
+    assert 'setAttribute("role", "alert")' in block
+
+
 def test_render_html_escapes_a_comment_opener():
     """`</script>` is the obvious way out of a script element; `<!--<script>` is
     the one that hid, and the exact trigger matters. A bare `<!--` opens

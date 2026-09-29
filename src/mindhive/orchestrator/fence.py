@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/orchestrator/fence.py
 """The ceiling a real lintester child actually runs under.
 

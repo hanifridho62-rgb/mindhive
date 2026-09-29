@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Adaptive work injection: replenish a surface's plan from what the record proves.
 
 Work in this system ends quietly. An interactive session stops when the human
@@ -50,7 +51,6 @@ would let two different conditions share one identity — which reads as "alread
 proposed" and silences the lens. `kind` carries the readable classification the
 digest gives up, for the lenses that observe more than one kind of condition.
 """
-
 import hashlib
 import re
 from dataclasses import dataclass, field, replace
@@ -2195,8 +2195,8 @@ LENSES["caveat"] = caveat
 # against the real repo — and the real repo is 4000 tests wide.
 
 # The thermo-nuclear threshold. Not a new opinion: `docs/session-legend.md`
-# already records `__main__.py` sitting past this line as a standing caveat, and
-# the review skill checks against the same number.
+# recorded the pre-split `__main__.py` sitting past this line as a standing
+# caveat, and the review skill checks against the same number.
 LINE_THRESHOLD = 1000
 
 # How many lines past the threshold make one step of magnitude. It does double

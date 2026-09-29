@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/mindnet/ab.py
 """`hive mindnet ab` — run one task graph twice, brief OFF then ON, and compare.
 
@@ -221,8 +222,9 @@ def record(trial, project=None) -> None:
 # --- CLI -----------------------------------------------------------------------
 #
 # Self-registering on the `mindnet` subparser, the trade `bench`, `briefcli` and
-# `clusterscli` already take: `__main__.py` is under a shrink-only ratchet, so an
-# inline argparse block here would cost it ~30 lines it does not have.
+# `clusterscli` already take: the parser module (`__main__.py` then, under a
+# shrink-only ratchet; `commands/parsers/mindnet.py` since the P9 split, capped
+# at 500 lines) would pay ~30 lines for an inline argparse block here.
 
 REFUSED = 2
 

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # stop — smart-zone session rotation detector.
 #
 # Fires at the end of every agent turn. It measures this session's true context
