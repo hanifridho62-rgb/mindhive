@@ -75,7 +75,10 @@ def recall(query, project=None, semantic=False, limit=10, force=False):
         #
         # The fallback is for an EMPTY index, never a broken one: the count is
         # asked strictly, so a failure raises `vectors.SemanticQueryError`
-        # instead of reading as 0 and routing to the files in silence. The
+        # instead of reading as 0 and routing to the files in silence. So is a
+        # query that answers nothing from the rows the count found
+        # (`vector_errors.UnansweredQuery`, raised in `vectors._ask`): measured
+        # on a collection whose dimension was NULL, it routed there too. The
         # LIVE_LOCK refusal comes first, before the count opens anything; a
         # limit below 1 then asks for nothing, so nothing is opened.
         guard.ensure_safe(force=force)

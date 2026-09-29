@@ -71,6 +71,10 @@ class FakeCollection:
                 "metadatas": [[self.rows[i]["metadata"] for i, _ in hits]],
                 "distances": [[d for _, d in hits]]}
 
+    def count(self):
+        self.calls.append(("count", None))
+        return len(self.rows)
+
     def kinds(self):
         return [name for name, _ in self.calls]
 
@@ -256,19 +260,24 @@ def test_the_lock_is_the_one_vectors_names(monkeypatch, col):
                                                     vectors.CHROMA_LOCK_STALE_S)
 
 
-def test_a_write_opens_with_refill_and_a_read_does_not(col):
+def _embedded_and_asked(col):
+    """One record written, and a query answered with it."""
     idx = _index()
-    idx.embed_batch("events", _recs(1))
+    (rec,) = _recs(1)
+    idx.embed_batch("events", [rec])
+    col.hits = [(idx.record_id(rec), 0.1)]
     idx.query("events", "anything")
+
+
+def test_a_write_opens_with_refill_and_a_read_does_not(col):
+    _embedded_and_asked(col)
     assert [o["refill"] for o in col.opened] == [True, False]
 
 
 def test_a_write_opens_the_live_index_and_a_read_opens_the_copy(col):
     """A read through the live client writes to the index it reads
     (DATA_MODEL.md 4.19), so only the write may be handed that client."""
-    idx = _index()
-    idx.embed_batch("events", _recs(1))
-    idx.query("events", "anything")
+    _embedded_and_asked(col)
     assert [o["client"] for o in col.opened] == [None, READ_CLIENT]
 
 
@@ -497,6 +506,42 @@ def test_a_query_that_raises_is_an_error_not_an_empty_answer(col):
         _index().query("events", "q")
     assert (err.value.stage, err.value.collection) == ("query", "events")
     assert err.value.__cause__ is boom
+
+
+@pytest.mark.parametrize("panics", [True, False], ids=["panic", "interrupt"])
+def test_an_encoder_that_panics_is_a_failed_encode(col, panics):
+    """The default encoder tokenises through HF tokenizers, a pyo3 extension,
+    whose panics are BaseExceptions: one went past this driver's `except
+    Exception` raw, where every other step of a read reports it as the stage
+    that failed. An interrupt is still no failure."""
+    stop = (type("PanicException", (BaseException,),
+                 {"__module__": "pyo3_runtime"})("tokenizer panicked")
+            if panics else KeyboardInterrupt())
+
+    def _enc_stops(_docs):
+        raise stop
+
+    if panics:
+        with pytest.raises(vectors.SemanticQueryError) as err:
+            LocalVectorIndex(encoder=_enc_stops).query("events", "q")
+        assert (err.value.stage, err.value.collection) == ("encode", "events")
+        assert err.value.__cause__ is stop
+    else:
+        with pytest.raises(KeyboardInterrupt):
+            LocalVectorIndex(encoder=_enc_stops).query("events", "q")
+
+
+def test_a_query_that_answers_nothing_from_its_rows_failed(col):
+    """A collection holding rows that answers no hits has failed -- the
+    shared `vectors._ask` says so for this driver as for the others."""
+    from mindhive import vector_errors
+    (rec,) = _recs(1)
+    idx = _index()
+    idx.embed_batch("events", [rec])
+    col.hits = []
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        idx.query("events", "q")
+    assert isinstance(err.value.__cause__, vector_errors.UnansweredQuery)
 
 
 def test_a_top_k_below_one_asks_the_index_nothing(col):

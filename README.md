@@ -402,14 +402,22 @@ For both commands the refusal — and a missing `[vectors]` extras install — i
 index that cannot be read is exit 1, never an empty result: the message names
 the failing stage, the project namespace and a remedy that depends on what
 broke — wait out a busy writer, free the temp directory, or repair the
-damaged index. Where a collection opened and then failed, or a cut segment
-belongs to `ledger` or `events`, that is `hive embed --rebuild --project <ns>`
+damaged index. Where a collection opened and then failed — a query that
+answered nothing from a collection holding rows it could have returned, or a
+hit without its text, included — or the `ledger` or `events` collection read
+has a cut segment, that is `hive embed --rebuild --project <ns>`
 first, which drops the collection without reading it, and the delete of the
 `chroma/` directory it names if the read still fails. Where chromadb cannot
-open the files — a rebuild opens them too — or the damage is the watcher's
-collection, which a rebuild never writes, it is the delete alone: delete the
-directory and run `hive embed --project <ns>`; the watcher's collection
-refills only from rows appended afterwards. A quarantined namespace — an
+open the files — a rebuild needs them open too, and fails on them — or the
+damage is the watcher's collection, which a rebuild never writes, it is the
+delete alone: delete the directory and run `hive embed --project <ns>`; the
+watcher's collection refills only from rows appended afterwards. A client a
+read failed on is never closed (closing one corrupted the heap), so once 16
+are held, an index with a failure no read has got past is not read again
+until the process restarts, and the message names the restart after the
+repair, before any delete. A `hive embed` that fails writing prints one
+`error:` line — what it wrote before the failure, and the repair — and exits
+1. A quarantined namespace — an
 `unsafe-<hash>` directory, whose name `--project` refuses — is repaired without
 `--project`: run `hive embed` from the project's checkout, or with the same
 `MINDHIVE_PROJECT`, and the message says so. An argument chromadb refused at
