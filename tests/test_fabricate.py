@@ -381,6 +381,40 @@ def test_a_capped_loop_wakes_at_most_max_attempts_times(tmp_path,
         list(range(1, autoresume.MAX_ATTEMPTS + 1))
 
 
+@pytest.mark.parametrize("retire", ["complete", "archive"])
+def test_a_plan_retired_while_the_run_was_going_stays_retired(
+        tmp_path, monkeypatch, retire):
+    """A run is capped hours after it started, and its snapshot re-sets and
+    interrupts the plan it was launched on. A human who completed or archived
+    that plan meanwhile closed it on purpose: the snapshot must not reopen it
+    as interrupted, with a wake-up armed to relaunch it."""
+    monkeypatch.chdir(tmp_path)
+    rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
+    from mindhive.loop import config as loop_config
+    from mindhive.loop import engine as loop_engine
+
+    class RetireThenCapped:
+        def run(self, prompt, loop_context, **kw):
+            if retire == "complete":
+                roadmap.record("complete", rec["fab_id"])
+            else:
+                roadmap.record("archive", rec["fab_id"],
+                               reason="superseded by hand")
+            return _capped_result()
+
+    result = loop_engine.run_loop(
+        project="test", loop_dir=rec["goal_dir"],
+        cfg=loop_config.LoopConfig(max_iterations=3),
+        driver=RetireThenCapped(), now_fn=lambda: T0_EPOCH,
+        sleep_fn=lambda s: None, progress_fn=lambda i: True,
+        plan_id=rec["fab_id"])
+    assert result["reason"] == "api_cap"
+    evs = events.read_all()
+    assert roadmap.get(evs, rec["fab_id"])["status"] == \
+        ("completed" if retire == "complete" else roadmap.ARCHIVED)
+    assert autoresume.pending(evs) == []
+
+
 # Nine SOP steps: more than MAX_ATTEMPTS, so a chain that spends an attempt on
 # every wake-up runs out before the plan does.
 PRD_LONG = """TITLE: Build the nine-part panel
@@ -586,6 +620,91 @@ def test_a_checklist_the_wake_up_cannot_read_is_not_progress(tmp_path):
     assert ar["checked_high"] == 0          # what it read before the relaunch
 
 
+def test_items_a_human_unchecks_between_wake_ups_lower_the_mark(tmp_path,
+                                                                monkeypatch):
+    """The mark is the most items this chain ever saw checked. A human who
+    reviews the work while the loop sleeps and un-checks K items has said
+    those are not done, and re-doing them is progress. Measured against the
+    old mark, the rework counted only once the count passed it, so K >=
+    MAX_ATTEMPTS dropped the chain first -- here at 6/9, three items never
+    touched again."""
+    monkeypatch.chdir(tmp_path)
+    rec = fabricate.compile_work_order(PRD_LONG, base_dir=tmp_path)
+    fix_plan = Path(rec["goal_dir"]) / "fix_plan.md"
+
+    def between(k):
+        if k == 5:                  # the launch and five wake-ups: 6 checked
+            assert _checked(rec) == 6
+            fix_plan.write_text(
+                fix_plan.read_text(encoding="utf-8").replace("- [x]", "- [ ]"),
+                encoding="utf-8")
+
+    attempts, armed, gone = _wake_up_chain(monkeypatch, rec, _check_one,
+                                           between=between)
+    assert _checked(rec) == 9
+    # Fourteen wake-ups checked an item off -- five before the review, nine
+    # re-doing and finishing the plan after it -- each re-arming at attempt
+    # 1; the fifteenth found nothing left, and from there every wake-up
+    # spent one.
+    assert attempts == [1] * 15 + list(range(2, autoresume.MAX_ATTEMPTS + 1))
+    assert armed == [] and gone == [rec["fab_id"]]
+    marks = [(e.payload.get("checked_high"), e.payload.get("checked_left"))
+             for e in events.read_all() if e.type == "autoresume"
+             and e.payload.get("action") == "scheduled"]
+    # Each re-arm carries the mark and what the relaunch left. The wake-up
+    # that found six items un-checked since then lowered the mark by six
+    # before measuring, so its one re-done item read as progress.
+    assert marks[:8] == [(None, None), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6),
+                         (1, 1), (2, 2)]
+
+
+def test_a_checklist_read_that_raises_anything_is_not_progress(tmp_path,
+                                                               monkeypatch):
+    """Whatever reading the checklist raises -- not only the OSError a missing
+    or unreadable file gives -- the wake-up treats it as unreadable: no
+    progress, the outcome recorded, the chain re-armed. A parser error used to
+    escape before the `fired` row landed, leaving the plan scheduled with no
+    timer behind it."""
+    rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
+    roadmap.record("interrupt", rec["fab_id"], cause="api_cap")
+    autoresume.schedule(rec["fab_id"], mode="loop", goal_dir=rec["goal_dir"],
+                        register=_no_timer, now=T0_EPOCH)
+    from mindhive.loop import task as task_mod
+
+    def broken(text):
+        raise TypeError("checklist parser broke")
+
+    monkeypatch.setattr(task_mod, "plan_items", broken)
+    payload = autoresume.fire(
+        rec["fab_id"],
+        loop_runner=lambda *a: ("still_limited", "loop api_cap"),
+        register=_no_timer, unregister=lambda p: None, runner=_no_prompt)
+    assert payload["outcome"] == "still_limited"
+    ar = autoresume.fold(events.read_all())[rec["fab_id"]]
+    assert (ar["status"], ar["attempt"]) == ("scheduled", 2)
+    assert "checked_high" not in ar          # nothing readable to measure from
+
+
+def test_a_checklist_past_the_mark_bound_still_re_arms(tmp_path, monkeypatch):
+    """The count a wake-up carries is capped at the bound the contract
+    enforces, so a checklist longer than any real one still re-arms instead
+    of failing the re-arm's own validation."""
+    monkeypatch.setattr(autoresume, "MAX_CHECKED_ITEMS", 5)
+    rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
+    (Path(rec["goal_dir"]) / "fix_plan.md").write_text(
+        "".join(f"- [x] part {i}\n" for i in range(8)), encoding="utf-8")
+    roadmap.record("interrupt", rec["fab_id"], cause="api_cap")
+    autoresume.schedule(rec["fab_id"], mode="loop", goal_dir=rec["goal_dir"],
+                        register=_no_timer, now=T0_EPOCH)
+    autoresume.fire(
+        rec["fab_id"],
+        loop_runner=lambda *a: ("still_limited", "loop api_cap"),
+        register=_no_timer, unregister=lambda p: None, runner=_no_prompt)
+    ar = autoresume.fold(events.read_all())[rec["fab_id"]]
+    assert (ar["status"], ar["attempt"], ar["checked_high"]) == \
+        ("scheduled", 2, 5)
+
+
 def test_loop_mode_fire_relaunches_the_loop(tmp_path):
     rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
     roadmap.record("interrupt", rec["fab_id"], cause="api_cap")
@@ -688,6 +807,95 @@ def test_a_cancel_issued_while_the_relaunch_runs_is_honoured(tmp_path):
     assert gone == [rec["fab_id"]] * 2              # the cancel's, the fire's
 
 
+def test_a_schedule_issued_by_hand_while_the_relaunch_runs_is_honoured(
+        tmp_path):
+    """A relaunch runs for hours. A `hive autoresume schedule --at` issued
+    meanwhile -- moving the next wake-up to a quiet hour -- found the delivery
+    still scheduled and replaced it; the wake-up's own re-arm then replaced
+    THAT with one cooldown from its return. The hand-issued schedule wins: the
+    wake-up re-arms as it says, its count started over, and a re-schedule
+    keeps the loop mode and goal dir it does not name."""
+    rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
+    roadmap.record("interrupt", rec["fab_id"], cause="api_cap")
+    autoresume.schedule(rec["fab_id"], mode="loop", goal_dir=rec["goal_dir"],
+                        register=_no_timer, now=T0_EPOCH, attempt=3,
+                        checked_high=2)
+    quiet = autoresume._iso(time.time() + 30 * 3600)
+    armed, gone = [], []
+
+    def loop_runner(plan_id, goal_dir, project):
+        autoresume.schedule(plan_id, at=quiet, cwd="C:/elsewhere",
+                            register=_no_timer)             # another shell
+        return "still_limited", "loop api_cap"
+
+    payload = autoresume.fire(
+        rec["fab_id"], loop_runner=loop_runner, runner=_no_prompt,
+        register=lambda plan_id, *a: armed.append(plan_id) or "windows_task",
+        unregister=gone.append)
+    assert payload["outcome"] == "still_limited"
+    assert "by hand" in payload["detail"]
+    ar = autoresume.fold(events.read_all())[rec["fab_id"]]
+    assert (ar["status"], ar["due"], ar["attempt"], ar["cwd"]) == \
+        ("scheduled", quiet, 1, "C:/elsewhere")
+    assert (ar["mode"], ar["goal_dir"]) == ("loop", str(rec["goal_dir"]))
+    assert "checked_high" not in ar             # theirs starts the count over
+    assert armed == [rec["fab_id"]] and gone == []    # their timer stands
+
+
+def test_a_fire_by_hand_after_a_cancel_does_not_re_arm_the_chain(tmp_path):
+    """`hive autoresume cancel` withdraws the chain; a later `hive autoresume
+    fire` by hand delivers once. It used to read the cancelled record's loop
+    mode, relaunch, and -- the cancel having landed before it started rather
+    than while it ran -- re-arm the chain the human had just withdrawn."""
+    rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
+    roadmap.record("interrupt", rec["fab_id"], cause="api_cap")
+    autoresume.schedule(rec["fab_id"], mode="loop", goal_dir=rec["goal_dir"],
+                        register=_no_timer, now=T0_EPOCH)
+    autoresume.cancel(rec["fab_id"], unregister=lambda p: None)
+    gone, ran = [], []
+    payload = autoresume.fire(
+        rec["fab_id"],
+        loop_runner=lambda *a: ran.append(1)
+        or ("still_limited", "loop api_cap"),
+        runner=_no_prompt,
+        register=lambda *a: pytest.fail("a cancelled chain re-armed"),
+        unregister=gone.append)
+    assert ran == [1]                               # delivered once, by hand
+    assert payload["outcome"] == "still_limited"
+    assert "after a cancel" in payload["detail"]
+    evs = events.read_all()
+    assert autoresume.pending(evs) == []
+    assert autoresume.fold(evs)[rec["fab_id"]]["status"] == "fired"
+    assert gone == [rec["fab_id"]]
+
+
+def test_a_plan_completed_while_the_relaunch_ran_ends_the_chain_with_a_reason(
+        tmp_path):
+    """The relaunch is capped, but a human completed the plan meanwhile: there
+    is nothing to re-arm, and the `fired` row says so. The re-arm used to fail
+    on the schedule's own guard after the row had landed, so the chain ended
+    on a detail that said nothing about why."""
+    rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
+    roadmap.record("interrupt", rec["fab_id"], cause="api_cap")
+    autoresume.schedule(rec["fab_id"], mode="loop", goal_dir=rec["goal_dir"],
+                        register=_no_timer, now=T0_EPOCH)
+    gone = []
+
+    def loop_runner(plan_id, goal_dir, project):
+        roadmap.record("complete", plan_id)                 # another shell
+        return "still_limited", "loop api_cap"
+
+    payload = autoresume.fire(
+        rec["fab_id"], loop_runner=loop_runner, runner=_no_prompt,
+        register=lambda *a: pytest.fail("a completed plan re-armed"),
+        unregister=gone.append)
+    assert payload["outcome"] == "still_limited"
+    assert "no longer interrupted (completed)" in payload["detail"]
+    assert autoresume.fold(events.read_all())[rec["fab_id"]]["status"] == \
+        "fired"
+    assert gone == [rec["fab_id"]]
+
+
 def test_a_capped_relaunch_is_due_one_cooldown_after_it_returned(tmp_path):
     """The window just closed on the relaunch, so the next wake-up is one
     cooldown after it returned. Keyed to the recorded interruption instead, a
@@ -709,6 +917,31 @@ def test_a_capped_relaunch_is_due_one_cooldown_after_it_returned(tmp_path):
     assert (ar["status"], ar["attempt"]) == ("scheduled", 2)
     assert autoresume._parse_ts(ar["due"]) - back == \
         autoresume.COOLDOWN_HOURS * 3600
+
+
+def test_the_next_wake_up_is_timed_from_the_relaunch_return_not_its_start(
+        tmp_path, monkeypatch):
+    """The relaunch runs for hours before the window closes on it. Read when
+    the wake-up began, the clock would put the next one a cooldown after the
+    START -- into a window still closed by the hours the relaunch ran. The
+    test above cannot tell the two apart (it hands `fire` the return time);
+    this one lets the relaunch move the clock."""
+    rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
+    roadmap.record("interrupt", rec["fab_id"], cause="api_cap")
+    autoresume.schedule(rec["fab_id"], mode="loop", goal_dir=rec["goal_dir"],
+                        register=_no_timer, now=T0_EPOCH)
+    clock = {"now": T0_EPOCH + 5 * 3600}
+    monkeypatch.setattr(autoresume.time, "time", lambda: clock["now"])
+
+    def loop_runner(plan_id, goal_dir, project):
+        clock["now"] += 3 * 3600                 # three hours of work
+        return "still_limited", "loop api_cap"
+
+    autoresume.fire(rec["fab_id"], loop_runner=loop_runner, runner=_no_prompt,
+                    register=_no_timer)
+    ar = autoresume.fold(events.read_all())[rec["fab_id"]]
+    assert autoresume._parse_ts(ar["due"]) == \
+        clock["now"] + autoresume.COOLDOWN_HOURS * 3600
 
 
 def test_loop_mode_fire_records_an_outcome_whatever_the_delivery_raises(
@@ -937,13 +1170,48 @@ def test_autoresume_contract_rejects_bad_mode_payloads():
              "due": "2026-07-18T05:00:00Z", "attempt": 1, "mode": "loop"})
 
 
-def test_autoresume_contract_rejects_a_bad_checked_high():
+def test_autoresume_contract_bounds_the_checklist_marks():
+    """A raw `hive append autoresume` could carry any integer, and a mark no
+    checklist can reach would freeze progress detection for the rest of the
+    chain -- nothing is ever checked past it. Both marks share the bound."""
     ok = {"action": "scheduled", "plan_id": "x-1",
           "due": "2026-07-18T05:00:00Z", "attempt": 1}
-    autoresume.validate_payload(dict(ok, checked_high=0))
-    for bad in (-1, True, "3", 2.5):
-        with pytest.raises(ValueError, match="checked_high"):
-            autoresume.validate_payload(dict(ok, checked_high=bad))
+    for key in ("checked_high", "checked_left"):
+        autoresume.validate_payload(dict(ok, **{key: 0}))
+        autoresume.validate_payload(
+            dict(ok, **{key: autoresume.MAX_CHECKED_ITEMS}))
+        for bad in (-1, True, "3", 2.5, autoresume.MAX_CHECKED_ITEMS + 1,
+                    10 ** 30):
+            with pytest.raises(ValueError, match=key):
+                autoresume.validate_payload(dict(ok, **{key: bad}))
+
+
+def test_fold_drops_the_marks_a_terminal_record_cannot_use():
+    """The marks belong to a pending chain: a fired or cancelled record
+    carries none, and a mark past the bound -- a hand-written row -- is
+    ignored rather than frozen into the chain."""
+    def sched(**marks):
+        events.append_event(
+            "autoresume", {"action": "scheduled", "plan_id": "x-1",
+                           "due": "2026-07-18T05:00:00Z", "attempt": 1,
+                           **marks}, session_id="s1")
+
+    def rec():
+        return autoresume.fold(events.read_all())["x-1"]
+
+    sched(checked_high=10 ** 30, checked_left=10 ** 30)
+    assert "checked_high" not in rec() and "checked_left" not in rec()
+    sched(checked_high=3, checked_left=2)
+    assert (rec()["checked_high"], rec()["checked_left"]) == (3, 2)
+    events.append_event(
+        "autoresume", {"action": "fired", "plan_id": "x-1", "attempt": 1,
+                       "outcome": "still_limited"}, session_id="s1")
+    assert "checked_high" not in rec() and "checked_left" not in rec()
+    sched(checked_high=3, checked_left=2)
+    events.append_event(
+        "autoresume", {"action": "cancelled", "plan_id": "x-1"},
+        session_id="s1")
+    assert "checked_high" not in rec() and "checked_left" not in rec()
 
 
 def test_a_schedule_without_a_checked_high_starts_the_count_over(tmp_path):

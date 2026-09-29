@@ -74,6 +74,14 @@ def _snapshot_interrupted_plan(project, run_id, loop_dir, cause,
     try:
         from .. import roadmap as roadmap_mod
         plan_id = plan_id or run_id
+        # A plan a human retired while the run was going -- `hive roadmap
+        # complete` or `archive` -- is closed on purpose. Re-setting and
+        # interrupting it here would reopen it, and hand the wake-up a plan
+        # to relaunch; the run's own end is recorded either way.
+        current = roadmap_mod.get(events.read_all(project), plan_id)
+        if current is not None \
+                and current["status"] in roadmap_mod.RETIRED_STATUSES:
+            return
         tasks = task_mod.load_tasks(loop_dir)
         lines = tasks.prompt.strip().splitlines()
         prompt = lines[0].lstrip("# ").strip() if lines else ""

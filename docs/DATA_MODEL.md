@@ -201,7 +201,8 @@ unvalidated ledger string into the rendered trail), `memory_consolidated`,
 recorded enrichment acts and the default-on toggle's audit trail — the
 settings sidecar `enrich.json` is the source of truth),
 `autoresume` (`{action, plan_id, due?, attempt?, cooldown_hours?, cwd?,
-model?, timer?, mode?, goal_dir?, checked_high?, outcome?, detail?}` —
+model?, timer?, mode?, goal_dir?, checked_high?, checked_left?, outcome?,
+detail?}` —
 auto-resume delivery lifecycle, `autoresume.py`: action ∈ scheduled, fired,
 cancelled; after a usage-limit interruption the roadmap marker is scheduled
 to re-enter Claude once the ~5h window reopens — mode "prompt" as a one-shot
@@ -209,8 +210,13 @@ headless session, mode "loop" by relaunching the loop engine on `goal_dir`
 (through `fabricate.run` when the plan is a fabrication's `fab_id`), whose
 re-arm carries `checked_high`, the most `fix_plan.md` items the chain has
 seen checked, so only a wake-up that checks off something new restarts the
-attempt count; these events are the delivery audit trail and the roadmap
-events remain the semantic record),
+attempt count, and `checked_left`, how many the relaunch left checked, so
+items a human un-checks while the loop sleeps lower that mark; both are
+bounded by `MAX_CHECKED_ITEMS` and dropped from fired/cancelled records; a
+`fired` row lands after the delivery returns, and a cancel, a hand-issued
+re-schedule or a retired plan meanwhile is honoured over its re-arm; these
+events are the delivery audit trail and the roadmap events remain the
+semantic record),
 `fabrication` (`{action, fab_id, goal_dir?, title?, steps?, source?, due?,
 timer?, cwd?, run_id?, reason?, iterations?}` — PRD assembly-line
 lifecycle, `fabricate.py` (blueprint P10, spec Bug 9): action ∈ compiled,
