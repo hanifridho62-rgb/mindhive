@@ -61,6 +61,15 @@ hung past two minutes, or failed, the outcome varying between runs.
 `check_segments` refuses that damage before chromadb reads the collection,
 which contains every one of them -- in a segment the copy's catalogue still
 names, since chromadb leaves a dropped collection's segment directory behind.
+It holds the segment's other files to what its header says they must hold
+(`_segment_damage`): measured on four scratch indexes before that, a
+`link_lists.bin` cut in half crashed the reading process with a segfault in
+19 of 23 reads, hung it past 150 s in 2 and failed with InternalError in 2 --
+and under `python -X faulthandler`, which neither the CLI nor the dashboard
+sets, 4 reads of 4 failed with InternalError instead: the outcome follows the
+memory layout -- and a `data_level0.bin` cut in half answered every read but
+one count, which segfaulted, without an error; the one answer compared with
+the whole index's had silently lost its two best hits.
 It is the reader's *check*, asked for the collection read and once per copy:
 chromadb loads a collection's HNSW segment only once that collection is
 counted or queried, so with `events` cut, `ledger` is read from the same copy
@@ -74,16 +83,15 @@ where chromadb raises on it -- a header of whole length but garbage bytes
 failed the count with InternalError: when the caller's *judge* claims a failure
 as the client's own, the client is never closed and never freed
 (`_immortalise`), and its copy is left for the dead-pid sweep of a later
-process. The rest is NOT contained. Measured on four scratch indexes: a
-`link_lists.bin` cut in half crashed the reading process with a segfault in
-19 of 23 reads, hung it past 150 s in 2 and failed with InternalError in 2 --
-and under `python -X faulthandler`, which neither the CLI nor the dashboard
-sets, 4 reads of 4 failed with InternalError instead: the outcome follows the
-memory layout. A `data_level0.bin` cut in half answered every read but one
-count, which segfaulted, without an error; the one answer compared with the
-whole index's had silently lost its two best hits. Nothing in this process
-can contain a crash, a hang or a wrong answer; a read in a child process could
-contain the first two, and is not done here.
+process. That is the fate of a client in this process; the default
+(`opener`, `ISOLATE_READS`) is a client in a process of its own
+(`vector_reader`), which keeps nothing: nothing here read the damage, so the
+client is closed -- its process killed if it will not go -- and its copy
+deleted after its last reader, and no client counts toward `POISON_LIMIT`.
+Damage of the right length -- garbage bytes where a segment's data or links
+were -- is what the check cannot see; read in a process of its own, a crash
+or a hang on it is a failed read here, and only a wrong answer given without
+an error is not contained.
 
 The failure is remembered against the bytes it happened on, each fingerprint
 of a collection in a memo of its own: the same collection of an unchanged
@@ -105,6 +113,8 @@ import atexit
 import logging
 import os
 import shutil
+import struct
+import sys
 import tempfile
 import threading
 import time
@@ -112,10 +122,11 @@ from contextlib import contextmanager
 from pathlib import Path
 
 __all__ = ["SnapshotError", "IndexUnreadable", "DamagedSegment", "reading",
-           "open_chroma", "check_segments", "fingerprint", "held", "dispose_all",
-           "SNAPSHOT_PREFIX", "COPY_ATTEMPTS", "COPY_RETRY_PAUSE_S",
-           "REMOVE_ATTEMPTS", "REMOVE_RETRY_PAUSE_S", "POISON_LIMIT",
-           "FAILED_RETRY_S", "HNSW_HEADER_BYTES"]
+           "opener", "open_chroma", "check_segments", "fingerprint", "held",
+           "dispose_all", "SNAPSHOT_PREFIX", "COPY_ATTEMPTS",
+           "COPY_RETRY_PAUSE_S", "REMOVE_ATTEMPTS", "REMOVE_RETRY_PAUSE_S",
+           "POISON_LIMIT", "FAILED_RETRY_S", "HNSW_HEADER",
+           "HNSW_HEADER_BYTES", "ISOLATE_READS"]
 
 _log = logging.getLogger("mindhive.vector_snapshot")
 
@@ -138,9 +149,19 @@ SNAPSHOT_DIR = None
 POISON_LIMIT = 16
 #: How long a failed read is remembered against unchanged bytes.
 FAILED_RETRY_S = 600.0
-#: Bytes in a whole HNSW `header.bin`: every segment measured under chromadb
-#: 1.5.9 has exactly this many.
-HNSW_HEADER_BYTES = 100
+#: Whether a read's chromadb client runs in a process of its own
+#: (`vector_reader`), so that a crash or a hang in chromadb is a failed read
+#: here rather than the end of this process. Off, or in a frozen build, the
+#: copy is opened in this process (`open_chroma`).
+ISOLATE_READS = True
+#: chroma-hnswlib's persisted `header.bin`, little-endian, as its
+#: `HEADER_FIELDS`: PERSISTENCE_VERSION (int); offsetLevel0, max_elements,
+#: cur_element_count, size_data_per_element, label_offset, offsetData
+#: (size_t); maxlevel (int); enterpoint_node (unsigned); maxM, maxM0, M
+#: (size_t); mult (double); ef_construction (size_t). 100 bytes: every
+#: segment measured under chromadb 1.5.9 has exactly this many.
+HNSW_HEADER = struct.Struct("<i6QiI3QdQ")
+HNSW_HEADER_BYTES = HNSW_HEADER.size
 
 _SQLITE = "chroma.sqlite3"
 _GUARD = threading.Lock()
@@ -190,7 +211,8 @@ class IndexUnreadable(RuntimeError):
 
 
 class DamagedSegment(RuntimeError):
-    """A persisted HNSW segment whose `header.bin` is shorter than a whole one.
+    """A persisted HNSW segment whose files hold less than its `header.bin`
+    says they must -- or a header cut short, or one at odds with itself.
     `collection` is the collection it belongs to -- the one read, when the
     check was asked for one; None when the copy's catalogue could not say."""
 
@@ -244,18 +266,19 @@ def fingerprint(src):
 
 
 def check_segments(copy, collection=None) -> None:
-    """Refuse a read of *collection* whose persisted HNSW segment has a
-    `header.bin` cut short, before chromadb reads it. Only a segment chromadb
-    persisted (it has `index_metadata.pickle`) is judged: an unpersisted one
-    is rebuilt from the log, and a short header there was measured harmless.
-    Only one the copy's catalogue still names: chromadb 1.5.9 leaves a
-    dropped collection's segment directory on disk and never opens it again,
-    and judged, the cut segment `hive embed --rebuild` had just dropped
-    refused every read after the rebuild. And only one of *collection*:
-    chromadb loads a collection's segment once that collection is counted or
-    queried, so a cut `events` segment is no reason to refuse `ledger`. A
-    catalogue that cannot be read names no owner, and every segment is
-    judged -- as every one is when *collection* is None."""
+    """Refuse a read of *collection* whose persisted HNSW segment cannot hold
+    what its `header.bin` says (`_segment_damage`), before chromadb reads it.
+    Only a segment chromadb persisted (it has `index_metadata.pickle`) is
+    judged: an unpersisted one is rebuilt from the log, and a short header
+    there was measured harmless. Only one the copy's catalogue still names:
+    chromadb 1.5.9 leaves a dropped collection's segment directory on disk
+    and never opens it again, and judged, the cut segment `hive embed
+    --rebuild` had just dropped refused every read after the rebuild. And
+    only one of *collection*: chromadb loads a collection's segment once
+    that collection is counted or queried, so a cut `events` segment is no
+    reason to refuse `ledger`. A catalogue that cannot be read names no
+    owner, and every segment is judged -- as every one is when *collection*
+    is None."""
     live = _live_segments(copy)
     for header in Path(copy).glob("*/header.bin"):
         seg = header.parent
@@ -269,12 +292,63 @@ def check_segments(copy, collection=None) -> None:
             owner = live[sid]
             if collection is not None and owner != collection:
                 continue
-        size = header.stat().st_size
-        if size < HNSW_HEADER_BYTES:
+        why = _segment_damage(seg)
+        if why is not None:
             of = f" of {owner!r}" if owner else ""
-            raise DamagedSegment(
-                f"HNSW segment {seg.name}{of}: header.bin is {size} bytes, a "
-                f"whole one is {HNSW_HEADER_BYTES}", collection=owner)
+            raise DamagedSegment(f"HNSW segment {seg.name}{of}: {why}",
+                                 collection=owner)
+
+
+def _segment_damage(seg):
+    """Why the persisted segment at *seg* cannot hold what its `header.bin`
+    says, or None. The header's `cur_element_count` elements -- deleted
+    ones stay counted -- of `size_data_per_element` bytes must fit in
+    `data_level0.bin` (sized for `max_elements` when never grown), one
+    float each in `length.bin`, and `link_lists.bin` must walk: per element
+    a u32 size, a multiple of `maxM * 4 + 4` and at most `maxlevel` of them,
+    then that many bytes. Measured on six scratch indexes (1300, 130, 35 and
+    2500 rows at sync thresholds 1000, 100 and 10, 200 rows deleted, widths
+    8 and 384): every whole segment passes, and each of its four files cut
+    in half, or by one byte, is refused -- but for a cut inside the room
+    `data_level0.bin` keeps past the last element, which chromadb never
+    reads. The walk costs 14 ms at 40k elements, once per copy."""
+    raw = (seg / "header.bin").read_bytes()
+    if len(raw) < HNSW_HEADER_BYTES:
+        return (f"header.bin is {len(raw)} bytes, a whole one is "
+                f"{HNSW_HEADER_BYTES}")
+    (_version, _offset0, room, cur, size, label_at, data_at, maxlevel,
+     _enter, maxm, _maxm0, _m, _mult, _ef) = HNSW_HEADER.unpack_from(raw)
+    if cur > room or size == 0 or label_at >= size or data_at >= size:
+        return (f"header.bin says {cur} of {room} elements of {size} bytes, "
+                f"data at {data_at} and label at {label_at}")
+    for name, need in (("data_level0.bin", cur * size),
+                       ("length.bin", cur * 4)):
+        try:
+            have = (seg / name).stat().st_size
+        except OSError:
+            return f"{name} is missing"
+        if have < need:
+            return f"{name} is {have} bytes, {cur} elements need {need}"
+    try:
+        links = (seg / "link_lists.bin").read_bytes()
+    except OSError:
+        return "link_lists.bin is missing"
+    per_level, levels = maxm * 4 + 4, max(maxlevel, 0)
+    at = 0
+    for i in range(cur):
+        if at + 4 > len(links):
+            return (f"link_lists.bin is {len(links)} bytes, cut inside "
+                    f"element {i} of {cur}")
+        n = struct.unpack_from("<I", links, at)[0]
+        at += 4
+        if n % per_level or n > per_level * levels:
+            return (f"link_lists.bin: element {i} claims {n} bytes of links, "
+                    f"not up to {levels} levels of {per_level}")
+        if at + n > len(links):
+            return (f"link_lists.bin is {len(links)} bytes, cut inside "
+                    f"element {i} of {cur}")
+        at += n
+    return None
 
 
 def _canonical(seg_id) -> str:
@@ -308,12 +382,22 @@ def _live_segments(copy):
         con.close()
 
 
+def opener():
+    """The opener a read hands `reading`: `vector_reader.open_isolated`, a
+    client in a process of its own, unless `ISOLATE_READS` is off or there
+    is no interpreter to start (`sys.frozen`), when it is `open_chroma`."""
+    if ISOLATE_READS and not getattr(sys, "frozen", False):
+        from .vector_reader import open_isolated
+        return open_isolated
+    return open_chroma
+
+
 def open_chroma(copy):
-    """A chromadb client on the copy at *copy*. chromadb registers a
-    client's system BEFORE starting it, so an open that fails leaves the
-    half-started system in its registry for the life of the process -- a
-    leak per failed read; it is taken out here. The segment check is the
-    reader's, per collection (`reading`'s *check*)."""
+    """A chromadb client on the copy at *copy*, in this process. chromadb
+    registers a client's system BEFORE starting it, so an open that fails
+    leaves the half-started system in its registry for the life of the
+    process -- a leak per failed read; it is taken out here. The segment
+    check is the reader's, per collection (`reading`'s *check*)."""
     import chromadb
     try:
         return chromadb.PersistentClient(path=str(copy))
@@ -490,22 +574,34 @@ def _immortalise(client) -> None:
 def _poison(snap, name, error) -> None:
     """Take *snap* out of service for good, and remember *error* against the
     bytes it was read from -- beside, never in place of, a failure of the
-    same collection on other bytes."""
+    same collection on other bytes. A client in a process of its own
+    (`isolated`) is retired instead of kept: nothing in this process read
+    the damage, so it is closed, its process killed if it will not go, and
+    its copy deleted once its last reader is done."""
+    isolated = getattr(snap.client, "isolated", False)
     with _GUARD:
-        first = not snap.poisoned
-        snap.poisoned = True
-        if _CURRENT.get(snap.key) is snap:
-            del _CURRENT[snap.key]
-        if first:
-            _POISONED.append(snap)
         _FAILED.setdefault((snap.key, name), {})[snap.fingerprint] = (
             error, time.monotonic())
-    if first:
-        _immortalise(snap.client)
+        if _CURRENT.get(snap.key) is snap:
+            del _CURRENT[snap.key]
+        if isolated:
+            first, snap.retired = not snap.retired, True
+        else:
+            first, snap.poisoned = not snap.poisoned, True
+            if first:
+                _POISONED.append(snap)
+    if not first:
+        return
+    if isolated:
         _log.warning("vector_snapshot: a read of the %r index at %s failed "
-                     "(%s); its client stays open until the process ends and "
-                     "its copy %s is left for a later sweep",
-                     name, snap.key, error, snap.root)
+                     "(%s); its reading process is closed and its copy %s "
+                     "deleted", name, snap.key, error, snap.root)
+        return
+    _immortalise(snap.client)
+    _log.warning("vector_snapshot: a read of the %r index at %s failed "
+                 "(%s); its client stays open until the process ends and "
+                 "its copy %s is left for a later sweep",
+                 name, snap.key, error, snap.root)
 
 
 def _refused(key, name, fp, since=None) -> None:

@@ -15,6 +15,7 @@ import logging
 import os
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import threading
@@ -535,6 +536,42 @@ def _fail(src, log, name="events", error=None):
     return error
 
 
+def test_a_failed_read_through_a_reader_of_its_own_frees_its_copy(tmp_path,
+                                                                    kept):
+    """With the read in a process of its own (`client.isolated`,
+    `vector_reader`), a failure the judge claims is no reason to keep the
+    client: nothing here read the damage. The client is closed -- its
+    process killed, if it will not go -- and the copy deleted once its last
+    reader is done; the memo still refuses the same bytes, and no client
+    counts toward the cap."""
+    src = _source(tmp_path)
+    log = []
+
+    def opener(path):
+        client = _FakeClient(path)
+        client.isolated = True
+        log.append(client)
+        return client
+
+    def read():
+        return vector_snapshot.reading(src, opener, judge=_claims,
+                                       name="events")
+
+    with pytest.raises(_Boom):
+        with read():
+            raise _Boom("Error loading hnsw index")
+    assert kept == [] and vector_snapshot._POISONED == []
+    assert log[0].closed and not log[0].path.exists(), \
+        "the failed reader's copy was kept"
+    with pytest.raises(vector_snapshot.IndexUnreadable):
+        with read():
+            pass
+    assert len(log) == 1, "the bytes that failed were opened again"
+    (src / "seg" / "data_level0.bin").write_bytes(b"a writer came by")
+    with read() as client:
+        assert client is log[1]
+
+
 def test_a_client_whose_read_failed_is_never_closed(tmp_path, kept):
     src = _source(tmp_path)
     log = []
@@ -960,17 +997,40 @@ def test_a_failure_the_judge_does_not_claim_leaves_the_client_in_service(
     assert log[0].closed
 
 
+def _segment(seg, cur=3, dim=2, room=None, links=None, maxm=16):
+    """A persisted HNSW segment at *seg* whose files hold what its header
+    says, in chroma-hnswlib's layout: *cur* elements of *dim* floats, with
+    `data_level0.bin` sized for *room* of them (`max_elements`), `length.bin`
+    one float each, and `link_lists.bin` one `[u32 size][bytes]` per element
+    with *links* levels of `maxM * 4 + 4` bytes -- the second element's one
+    level, unless said otherwise."""
+    maxm0 = 2 * maxm
+    data_at = maxm0 * 4 + 4
+    size = data_at + dim * 4 + 8
+    room = cur if room is None else room
+    links = [int(i == 1) for i in range(cur)] if links is None else list(links)
+    seg.mkdir(parents=True, exist_ok=True)
+    (seg / "header.bin").write_bytes(vector_snapshot.HNSW_HEADER.pack(
+        1, 0, room, cur, size, data_at + dim * 4, data_at,
+        max(links, default=0), 0, maxm, maxm0, maxm, 1.0, 100))
+    (seg / "data_level0.bin").write_bytes(b"\0" * (room * size))
+    (seg / "length.bin").write_bytes(b"\0" * (cur * 4))
+    per_level = maxm * 4 + 4
+    (seg / "link_lists.bin").write_bytes(b"".join(
+        struct.pack("<I", per_level * n) + b"\0" * (per_level * n)
+        for n in links))
+    (seg / "index_metadata.pickle").write_bytes(b"m")
+    return seg
+
+
 def test_a_persisted_hnsw_segment_with_a_short_header_is_refused(tmp_path):
     """The measured damage, caught before chromadb reads it. A short header
     in a segment that was never persisted is harmless -- chromadb rebuilds
     those from the log -- so only a segment with `index_metadata.pickle` is
     judged."""
     copy = tmp_path / "chroma"
-    whole, cut = copy / "seg-a", copy / "seg-b"
-    for seg in (whole, cut):
-        seg.mkdir(parents=True)
-    (whole / "header.bin").write_bytes(b"h" * vector_snapshot.HNSW_HEADER_BYTES)
-    (whole / "index_metadata.pickle").write_bytes(b"m")
+    whole, cut = _segment(copy / "seg-a"), copy / "seg-b"
+    cut.mkdir(parents=True)
     (cut / "header.bin").write_bytes(b"h" * 7)
     vector_snapshot.check_segments(copy)
     (cut / "index_metadata.pickle").write_bytes(b"m")
@@ -1002,11 +1062,9 @@ def test_a_segment_the_index_no_longer_names_is_not_judged(tmp_path):
     segment the copy's catalogue names is judged, and the refusal says whose
     it is."""
     copy = tmp_path / "chroma"
-    live, dropped = copy / "seg-live", copy / "seg-dropped"
-    for seg in (live, dropped):
-        seg.mkdir(parents=True)
-        (seg / "index_metadata.pickle").write_bytes(b"m")
-    (live / "header.bin").write_bytes(b"h" * vector_snapshot.HNSW_HEADER_BYTES)
+    live, dropped = _segment(copy / "seg-live"), copy / "seg-dropped"
+    dropped.mkdir(parents=True)
+    (dropped / "index_metadata.pickle").write_bytes(b"m")
     (dropped / "header.bin").write_bytes(b"h" * 7)
     _catalogue(copy, {"seg-live": "events"})
     vector_snapshot.check_segments(copy)
@@ -1036,12 +1094,7 @@ def test_the_header_check_judges_the_segments_of_the_collection_read(tmp_path):
     a collection's HNSW segment only once that collection is counted or
     queried. Asked for no collection, the check judges every one."""
     copy = tmp_path / "chroma"
-    ev, led = copy / "seg-ev", copy / "seg-led"
-    for seg in (ev, led):
-        seg.mkdir(parents=True)
-        (seg / "index_metadata.pickle").write_bytes(b"m")
-        (seg / "header.bin").write_bytes(
-            b"h" * vector_snapshot.HNSW_HEADER_BYTES)
+    ev, led = _segment(copy / "seg-ev"), _segment(copy / "seg-led")
     (ev / "header.bin").write_bytes(b"h" * 7)
     _catalogue(copy, {"seg-ev": "events", "seg-led": "ledger"})
     vector_snapshot.check_segments(copy, "ledger")
@@ -1069,6 +1122,99 @@ def test_a_segment_the_catalogue_names_in_another_form_is_judged(tmp_path):
         with pytest.raises(vector_snapshot.DamagedSegment) as err:
             vector_snapshot.check_segments(copy, "events")
         assert err.value.collection == "events", named
+
+
+def test_a_segment_whose_files_hold_what_its_header_says_is_read(tmp_path):
+    """The layout the length checks read, measured on six scratch indexes
+    (1300, 130, 35 and 2500 rows at sync thresholds 1000, 100 and 10, 200 of
+    them deleted, widths 8 and 384) and confirmed against chroma-hnswlib's
+    source: `header.bin` is 100 bytes of fields; `data_level0.bin` holds the
+    header's `cur_element_count` elements of `size_data_per_element` bytes
+    -- deleted rows still counted, room for `max_elements` when never grown
+    -- `length.bin` one float per element, and `link_lists.bin` per element
+    a u32 size, a multiple of `maxM * 4 + 4` and at most `maxlevel` of them,
+    then that many bytes. Every one of those segments passes."""
+    assert vector_snapshot.HNSW_HEADER.size == vector_snapshot.HNSW_HEADER_BYTES
+    assert vector_snapshot.HNSW_HEADER_BYTES == 100
+    copy = tmp_path / "chroma"
+    _segment(copy / "seg-a", cur=3, room=10)
+    _segment(copy / "seg-b", cur=4, links=(0, 2, 0, 1))
+    _catalogue(copy, {"seg-a": "events", "seg-b": "ledger"})
+    for read in (None, "events", "ledger"):
+        vector_snapshot.check_segments(copy, read)
+
+
+@pytest.mark.parametrize("by", ["half", "a byte"])
+@pytest.mark.parametrize("cut", ["data_level0.bin", "length.bin",
+                                 "link_lists.bin"])
+def test_a_segment_file_shorter_than_its_elements_is_refused(tmp_path, cut, by):
+    """The damage the header check could not see (DATA_MODEL.md 4.19, "Not
+    contained"): measured, a `link_lists.bin` cut in half segfaulted the
+    reading process in 19 reads of 23 and hung it in 2, and a
+    `data_level0.bin` cut in half answered without an error, its two best
+    hits gone. Each file is held to what the header says it must hold, and
+    the refusal names the file and the collection, whose rebuild is the
+    repair; a read of another collection is not refused."""
+    copy = tmp_path / "chroma"
+    seg = _segment(copy / "seg-a")
+    _catalogue(copy, {"seg-a": "events"})
+    data = (seg / cut).read_bytes()
+    (seg / cut).write_bytes(data[:len(data) // 2] if by == "half" else data[:-1])
+    with pytest.raises(vector_snapshot.DamagedSegment) as err:
+        vector_snapshot.check_segments(copy, "events")
+    assert cut in str(err.value) and "seg-a of 'events'" in str(err.value)
+    assert err.value.collection == "events"
+    vector_snapshot.check_segments(copy, "ledger")
+
+
+@pytest.mark.parametrize("gone", ["data_level0.bin", "length.bin",
+                                  "link_lists.bin"])
+def test_a_segment_file_that_is_missing_is_refused(tmp_path, gone):
+    copy = tmp_path / "chroma"
+    seg = _segment(copy / "seg-a")
+    (seg / gone).unlink()
+    with pytest.raises(vector_snapshot.DamagedSegment,
+                       match=f"{gone} is missing"):
+        vector_snapshot.check_segments(copy)
+
+
+def test_a_link_list_that_is_no_count_of_levels_is_refused(tmp_path):
+    """A `link_lists.bin` long enough whose element claims a size that is no
+    multiple of a level's bytes, or more levels than the header's `maxlevel`:
+    bytes where a size should be, which chromadb reads as one."""
+    copy = tmp_path / "chroma"
+    seg = _segment(copy / "seg-a", cur=2, links=(1, 0))
+    per_level = 16 * 4 + 4
+    for claim in (per_level + 1, per_level * 2):
+        (seg / "link_lists.bin").write_bytes(
+            struct.pack("<I", claim) + b"\0" * claim + struct.pack("<I", 0))
+        with pytest.raises(vector_snapshot.DamagedSegment,
+                           match="element 0 claims") as err:
+            vector_snapshot.check_segments(copy)
+        assert str(claim) in str(err.value)
+
+
+def test_a_header_at_odds_with_itself_is_refused(tmp_path):
+    """A header of whole length whose fields cannot be: more elements than
+    room for them, an element of no bytes, a label past the element's end,
+    or a hundred bytes of the same letter. What such a header says the
+    files must hold is not worth asking; measured, a header of garbage
+    bytes failed the count with an InternalError."""
+    copy = tmp_path / "chroma"
+    seg = _segment(copy / "seg-a")
+    fields = list(vector_snapshot.HNSW_HEADER.unpack(
+        (seg / "header.bin").read_bytes()))
+    for at, value in ((3, fields[2] + 1), (4, 0), (5, fields[4])):
+        broken = list(fields)
+        broken[at] = value
+        (seg / "header.bin").write_bytes(
+            vector_snapshot.HNSW_HEADER.pack(*broken))
+        with pytest.raises(vector_snapshot.DamagedSegment,
+                           match="header.bin says"):
+            vector_snapshot.check_segments(copy)
+    (seg / "header.bin").write_bytes(b"h" * vector_snapshot.HNSW_HEADER_BYTES)
+    with pytest.raises(vector_snapshot.DamagedSegment, match="header.bin says"):
+        vector_snapshot.check_segments(copy)
 
 
 def test_a_client_kept_after_a_failure_outlives_every_other_reference():
@@ -1229,6 +1375,20 @@ def test_the_watchers_id_probe_is_a_read_like_any_other(real_index, tmp_path):
     assert _hashes(real_index) == before
 
 
+def test_reads_open_their_copy_in_a_process_of_their_own(monkeypatch):
+    """`opener()` is what `vectors._reading` hands `reading`: the isolated
+    reader, unless reads are told to stay in-process or there is no
+    interpreter to start (a frozen build)."""
+    from mindhive import vector_reader
+    assert vector_snapshot.ISOLATE_READS is True
+    assert vector_snapshot.opener() is vector_reader.open_isolated
+    monkeypatch.setattr(vector_snapshot, "ISOLATE_READS", False)
+    assert vector_snapshot.opener() is vector_snapshot.open_chroma
+    monkeypatch.setattr(vector_snapshot, "ISOLATE_READS", True)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    assert vector_snapshot.opener() is vector_snapshot.open_chroma
+
+
 def test_a_copy_chromadb_cannot_open_is_not_left_registered(tmp_path):
     """chromadb registers a client's system BEFORE starting it, so an open
     that fails leaves the half-started system in its registry for the life of
@@ -1257,15 +1417,17 @@ def test_a_copy_chromadb_cannot_open_is_not_left_registered(tmp_path):
 # The failure these defences exist for kills the interpreter, so it is driven
 # in a child: `build` persists an events segment (by default 1300 rows past
 # chroma's sync_threshold of 1000, width 8 to keep it quick) and cuts its
-# `header.bin` to 7 bytes, beside a healthy three-row `ledger`; the read modes
-# then count three times, the source changing once between the second and
-# third, and `siblings` queries `ledger` after each count.
+# `header.bin` to 7 bytes -- or, told `data`, `links` or `length`, that file
+# in half; told `none`, nothing -- beside a healthy three-row `ledger`; the
+# read modes then count three times, the source changing once between the
+# second and third, and `siblings` queries `ledger` after each count.
 
 _CHILD = r'''
 import sys
 from pathlib import Path
 mode, snaps = sys.argv[1], Path(sys.argv[2])
 total, sync = (int(a) for a in (sys.argv[3:5] or (1300, 0)))
+damage = sys.argv[5] if len(sys.argv) > 5 else "header"
 from mindhive import events, paths, vector_snapshot, vectors
 vector_snapshot.SNAPSHOT_DIR = snaps
 chroma = paths.project_dir() / "chroma"
@@ -1294,10 +1456,18 @@ if mode == "build":
     from chromadb.api.shared_system_client import SharedSystemClient as S
     S._identifier_to_refcount.pop(str(chroma), None)
     S._identifier_to_system.pop(str(chroma)).stop()
+    cut = {"header": "header.bin", "data": "data_level0.bin",
+           "links": "link_lists.bin", "length": "length.bin"}.get(damage)
     for header in chroma.glob("*/header.bin"):
-        if (header.parent / "index_metadata.pickle").exists():
-            header.write_bytes(header.read_bytes()[:7])
-            print("damaged", header.parent.name)
+        if not (header.parent / "index_metadata.pickle").exists():
+            continue
+        if cut is None:
+            print("healthy", header.parent.name)
+            continue
+        f = header.parent / cut
+        data = f.read_bytes()
+        f.write_bytes(data[:7] if damage == "header" else data[:len(data) // 2])
+        print("damaged", header.parent.name)
     sys.exit(0)
 if mode == "rebuild":     # the events half of `hive embed --rebuild`
     vectors._encoder = lambda: (lambda texts: [
@@ -1309,6 +1479,8 @@ if mode == "rebuild":     # the events half of `hive embed --rebuild`
     sys.exit(0)
 if mode == "unchecked":
     vector_snapshot.check_segments = lambda copy, collection=None: None
+    from mindhive import vector_reader
+    vector_reader.READ_TIMEOUT_S = 10.0     # a hung reader costs 10 s here
 vectors._encoder = lambda: (lambda texts: [[0.5] * 8 for t in texts])
 for attempt in range(3):
     try:
@@ -1319,6 +1491,7 @@ for attempt in range(3):
         print("ledger", len(vectors.semantic_recall("x", limit=5)), flush=True)
     if attempt == 1:
         (chroma / "touched.txt").write_text("a writer came by")
+vector_snapshot._retry_orphans()
 print("copies", len(list(snaps.glob(vector_snapshot.SNAPSHOT_PREFIX + "*"))),
       flush=True)
 '''
@@ -1343,12 +1516,13 @@ def test_a_damaged_hnsw_segment_fails_every_read_of_it_and_never_the_process(
     """Measured without these defences: the count fails, and closing that
     client at the next copy corrupts the heap (0xC0000374). `unchecked` is
     the damage getting past the header check: every read still fails as a
-    count, the client it failed on is kept rather than torn down, and the
-    unchanged index is not copied again. `siblings` is the check itself: a
-    read of `events` is refused before chromadb reads its segment, `ledger`
-    is read from the same copy, the copy the source moved past is closed
-    and deleted, and the copies the killed-off readers kept are swept by the
-    next process. The one left is the current copy, closed at exit."""
+    count -- in a reading process of its own, whose heap the close may
+    corrupt at no cost to anyone -- the reader it failed on is closed and
+    its copy deleted, and the unchanged index is not copied again.
+    `siblings` is the check itself: a read of `events` is refused before
+    chromadb reads its segment, `ledger` is read from the same copy, and
+    the copy the source moved past is closed and deleted. The one left is
+    the current copy, closed at exit."""
     pytest.importorskip("chromadb")
     # Without the model the count answers 0 before it reads anything, which
     # would read here as the damage being counted as an empty index.
@@ -1357,11 +1531,28 @@ def test_a_damaged_hnsw_segment_fails_every_read_of_it_and_never_the_process(
     assert "damaged" in _child("build", snaps, tmp_path)
     out = _child("unchecked", snaps, tmp_path)
     assert out.count("failed count") == 3, out
-    assert "copies 2" in out, out
+    assert "copies 0" in out, out
     out = _child("siblings", snaps, tmp_path)
     assert out.count("failed open") == 3, out
     assert out.count("ledger 3") == 3, out
     assert "copies 1" in out, out
+
+
+def test_a_crash_or_hang_in_the_reading_process_is_a_failed_read_here(tmp_path):
+    """The containment the length checks do not give -- damage they cannot
+    see -- driven with the check off on the damage measured to segfault the
+    reading process in 19 reads of 23 and hang it in 2. The read runs in a
+    process of its own: each count fails here (an `InternalError` relayed,
+    `ReaderDied` on a segfault, `ReaderHung` after the timeout), the failed
+    reader is closed and its copy deleted, and this process lives to say
+    so."""
+    pytest.importorskip("chromadb")
+    pytest.importorskip("sentence_transformers")
+    snaps = tmp_path / "child-snaps"
+    assert "damaged" in _child("build", snaps, tmp_path, 1300, 0, "links")
+    out = _child("unchecked", snaps, tmp_path)
+    assert out.count("failed count") == 3, out
+    assert "copies 0" in out, out
 
 
 @pytest.mark.parametrize("total,sync", [(130, 100), (35, 10)],
@@ -1384,6 +1575,38 @@ def test_the_damage_that_crashed_or_hung_the_count_never_reaches_chromadb(
     assert out.count("failed open") == 3, out
     assert out.count("ledger 3") == 3, out
     assert "copies 1" in out, out
+
+
+@pytest.mark.parametrize("cut", ["data", "length", "links"])
+def test_a_cut_segment_file_is_refused_before_chromadb_reads_it(tmp_path, cut):
+    """The damage the header check could not see, on the segment chromadb
+    persisted. Measured without these checks on four scratch indexes: a
+    `link_lists.bin` cut in half segfaulted the reading process in 19 reads
+    of 23, hung it past 150 s in 2 and failed 2 with InternalError; a
+    `data_level0.bin` cut in half answered every read but one segfaulted
+    count without an error, one answer missing its two best hits. Each is
+    refused as the cut header is: the read of `events` fails as an `open`
+    naming the collection, `ledger` is read from the same copy, and the
+    process lives to say so."""
+    pytest.importorskip("chromadb")
+    pytest.importorskip("sentence_transformers")
+    snaps = tmp_path / "child-snaps"
+    assert "damaged" in _child("build", snaps, tmp_path, 1300, 0, cut)
+    out = _child("siblings", snaps, tmp_path)
+    assert out.count("failed open") == 3, out
+    assert out.count("ledger 3") == 3, out
+    assert "copies 1" in out, out
+
+
+def test_a_segment_chromadb_persisted_whole_passes_the_length_checks(tmp_path):
+    """The checks read chroma-hnswlib's real layout: a segment chromadb 1.5.9
+    persisted, untouched, is counted three times over."""
+    pytest.importorskip("chromadb")
+    pytest.importorskip("sentence_transformers")
+    snaps = tmp_path / "child-snaps"
+    assert "healthy" in _child("build", snaps, tmp_path, 1300, 0, "none")
+    out = _child("checked", snaps, tmp_path)
+    assert out.count("count 1300") == 3, out
 
 
 def test_a_rebuild_repairs_a_cut_header_it_drops(tmp_path):

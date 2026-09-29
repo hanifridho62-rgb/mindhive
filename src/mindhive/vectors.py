@@ -155,14 +155,17 @@ def _reading(project, name=None):
     no index; used as `with _reading(project, name) as client:`. The one place
     a read path meets chromadb, and so the seam the tests replace. Without
     chromadb it is the extras refusal, before anything is read. The copy's
-    segments are checked for collection *name* before it is read."""
+    segments are checked for collection *name* before it is read, and the
+    copy is opened in a reading process of its own
+    (`vector_snapshot.opener`), so a crash or a hang in chromadb is a
+    failed read here, never the end of this process."""
     try:
         import chromadb  # noqa: F401
     except ImportError as e:
         raise RuntimeError(_EXTRAS) from e
     from . import vector_snapshot
     return vector_snapshot.reading(
-        paths.project_dir(project) / "chroma", vector_snapshot.open_chroma,
+        paths.project_dir(project) / "chroma", vector_snapshot.opener(),
         judge=_judge, name=name, check=vector_snapshot.check_segments)
 
 

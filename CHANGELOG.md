@@ -230,6 +230,30 @@ history and grouped by what each release window introduced. They summarise;
     `error:` line for a write that failed and exits 1
     (`vector_errors.embed_failure`), and `LocalVectorIndex` catches a panic
     in the encoder like any failure.
+  - A cut segment file is contained. `check_segments` checks every
+    persisted segment's files against its own `header.bin` —
+    chroma-hnswlib's 100-byte header (`HNSW_HEADER`): `data_level0.bin` and
+    `length.bin` shorter than its element count needs, `link_lists.bin` cut
+    inside an element or claiming more levels than it allows, a header at
+    odds with itself — and refuses the read as `DamagedSegment` naming the
+    collection, so the repair is the rebuild first. Measured, a
+    `link_lists.bin` cut in half had segfaulted the reading process in 19
+    reads of 23 and hung it in 2, and a `data_level0.bin` cut in half had
+    answered without an error, missing its two best hits. And the chromadb
+    calls of a read run in a child process (`vector_reader`,
+    `vector_snapshot.ISOLATE_READS`): a segfault or a hang there is
+    `ReaderDied` / `ReaderHung` here — a failed count or query with the same
+    repair — and the child is closed and its copy deleted, where an
+    in-process failure had to keep its client for good. A read through the
+    child costs what an in-process one does (1.2 ms median either way on a
+    1,300-row scratch index; `hive bench recall-semantic` on a copy of the
+    real index: warm query median 9.8 ms in-process, 10.9 ms through the
+    child, two isolated runs 10.9 and 14.0 ms); starting the child costs
+    1.2–1.9 s, once per copy, inside the model load the bench times apart
+    (8.4–10.5 s). It ends with the
+    parent, waiting on the parent's process handle — never by reading its
+    stdin: a read left pending on that pipe stalled `import numpy` in the
+    child for good.
 - README said the dashboard's auto-harvest polls every 180 seconds by default
   (`MINDHIVE_AUTOHARVEST_SECS`); the code's default is 3 seconds, floor 1
   (blueprint P8, found while building the environment-variable registry).

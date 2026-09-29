@@ -2556,9 +2556,34 @@ reference, interpreter exit — corrupts the heap (exit `0xC0000374`). So the
 defence is layered, from cheapest to last resort:
 
 1. `vector_snapshot.check_segments` refuses a read of a collection whose
-   persisted segment (one with `index_metadata.pickle`) has a `header.bin`
-   shorter than `HNSW_HEADER_BYTES`, before chromadb reads it; that surfaces
-   as stage `open`. It is the reader's check (`reading(check=…)`), asked for
+   persisted segment (one with `index_metadata.pickle`) is shorter than its
+   own header says it must be, before chromadb reads it; that surfaces as
+   stage `open`. `header.bin` is chroma-hnswlib's 100-byte `saveIndex`
+   header (`HNSW_HEADER`, `struct` `<i6QiI3QdQ`: the persistence version;
+   `offsetLevel0`, `max_elements`, `cur_element_count`,
+   `size_data_per_element`, `label_offset`, `offsetData`; `maxlevel`,
+   `enterpoint_node`; `maxM`, `maxM0`, `M`; `mult`, `ef_construction`), and
+   the other files' lengths follow from it: `data_level0.bin` holds
+   `cur_element_count` elements of `size_data_per_element` bytes (`maxM0*4+4`
+   of level-0 links, the vector, the 8-byte label), `length.bin` four bytes
+   per element, and `link_lists.bin` one `[u32 size][links]` record per
+   element whose size is a multiple of `maxM*4+4` and at most `maxlevel` of
+   them. Deleted rows stay counted, and a segment sized for `max_elements`
+   and never grown is longer than it needs to be; both pass. Refused, each
+   named with the bytes found and the bytes needed: a `header.bin` under 100
+   bytes or at odds with itself (more elements than room, a size of 0, an
+   offset past the element); `data_level0.bin` or `length.bin` missing or
+   shorter than the elements need; `link_lists.bin` missing, cut inside an
+   element, or with an element claiming more levels than the header allows.
+   Walking the link lists of 40k elements costs 13.7 ms, once per copy.
+   Measured in a child process on a 1,300-row `events` segment persisted
+   whole (`tests/test_vector_snapshot.py`): `data_level0.bin`, `length.bin`
+   and `link_lists.bin` each cut in half are refused at the open naming
+   `events`, three reads of three, `ledger` answering beside them; the whole
+   segment passes and counts 1,300. Before the length checks the cut data
+   file answered without an error, missing its best hits, and the cut link
+   file crashed or hung the process (*What the check could not see*, below).
+   It is the reader's check (`reading(check=…)`), asked for
    the collection read, not the open's: chromadb loads a collection's HNSW
    segment only once that collection is counted or queried, so with a cut
    `events` segment `ledger` is read from the same copy, whose client, never
@@ -2588,9 +2613,11 @@ defence is layered, from cheapest to last resort:
    other than rows the client answered without (`MissingDocument`,
    `UnansweredQuery`: the client answered, so it did not fail, and held for
    good it would count a readable client toward the cap) —
-   poisons that copy: its client is never closed and never freed
-   (`_immortalise`), and the copy is left for a later process's dead-pid
-   sweep. A panic counts: before `as_failure` wrapped it, it reached no judge
+   poisons that copy. Read in-process, its client is never closed and never
+   freed (`_immortalise`), and the copy is left for a later process's
+   dead-pid sweep; read through the reading process (below), nothing in this
+   process touched the damage, so the client is closed — the child killed if
+   it will not go — and the copy deleted. A panic counts: before `as_failure` wrapped it, it reached no judge
    and its client stayed in service. Claimed, a refused argument poisoned a
    HEALTHY index: its client kept for good and every later read of it refused.
 3. The failure is remembered per (index, collection) against the bytes it
@@ -2619,7 +2646,9 @@ defence is layered, from cheapest to last resort:
    serves the reader that took it and is closed after it — installed, it took
    the newer copy's place and closed it, and the next read of the newer bytes
    copied the index again.
-4. Every poisoned client is held until the process ends, so once
+4. Every poisoned in-process client is held until the process ends — a
+   failure through the reading process holds nothing, so the cap is a frozen
+   build's — so once
    `POISON_LIMIT` (16) are held, a source is not read again until the process
    restarts while it has a standing failure — one of any of its collections
    that no read of that collection has got past since — and the message says
@@ -2655,25 +2684,85 @@ and the process to live — 5 runs of 5 under the per-collection check. Damage t
 raises on it: a `header.bin` of whole length but garbage bytes failed the count
 with `InternalError`, which the judge claims, so the client is poisoned.
 
-**Not contained:** the rest of what the check cannot see. Measured on four
-scratch indexes through the read path, chromadb 1.5.9: a `link_lists.bin` cut
-in half crashed the reading process with a segfault in 19 of 23 reads, hung it
-past 150 s in 2, and failed with a judged `InternalError` in 2 — and under
-`python -X faulthandler`, which neither the CLI nor the dashboard sets, 4 reads
-of 4 failed with `InternalError` instead: the outcome follows the memory
-layout. A segfault reaches no judge and no `{project, error}` row: in the
-dashboard, one semantic search, HIVE MIND search or semantic graph over that
-namespace takes the server down. A `data_level0.bin` cut in half answered
+**What the check could not see.** Measured on four scratch indexes through
+the read path before the length checks, chromadb 1.5.9: a `link_lists.bin`
+cut in half crashed the reading process with a segfault in 19 of 23 reads,
+hung it past 150 s in 2, and failed with a judged `InternalError` in 2 — and
+under `python -X faulthandler`, which neither the CLI nor the dashboard sets,
+4 reads of 4 failed with `InternalError` instead: the outcome follows the
+memory layout. A segfault reaches no judge and no `{project, error}` row: in
+the dashboard, one semantic search, HIVE MIND search or semantic graph over
+that namespace took the server down. A `data_level0.bin` cut in half answered
 every read but one count, which segfaulted, without an error; the one answer
 compared with the whole index's had silently lost its two best hits. Known,
 either cut is repaired — `hive embed --rebuild` left both cut `events`
 indexes answering, measured with the rest above — but the read that would
-make it known is one the process does not survive, or, for the cut data file,
-one that reports nothing. No in-process guard survives a crash or a hang, or
-can tell such an answer from a right one: the unanswered-query guard catches a
-query that answers nothing, never one that answers without its best hits. A read in a child process would contain the first two, and a check
-of the other segment files' lengths might refuse such cuts before chromadb
-opens them; neither is done here.
+make it known was one the process did not survive, or, for the cut data file,
+one that reported nothing. Two things contain that now. The length checks of
+item 1 refuse both cuts before chromadb opens them, as stage `open` with the
+rebuild-first repair. And the read runs in a process of its own (next), so
+damage of the right lengths that chromadb crashes or hangs on is `ReaderDied`
+or `ReaderHung` in the caller — a failed `count` or `query`, judged as the
+client's own, with the rebuild-first repair — and the caller lives:
+`tests/test_vector_snapshot.py` cuts `link_lists.bin` with the length checks
+stubbed out and requires each of three reads to fail at the count and the
+reading process to live, no copy left behind; through the reading process the
+same cut, 9 trials, failed 6 with `InternalError` relayed, 1 with a segfault
+as `ReaderDied` and 2 with hangs as `ReaderHung` after the timeout. Not
+contained: a wrong answer given without an error — bytes of the right length
+that chromadb answers from — which no guard can tell from a right one; the
+unanswered-query guard catches a query that answers nothing, never one that
+answers without its best hits.
+
+**The read runs in a process of its own** (`vector_reader`;
+`vector_snapshot.ISOLATE_READS`). `vector_snapshot.opener` hands `reading`
+`open_isolated` in place of `open_chroma`: the copy is opened by a child
+interpreter — a plain `python -c` subprocess, never `multiprocessing`, whose
+spawn re-runs the parent's `__main__` — that reads the address of a named
+pipe (`AF_PIPE` on Windows, `AF_UNIX` elsewhere), a 16-byte key and the
+parent's pid from its stdin (not the command line, which any process can
+list), connects back through `multiprocessing.connection`'s HMAC challenge,
+takes the parent's `sys.path` so it imports the same `mindhive`, and answers
+the calls a read path makes: `list_collections`, `get_collection`, and a
+collection's `count`, `query` and `get`. Each call is waited for
+`READ_TIMEOUT_S` (30 s: a query over 40k rows answers in milliseconds, and
+the first read of a copy, which replays the queued rows, in well under a
+second), the open, `import chromadb` included, for `START_TIMEOUT_S` (60 s).
+A child that dies is `ReaderDied`, naming the call, the exit status and the
+child's last stderr lines; one that does not answer in time is killed and is
+`ReaderHung`; either refuses every later call at once. What the child raises
+is relayed by module, name and message and rebuilt as that class when it is
+chromadb's, the interpreter's own, `sqlite3`'s or this package's, else as a
+stand-in of the same name and module — a pyo3 `PanicException` included,
+which `vector_errors` knows by name — so the judge and the remedy read a
+relayed failure as they read an in-process one. A failed read through the
+child keeps nothing: the client is closed, the child killed if it will not
+go, and the copy deleted (item 2), and the memo of item 3 still refuses the
+same bytes. The child ends with `os._exit`: tearing down a client whose read
+failed corrupts the heap (exit `0xC0000374`), and in the child that costs
+nobody anything. A thread of the child waits for the parent to go — on the
+parent's process handle on Windows, on the end of its stdin elsewhere — and
+ends the child, so a parent killed without its `atexit` (`taskkill`, a
+crashed dashboard) leaves no reader behind, even one busy in a call that
+hangs (`tests/test_vector_reader.py`: a child sleeping 60 s in a call is
+gone within 15 of its parent's death). It does not wait by reading its
+stdin: measured, with a read pending on that pipe from another thread — even
+a bare `ReadFile` — `import numpy` in the child never returned, and took
+0.1 s with the thread waiting on an event or on the parent's handle instead.
+Cost, measured on a 1,300-row scratch index: starting a child takes 1.2–1.9 s,
+0.9 s of it `import chromadb`, once per copy, since `vector_snapshot` keeps
+the copy and its client while the index is unchanged; a read through it then
+costs about what one in-process does (1.2 ms median against 1.2 ms; the first
+read of a copy 22 ms against 63 ms), and a close 0.2 s. Through `hive bench
+recall-semantic --reps 7` on a copy of the real index (9.76 MB, 654 indexed
+events, three queries): the warm query median was 9.8 ms in-process and
+10.9 ms through the child — two isolated runs gave 10.9 and 14.0 ms, so the
+difference is inside the run-to-run spread — the cold first query 159 ms
+either way (the encoder's warm-up), and the semantic open, which the bench
+times apart (deps import, copy, model load, index open, the child's start
+inside it), 8.6 and 8.4 s isolated against 10.5 s in-process, that run first
+with its disk cache cold: the model load hides the child's start. A frozen
+build (`sys.frozen`) has no interpreter to start, and reads in-process there.
 
 **Not done here:** the writer side still leaves an index below
 `sync_threshold` unpersisted, so a copy's first open replays the queue.

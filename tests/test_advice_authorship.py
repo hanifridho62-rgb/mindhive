@@ -649,6 +649,10 @@ TOOL_SPAWNERS = {
     "mindnet/controller.py", "mindnet/worktree.py",
     "orchestrator/environment.py", "orchestrator/metrics.py", "paths.py",
     "plugin_cache.py", "replenish.py", "repo.py",
+    # the chromadb read worker (DATA_MODEL.md §4.19): `sys.executable -c` running
+    # this package's own bootstrap, fed the parent's sys.path over a pipe -- no
+    # session, no model, no agent; a segfault in chromadb ends it, not the caller.
+    "vector_reader.py",
 }
 
 
@@ -1489,7 +1493,15 @@ SPAWN_SITES = {
     # plugin-install flow -- no session, no model -- so it must NOT scrub.
     "plugin_cache.py": (1, 0),
     "replenish.py": (1, 0), "repo.py": (1, 0),
-    "research.py": (5, 1), "rotation/supervisor.py": (1, 0), "verify.py": (1, 1),
+    "research.py": (5, 1), "rotation/supervisor.py": (1, 0),
+    # one site, no agent: `RemoteClient` starts the chromadb read worker
+    # (`sys.executable -c <bootstrap>`, DATA_MODEL.md §4.19) so a segfault or a
+    # hang in chromadb becomes a `SemanticQueryError` instead of taking the
+    # dashboard down. It runs this package's own code -- no session, no model --
+    # so it must NOT scrub, and a scrub appearing here would mean the reader had
+    # started launching agents.
+    "vector_reader.py": (1, 0),
+    "verify.py": (1, 1),
     # three sites, one agent: `Manager.send` scrubs; `cli_auth_status` and
     # `profile_login` run the CLI's own `auth` flow for the operator -- no
     # session, no agent -- and keep the environment (review round 2b, refuted).

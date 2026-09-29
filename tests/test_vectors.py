@@ -1149,6 +1149,7 @@ def test_an_interrupt_leaves_the_real_snapshot_holding_no_client(
     chroma.mkdir(parents=True)
     (chroma / "chroma.sqlite3").write_bytes(b"not a database")
     stop, opened = KeyboardInterrupt(), []
+    monkeypatch.setattr(vector_snapshot, "ISOLATE_READS", False)
     monkeypatch.setattr(vector_snapshot, "open_chroma", lambda copy: (
         opened.append(_PanickyClient(stop)) or opened[-1]))
     monkeypatch.setattr(vectors, "_require_deps", lambda: None)

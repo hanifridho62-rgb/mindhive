@@ -526,11 +526,17 @@ first, which drops the collection without reading it, and the delete of the
 open the files — a rebuild needs them open too, and fails on them — or the
 damage is the watcher's collection, which a rebuild never writes, it is the
 delete alone: delete the directory and run `hive embed --project <ns>`; the
-watcher's collection refills only from rows appended afterwards. A client a
-read failed on is never closed (closing one corrupted the heap), so once 16
-are held, an index with a failure no read has got past is not read again
-until the process restarts, and the message names the restart after the
-repair, before any delete. A `hive embed` that fails writing prints one
+watcher's collection refills only from rows appended afterwards. The chromadb
+calls of a read run in a child process of its own, so a crash or a hang in
+chromadb's native core on a damaged index — measured, a cut `link_lists.bin`
+segfaulted 19 reads of 23 in-process — is exit 1 for the CLI and a 500 for
+the dashboard, never the death of either; the child is closed, its copy
+deleted, and the same bytes are refused without a new copy for ten minutes.
+Read in-process (a frozen build), a client a read failed on is never closed
+(closing one corrupted the heap), so once 16 are held, an index with a
+failure no read has got past is not read again until the process restarts,
+and the message names the restart after the repair, before any delete. A
+`hive embed` that fails writing prints one
 `error:` line — what it wrote before the failure, and the repair — and exits
 1. A quarantined namespace — an
 `unsafe-<hash>` directory, whose name `--project` refuses — is repaired without
@@ -539,9 +545,12 @@ repair, before any delete. A `hive embed` that fails writing prints one
 the query — a bad `n_results`, an id named twice — is reported as such, with
 no repair: the index is not at fault. A panic in chromadb's Rust core is a
 failed read like any other. A semantic read never writes the index: it
-queries a private copy (docs/DATA_MODEL.md §4.19). Not contained: a cut
-`link_lists.bin` mostly crashes the reading process, and a cut
-`data_level0.bin` answers without an error but can miss the best hits.
+queries a private copy (docs/DATA_MODEL.md §4.19). A persisted segment whose
+files are shorter than its header says — a cut `link_lists.bin`, which
+crashed or hung the process, or a cut `data_level0.bin`, which answered
+without an error and could miss the best hits — is refused before chromadb
+opens it, with the rebuild first. Not contained: a wrong answer given
+without an error.
 
 ## Usage-cap fallback
 When the Opus window is nearly spent, run `hive export` and paste handoff.md into
