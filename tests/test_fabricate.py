@@ -778,6 +778,61 @@ def test_a_checklist_read_that_raises_anything_is_not_progress(tmp_path,
     assert "checked_high" not in ar          # nothing readable to measure from
 
 
+def test_a_checklist_that_vanishes_during_the_relaunch_is_not_progress(
+        tmp_path):
+    """A goal dir whose fix_plan.md is gone when the relaunch returns -- the
+    agent cleaned the tree, moved the file -- reads as unreadable, not as a
+    checklist with nothing left open. Read as empty, the falling measure
+    credited it with clearing every required item at once: the attempt count
+    reset, and the open mark froze at zero for the rest of the chain."""
+    rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
+    fix_plan = Path(rec["goal_dir"]) / "fix_plan.md"
+    fix_plan.write_text("- [x] a\n- [ ] b\n- [ ] c\n", encoding="utf-8")
+    roadmap.record("interrupt", rec["fab_id"], cause="api_cap")
+    autoresume.schedule(rec["fab_id"], mode="loop", goal_dir=rec["goal_dir"],
+                        register=_no_timer, now=T0_EPOCH, attempt=2,
+                        checked_high=1, checked_left=1, open_low=2,
+                        open_left=2)
+
+    def loop_runner(plan_id, goal_dir, project):
+        fix_plan.unlink()
+        return "still_limited", "loop api_cap"
+
+    autoresume.fire(rec["fab_id"], loop_runner=loop_runner,
+                    register=_no_timer, unregister=lambda p: None,
+                    runner=_no_prompt)
+    ar = autoresume.fold(events.read_all())[rec["fab_id"]]
+    assert ar["attempt"] == 3                           # spent, not reset
+    assert [ar[k] for k in autoresume.MARKS] == [1, 1, 2, 2]
+
+
+def test_an_unreadable_checklist_after_the_relaunch_keeps_the_last_reading(
+        tmp_path):
+    """After a relaunch whose checklist cannot be read, the re-arm carries
+    the marks as they were and, as what the relaunch left, the last counts
+    it could read -- the ones from before the relaunch. Left absent, the next
+    wake-up could not tell a human's un-check from the agent's own, and the
+    drop edge D closed came back for one cycle."""
+    rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
+    fix_plan = Path(rec["goal_dir"]) / "fix_plan.md"
+    fix_plan.write_text("- [x] a\n- [x] b\n- [ ] c\n", encoding="utf-8")
+    roadmap.record("interrupt", rec["fab_id"], cause="api_cap")
+    autoresume.schedule(rec["fab_id"], mode="loop", goal_dir=rec["goal_dir"],
+                        register=_no_timer, now=T0_EPOCH, checked_high=2,
+                        checked_left=2, open_low=1, open_left=1)
+
+    def loop_runner(plan_id, goal_dir, project):
+        fix_plan.unlink()
+        fix_plan.mkdir()                    # reading it now raises OSError
+        return "still_limited", "loop api_cap"
+
+    autoresume.fire(rec["fab_id"], loop_runner=loop_runner,
+                    register=_no_timer, unregister=lambda p: None,
+                    runner=_no_prompt)
+    ar = autoresume.fold(events.read_all())[rec["fab_id"]]
+    assert [ar[k] for k in autoresume.MARKS] == [2, 2, 1, 1]
+
+
 def test_a_checklist_past_the_mark_bound_still_re_arms(tmp_path, monkeypatch):
     """The count a wake-up carries is capped at the bound the contract
     enforces, so a checklist longer than any real one still re-arms instead
@@ -906,13 +961,15 @@ def test_a_schedule_issued_by_hand_while_the_relaunch_runs_is_honoured(
     meanwhile -- moving the next wake-up to a quiet hour -- found the delivery
     still scheduled and replaced it; the wake-up's own re-arm then replaced
     THAT with one cooldown from its return. The hand-issued schedule wins: the
-    wake-up re-arms as it says, its count started over, and a re-schedule
-    keeps the loop mode and goal dir it does not name."""
+    wake-up re-arms as it says, its marks and attempt started over, and a
+    re-schedule keeps the loop mode and goal dir it does not name. One thing
+    it does not reset: the chain's wake-up count, or the absolute cap would
+    be a re-schedule away from meaningless."""
     rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
     roadmap.record("interrupt", rec["fab_id"], cause="api_cap")
     autoresume.schedule(rec["fab_id"], mode="loop", goal_dir=rec["goal_dir"],
                         register=_no_timer, now=T0_EPOCH, attempt=3,
-                        checked_high=2)
+                        checked_high=2, wake_ups=7)
     quiet = autoresume._iso(time.time() + 30 * 3600)
     armed, gone = [], []
 
@@ -931,7 +988,8 @@ def test_a_schedule_issued_by_hand_while_the_relaunch_runs_is_honoured(
     assert (ar["status"], ar["due"], ar["attempt"], ar["cwd"]) == \
         ("scheduled", quiet, 1, "C:/elsewhere")
     assert (ar["mode"], ar["goal_dir"]) == ("loop", str(rec["goal_dir"]))
-    assert "checked_high" not in ar             # theirs starts the count over
+    assert "checked_high" not in ar             # theirs starts the marks over
+    assert ar["wake_ups"] == 8                  # seven before, this one too
     assert armed == [rec["fab_id"]] and gone == []    # their timer stands
 
 

@@ -521,8 +521,10 @@ def schedule(plan_id, *, project=None, evs=None, cooldown_hours=None, at=None,
                "model": str(model or "")[:MAX_MODEL_CHARS], "timer": timer,
                "mode": mode,
                "goal_dir": str(goal_dir or "")[:MAX_PATH_CHARS]}
-    for key, count in zip(CHAIN_KEYS, (checked_high, checked_left, open_low,
-                                       open_left, wake_ups)):
+    counters = {"checked_high": checked_high, "checked_left": checked_left,
+                "open_low": open_low, "open_left": open_left,
+                "wake_ups": wake_ups}
+    for key, count in counters.items():
         if count is not None:
             payload[key] = count
     validate_payload(payload)
@@ -597,14 +599,17 @@ def _checklist_counts(goal_dir):
     got, not the roadmap's done count: a session that adopts the interrupted
     plan while the loop sleeps re-writes its steps with its own todos, and
     the roadmap keeps at most roadmap.MAX_STEPS of them. Total: whatever the
-    read or the parse raises, the checklist counts as unreadable; each count
-    is capped at the bound the contract puts on a carried counter."""
+    read or the parse raises, the checklist counts as unreadable, and so does
+    a checklist that is not there -- read as empty, a file the relaunch
+    removed would count as every required item cleared. Each count is capped
+    at the bound the contract puts on a carried counter."""
     from .loop import task as task_mod
     try:
         plan = Path(goal_dir) / "fix_plan.md"
-        text = plan.read_text(encoding="utf-8", errors="replace") \
-            if plan.exists() else ""
-        items = task_mod.plan_items(text)
+        if not plan.exists():
+            return None
+        items = task_mod.plan_items(
+            plan.read_text(encoding="utf-8", errors="replace"))
         return (min(len(items["done"]), MAX_CHAIN_COUNT),
                 min(len(items["planned"]), MAX_CHAIN_COUNT))
     except Exception:                                       # noqa: BLE001
@@ -622,7 +627,9 @@ def _measure(mark, left, before, after, rising) -> tuple:
     stands short of where the last relaunch left it (`left`) -- items
     un-checked, items added -- is a human reopening work, and re-doing that is
     progress, so the mark gives back as much. A count that cannot be read is
-    no progress and sets no mark. Returns (progressed, mark, left)."""
+    no progress and moves no mark; `left` then stays the last count that
+    could be read, so the next wake-up can still tell what moved while the
+    loop slept. Returns (progressed, mark, left)."""
     if None not in (mark, left, before):
         if rising and before < left:
             mark -= left - before
@@ -632,16 +639,24 @@ def _measure(mark, left, before, after, rising) -> tuple:
     progressed = after is not None and bool(seen) and (
         after > max(seen) if rising else after < min(seen))
     edge = max if rising else min
+    if after is None:
+        after_left = before if before is not None else left
+    else:
+        after_left = after
     return (progressed,
             edge(seen + ([] if after is None else [after]), default=None),
-            after)
+            after_left)
 
 
 def _progress(sched, before, after) -> tuple:
     """Whether a relaunch got somewhere on its checklist -- something newly
     checked off, or a required item cleared from it (an agent that deletes a
     finished line rather than checking it off) -- and the marks the re-arm
-    carries (`_measure`, once per count)."""
+    carries (`_measure`, once per count). Items added INSIDE a relaunch --
+    by the agent, or by the replenish injector at the exit gate -- raise the
+    open count like any other; a delete-style agent's clearing then reads as
+    none until a relaunch clears past the old low, costing one attempt per
+    such round, not the chain."""
     before = before or (None, None)
     after = after or (None, None)
     checked, high, c_left = _measure(
@@ -823,7 +838,9 @@ def _settle(plan_id, sched, attempt, outcome, detail, nxt, wait_s, exhausted,
     delivery still scheduled and succeeded, and is honoured over the re-arm
     the delivery earned (`nxt`, due `wait_s` after the delivery RETURNED --
     the clock is read here, not when it began): a hand-issued schedule is
-    re-armed as written, whatever the outcome; a cancelled delivery or a plan
+    re-armed as written, whatever the outcome, except that the chain's
+    wake-up count carries on (a re-schedule moves the delivery; it does not
+    make the chain younger than its cap); a cancelled delivery or a plan
     no longer interrupted is not re-armed at all; and a still-limited
     delivery that is not re-armed says why in its detail (`exhausted` names
     what ran out -- attempts, or a loop chain's wake-up cap -- when something
@@ -838,11 +855,14 @@ def _settle(plan_id, sched, attempt, outcome, detail, nxt, wait_s, exhausted,
             detail = (f"{detail} -- not re-armed: roadmap no longer "
                       f"interrupted ({plan['status'] if plan else 'gone'})")
     elif live is not None and live["status"] == "scheduled" and live != sched:
+        counters = {key: live.get(key) for key in CHAIN_KEYS}
+        counters["wake_ups"] = max(nxt.get("wake_ups") or 0,
+                                   live.get("wake_ups") or 0) or None
         rearm = dict(at=live["due"], attempt=live["attempt"],
                      cooldown_hours=live["cooldown_hours"],
                      cwd=live["cwd"] or None, model=live["model"] or None,
                      mode=live["mode"], goal_dir=live["goal_dir"] or None,
-                     **{key: live.get(key) for key in CHAIN_KEYS})
+                     **counters)
         detail = (f"{detail} -- re-armed as scheduled by hand while it ran "
                   f"(due {live['due']})")
     elif outcome == "still_limited":
@@ -863,8 +883,11 @@ def _settle(plan_id, sched, attempt, outcome, detail, nxt, wait_s, exhausted,
                         tags=["autoresume"], project=project)
     if rearm is not None:
         try:
-            schedule(plan_id, project=project, session_id=session_id,
-                     register=register, now=now, **rearm)
+            # `after` still holds: the fired row just appended changes
+            # neither the roadmap nor the mode, which is always given here.
+            schedule(plan_id, project=project, evs=after,
+                     session_id=session_id, register=register, now=now,
+                     **rearm)
             return payload
         except ValueError:
             pass          # retired between the two reads: nothing to arm

@@ -37,8 +37,8 @@ cooldown_minutes = 30
 
 [autoresume]
 # Absolute cap on one chain of usage-cap wake-ups (a capped run relaunched
-# every cooldown); a chain also ends after 6 wake-ups that move nothing on
-# the fix_plan checklist.
+# every cooldown); a chain also ends after autoresume.MAX_ATTEMPTS wake-ups
+# in a row that move nothing on the fix_plan checklist.
 max_wake_ups = 48
 """
 
