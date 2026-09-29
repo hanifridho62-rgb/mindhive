@@ -29,7 +29,7 @@ import os
 
 import pytest
 
-from mindhive import chain, pgmirror
+from mindhive import chain, events, pgmirror
 from mindhive.storage.local_driver import LocalEventStore
 from mindhive.storage.migration import EventReplayMigrationEngine
 from mindhive.storage.postgres_driver import PostgresEventStore
@@ -49,7 +49,8 @@ def ns(tmp_path, monkeypatch):
 
     Derived from pytest's own tmp_path name for `test_pg_live.py`'s reason: it
     is already unique per test, and being DETERMINISTIC means a re-run reuses
-    the namespace instead of leaving a fresh pile of rows behind each time."""
+    the namespace instead of leaving a fresh pile of rows behind each time --
+    and starts it EMPTY, see below."""
     from mindhive import paths
     name = paths.normalize(f"spitest-{tmp_path.name}")
     home = tmp_path / "home"
@@ -57,6 +58,15 @@ def ns(tmp_path, monkeypatch):
     monkeypatch.setenv("MINDHIVE_HOME", str(home))
     monkeypatch.setenv("MINDHIVE_PROJECT", name)
     pgmirror.apply_migrations()
+    # The name being deterministic, on a persistent cluster a re-run would
+    # otherwise start on LAST run's rows: every `events_inserted` count and
+    # round-trip hash below would then be off, wrongly (observed: six failures
+    # on the second run against one cluster, none on the first). `refresh` over
+    # the still-empty ledger is the loader's own `DELETE ... WHERE project = %s`
+    # and a COPY of nothing -- no statement of this file's own. It does not
+    # touch `event_embeddings`, so the three vector tests below are not
+    # covered by it.
+    pgmirror.refresh(name)
     return name
 
 
@@ -172,6 +182,28 @@ def test_the_segment_list_is_the_ledgers_segment_list(ns):
     local, pg = _seed(ns, ("s1", 1), ("s2", 1), ("s3", 1)), _dest(ns)
     EventReplayMigrationEngine().migrate_to_postgres(local, pg)
     assert sorted(pg.list_sessions()) == ["s1", "s2", "s3"]
+
+
+@needs_server
+def test_a_quarantined_session_reads_back_by_the_stem_the_mirror_lists(ns):
+    """A refused id (`../escape`) lands in `unsafe-<hash>.jsonl` on disk and
+    under that same segment in the mirror. `list_sessions` answers the stem,
+    and the SPI says the stem IS the id the store can address it by -- so a
+    read by that name yields the row, not the empty iterator that resolving
+    the stem through the write rule (a second quarantine) produced.
+
+    Mirrored with `pgmirror.refresh`, the loader that scans the segment FILES,
+    because that is the path that stores the on-disk name verbatim."""
+    local = LocalEventStore(ns, strict_session=False)
+    rec = local.append("../escape", "decision", {"text": "quarantined"},
+                       tags=["spi"])
+    pgmirror.refresh(ns)
+    pg = _dest(ns)
+    (stem,) = pg.list_sessions()
+    assert stem.startswith(events.QUARANTINE_PREFIX)
+    got = list(pg.read_stream(stem))
+    assert [(r.session_id, r.seg_line, r.chain_hash) for r in got] \
+        == [("../escape", 1, rec.chain_hash)]
 
 
 @needs_server
