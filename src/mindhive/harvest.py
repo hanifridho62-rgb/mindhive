@@ -16,12 +16,14 @@ def _harvest_lock_path() -> Path:
 
 
 @contextmanager
-def _harvest_lock(stale_secs: float = 120.0):
-    """Cross-process mutex so concurrent harvesters (the dashboard's fast loop
-    and the scheduled autosync task) never process the same transcript lines at
-    once and double-write events. Yields True if acquired, False if another
+def harvest_lock(stale_secs: float = 120.0):
+    """Cross-process mutex so concurrent harvesters (the dashboard's fast loop,
+    the scheduled autosync task, and the CLI doors to the same writer such as
+    `hive failures capture`) never process the same transcript lines at once
+    and double-write events. Yields True if acquired, False if another
     harvest already holds it. A lock older than ``stale_secs`` is presumed
-    orphaned (crashed process) and stolen."""
+    orphaned (crashed process) and stolen. Public on purpose: every path that
+    walks a transcript directory outside `catch_up` holds it under this name."""
     p = _harvest_lock_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -764,7 +766,7 @@ def catch_up(now=None, skip_captured=True, known_only=True) -> dict:
     `skipped_captured` are dropped as before: neither is a signal anyone
     acts on, while an unclosed call says an invocation went on the record
     with no outcome, so any rate built from it is thinner than it looks."""
-    with _harvest_lock() as got:
+    with harvest_lock() as got:
         if not got:               # another harvester is running — skip this tick
             return {"projects": {}, "total_new": 0, "skipped_unknown": [],
                     "unclosed_skill_calls": 0, "locked": True}

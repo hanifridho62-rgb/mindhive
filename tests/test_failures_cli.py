@@ -100,7 +100,7 @@ def test_capture_flow_reaches_auto_demotion(tmp_path):
 
 def test_capture_refused_while_harvest_lock_held_then_captures_after_release(tmp_path, capsys):
     """`hive failures capture` is a second writer over the transcript directory
-    the dashboard's auto-harvest loop sweeps under `harvest._harvest_lock`.
+    the dashboard's auto-harvest loop sweeps under `harvest.harvest_lock`.
     Both stamp `tool_failed` rows with the transcript line's own timestamp and
     dedup against a snapshot taken BEFORE the walk, so two concurrent passes
     mint byte-identical rows the append-only, hash-chained ledger keeps for
@@ -110,7 +110,7 @@ def test_capture_refused_while_harvest_lock_held_then_captures_after_release(tmp
     tdir = _write_transcript(tmp_path)
     argv = ["failures", "capture", "--transcripts", str(tdir), "--project", "test"]
 
-    with harvest._harvest_lock() as held:
+    with harvest.harvest_lock() as held:
         # The test process really holds the mutex, so the refusal asserted
         # below cannot be vacuous.
         assert held is True

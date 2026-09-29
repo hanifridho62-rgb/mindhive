@@ -203,7 +203,7 @@ def cmd_failures_capture(args) -> int | None:
     # directory mints byte-identical rows the append-only, hash-chained ledger
     # keeps for good. Refused the way `hive harvest --catch-up` is: report
     # `locked`, append nothing, exit 0 — rerun once that pass is over.
-    with harvest_mod._harvest_lock() as got:
+    with harvest_mod.harvest_lock() as got:
         if not got:
             print(json.dumps({"new_failures": 0, "files": 0, "locked": True}))
             return None

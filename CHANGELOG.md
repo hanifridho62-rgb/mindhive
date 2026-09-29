@@ -189,7 +189,8 @@ history and grouped by what each release window introduced. They summarise;
   keeps for good. While a live harvester holds the lock the command now
   answers `{"new_failures": 0, "files": 0, "locked": true}`, appends nothing
   and exits 0, the way `hive harvest --catch-up` does; rerun once that pass
-  is over.
+  is over. The mutex is public as `harvest.harvest_lock` now, so every CLI
+  door to the writer holds the one `catch_up` holds.
 - **The embedding watcher no longer records syncs that never happened.**
   Without the vector extras (`pip install -e .[vectors]`) it claims nothing,
   leaves the queue for the install that can drain it, and says why once per
