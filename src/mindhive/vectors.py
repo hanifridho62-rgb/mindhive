@@ -499,7 +499,18 @@ def embed_events(project=None, force=False, batch=256, types=None,
         col = _events_collection(project, refill=True, rebuild=rebuild)
         for start in range(0, len(eligible), batch):
             chunk = eligible[start:start + batch]
-            ids = [event_id(e) for e in chunk]
+            # A ledger can hold one row twice (a hook that fired twice appends
+            # byte-identical rows a line apart), and content addressing gives
+            # both copies one id. chroma refuses an id named twice in one `get`
+            # AND in one `add` (DuplicateIDError), which took the whole run
+            # down mid-batch -- after a rebuild had already dropped the
+            # collection. The second copy would embed to the same vector, so
+            # it is skipped here, counted with the rows already present.
+            seen = {}
+            for ev in chunk:
+                seen.setdefault(event_id(ev), ev)
+            skipped += len(chunk) - len(seen)
+            ids = list(seen)
             # One `get` per batch rather than one per event: chroma round trips
             # are the cost here, not the comparison.
             try:
@@ -507,8 +518,8 @@ def embed_events(project=None, force=False, batch=256, types=None,
             except Exception as e:                 # noqa: BLE001
                 _log.warning("vectors: id probe failed, re-embedding batch: %s", e)
                 present = set()
-            fresh = [(i, ev) for i, ev in zip(ids, chunk) if i not in present]
-            skipped += len(chunk) - len(fresh)
+            fresh = [(i, ev) for i, ev in seen.items() if i not in present]
+            skipped += len(seen) - len(fresh)
             if not fresh:
                 continue
             docs = [event_document(ev) for _, ev in fresh]

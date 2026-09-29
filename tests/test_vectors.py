@@ -235,12 +235,14 @@ class _FakeEventCollection:
         if self.get_raises:
             raise RuntimeError("chroma is unhappy")
         if ids is not None:
+            _refuse_repeats(ids, "get")
             return {"ids": [i for i in ids if i in self.present]}
         self.probed.append((where, limit))
         rows = sorted(self.present if self.matching is None else self.matching)
         return {"ids": rows[:limit] if limit else rows}
 
     def add(self, ids=None, documents=None, embeddings=None, metadatas=None):
+        _refuse_repeats(ids or [], "add")
         self.batches.append({"ids": list(ids or []),
                              "documents": list(documents or []),
                              "metadatas": list(metadatas or [])})
@@ -252,6 +254,17 @@ class _FakeEventCollection:
 
     def count(self):
         return len(self.present)
+
+
+def _refuse_repeats(ids, op):
+    """chroma's own rule, kept by the fake: an id named twice in one `get` or
+    one `add` raises DuplicateIDError before anything is read or written."""
+    seen = set()
+    for i in ids:
+        if i in seen:
+            raise RuntimeError(
+                f"Expected IDs to be unique, found duplicates of: {i} in {op}")
+        seen.add(i)
 
 
 def _stub_events_backend(monkeypatch, col, evs):
@@ -356,6 +369,28 @@ def test_a_failed_id_probe_re_embeds_rather_than_dropping_the_batch(
     col.get_raises = True
     _stub_events_backend(monkeypatch, col, [_ev()])
     assert vectors.embed_events()["embedded"] == 1
+
+
+def test_a_row_the_ledger_holds_twice_is_indexed_once(tmp_path, monkeypatch):
+    """A hook that fires twice appends byte-identical rows a line apart, and
+    content addressing gives both one id. chroma refuses an id named twice in
+    one `get` AND in one `add`, so the first `hive embed` after such a row
+    died mid-batch -- on the merged code AFTER the rebuild had dropped the
+    collection (seen on a copy of the live store: one `decision` appended
+    twice at the same second). The second copy would embed to the same
+    vector, so it is skipped, and counted as skipped."""
+    _isolate(tmp_path, monkeypatch)
+    col = _FakeEventCollection()
+    twin = _ev(text="landed the mirror")
+    _stub_events_backend(monkeypatch, col, [
+        twin, twin, _ev(text="another memo", ts="2026-01-01T00:00:01Z")])
+
+    out = vectors.embed_events()
+
+    assert out == {"scanned": 3, "eligible": 3, "embedded": 2, "skipped": 1}
+    ids = [i for b in col.batches for i in b["ids"]]
+    assert len(ids) == len(set(ids)) == 2
+    assert vectors.embed_events()["embedded"] == 0, "the twin re-embedded"
 
 
 def test_each_indexed_event_carries_its_type_ts_and_session(tmp_path,
