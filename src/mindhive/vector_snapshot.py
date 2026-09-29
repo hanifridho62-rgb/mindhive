@@ -120,6 +120,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from .core.locks import pid_alive
 
 __all__ = ["SnapshotError", "IndexUnreadable", "DamagedSegment", "reading",
            "opener", "open_chroma", "check_segments", "fingerprint", "held",
@@ -465,37 +466,10 @@ def _remove(root, attempts=None) -> bool:
     return False
 
 
-def _pid_alive(pid: int) -> bool:
-    """Whether process *pid* may still be running. Errs towards yes: a copy
-    is swept only when its owner is certainly gone."""
-    if os.name != "nt":
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except (OSError, OverflowError):           # EPERM: someone else's
-            return True
-        return True
-    import ctypes
-    from ctypes import wintypes
-    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    k32.OpenProcess.restype = wintypes.HANDLE
-    k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE,
-                                       ctypes.POINTER(wintypes.DWORD)]
-    k32.GetExitCodeProcess.restype = wintypes.BOOL
-    k32.CloseHandle.argtypes = [wintypes.HANDLE]
-    k32.CloseHandle.restype = wintypes.BOOL
-    handle = k32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
-    if not handle:
-        return ctypes.get_last_error() != 87       # INVALID_PARAMETER: no such pid
-    try:
-        code = wintypes.DWORD()
-        if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
-            return True
-        return code.value == 259                    # STILL_ACTIVE
-    finally:
-        k32.CloseHandle(handle)
+# The liveness probe moved to `core.locks.pid_alive` when the lock primitive
+# needed the same answer -- a stale lock is one whose HOLDER is gone, not one
+# that is merely old. The name stays for `_sweep` and the tests.
+_pid_alive = pid_alive
 
 
 def _owner(name: str):
