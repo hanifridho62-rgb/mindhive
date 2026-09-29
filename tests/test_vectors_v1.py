@@ -974,3 +974,22 @@ def test_an_interrupted_embed_is_raised(monkeypatch, capsys, interrupt):
     with pytest.raises(interrupt) as got:
         maint.cmd_embed(_embed_args())
     assert got.value is stop and capsys.readouterr().err == ""
+
+
+# --- one vector per row, whatever the batch repeats --------------------------
+
+def test_a_batch_naming_a_row_twice_stores_one_vector(monkeypatch):
+    """chromadb refuses an `add` that repeats an id (DuplicateIDError). A claim
+    recovered twice named its rows twice, so the whole batch failed, the claim
+    stayed on disk, and the next recovery queued the same duplicates again."""
+    mgr, col = _mgr(monkeypatch)
+    assert mgr.embed_batch("proj", [_rec(seg_line=7), _rec(seg_line=7),
+                                    _rec(seg_line=8)]) == 2
+    assert [b["ids"] for b in col.batches] == [["alpha:7", "alpha:8"]]
+
+
+def test_missing_extras_is_the_install_line_or_none(monkeypatch):
+    monkeypatch.setattr(vectors, "has_vectors_support", lambda: False)
+    assert "pip install -e .[vectors]" in vectors.missing_extras()
+    monkeypatch.setattr(vectors, "has_vectors_support", lambda: True)
+    assert vectors.missing_extras() is None

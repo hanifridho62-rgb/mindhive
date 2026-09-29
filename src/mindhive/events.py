@@ -11,7 +11,7 @@ from . import paths
 # Bound by identity under this module's name: `append_event` calls the private
 # spelling, so a test (or the watcher) can swap it here without reaching into
 # `embedqueue`. That module imports `paths` only -- no cycle.
-from .embedqueue import count_newlines as _count_newlines
+from .embedqueue import newline_cursor as _newline_cursor
 from .embedqueue import emit_pending_embed_marker as _emit_pending_embed_marker
 
 
@@ -696,13 +696,15 @@ def append_event(event_type, payload, session_id=None, tags=None, ts=None,
     # means it cannot. The strict check above sits earlier still, for the same
     # reason plus one: it must not be the thing that mints the directory.
     seg = d / segment_name(session_id)
+    # The segment read is the append path's one expensive step (3.24 ms on the
+    # largest live segment), so it runs BEFORE the lock; inside, the cursor is
+    # only reconciled with what other writers appended meanwhile (embedqueue).
+    cursor = _newline_cursor(seg) if event_type in SEMANTIC_TYPES else None
     with _append_lock(project):
-        # 1-based line of the row, counted BEFORE the write, only for rows the
-        # watcher wants; an unreadable segment skips the MARKER, never the row.
-        try:
-            seg_line = _count_newlines(seg) + 1 if event_type in SEMANTIC_TYPES else None
-        except OSError:
-            seg_line = None
+        # 1-based line of the row, settled BEFORE the write, only for rows the
+        # watcher wants; an unreadable segment (None) skips the MARKER, never the row.
+        cursor = None if cursor is None else _newline_cursor(seg, cursor)
+        seg_line = None if cursor is None else cursor.newlines + 1
         with open(seg, "a", encoding="utf-8") as f:
             f.write(canonical_json(to_dict(ev)) + "\n")
             if fsync:

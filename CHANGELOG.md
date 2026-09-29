@@ -163,8 +163,36 @@ history and grouped by what each release window introduced. They summarise;
   briefs for spawned agents; the POSIX hook family; the benchmark command
   (`hive bench`); dashboard poll-cost gates and keep-alive.
 
+### Changed
+
+- **The pending-embed queue is appended to, bounded, and counted before the
+  lock** (merge-safety follow-ups to PR #136): `state/pending_embed.json` is
+  now one JSON object per line — a semantic append is one `open(..., "a")` and
+  one write instead of re-serialising the whole document through `os.replace`
+  inside the append lock — and is compacted (one entry per row, the newest
+  kept) only once it passes `embedqueue.QUEUE_MAX_BYTES` (256 KiB), so a
+  namespace no watcher drains no longer grows it without limit. The older
+  `{"entries": [...]}` document is still read, so a claim taken before the
+  upgrade drains. The segment newline count that gives `seg_line` (3.24 ms on
+  the largest live segment) now runs before the append lock and is reconciled
+  inside it (`embedqueue.newline_cursor`), so the lock holds a `stat`, not a
+  read. `tests/test_embedqueue.py`.
+
 ### Fixed
 
+- **The embedding watcher no longer records syncs that never happened.**
+  Without the vector extras (`pip install -e .[vectors]`) it claims nothing,
+  leaves the queue for the install that can drain it, and says why once per
+  watcher (`run_once` / `process_marker` return `skipped`;
+  `vectors.missing_extras`). It used to claim, append `vector_sync_started`,
+  fail on the import and leave a claim on disk every cycle.
+- **Duplicate queue entries no longer poison a claim.** A row a claim names
+  twice is embedded once (`embedqueue.dedupe_entries`,
+  `VectorStoreManager.embed_batch`); recovery requeues each row once, even
+  when a claim's unlink was refused and it is recovered again, and does so
+  under the append lock so an append that lands mid-merge is not published
+  over. chromadb refuses an `add` that repeats an id, which failed the whole
+  batch and left the claim to be recovered — and refused — again.
 - **A failed semantic read no longer looks like "no hits", and a read no
   longer writes the index** (docs/DATA_MODEL.md §4.19; merged from
   `claude/semantic-recall-observable`):

@@ -78,6 +78,14 @@ def _require_deps():
         raise RuntimeError(_EXTRAS) from e
 
 
+def missing_extras():
+    """The one-line reason the semantic layer cannot run here, or None when
+    both packages are installed. Asks `has_vectors_support` -- a spec lookup,
+    no import -- so the watcher can ask on every cycle that has work without
+    paying the import; `_require_deps` is what a write path then pays once."""
+    return None if has_vectors_support() else _EXTRAS
+
+
 def _encoder():
     global _MODEL
     if _MODEL is None:
@@ -676,6 +684,13 @@ def record_metadata(record) -> dict:
             "provenance": record_provenance(record)}
 
 
+def vector_id(record) -> str:
+    """The id a record's vector is stored under: `"<session_id>:<seg_line>"`,
+    the physical row. `embedqueue.entry_key` spells the same id from a queue
+    entry, so the two sides of the hand-off dedupe on one key."""
+    return f"{record.session_id}:{record.seg_line}"
+
+
 class VectorStoreManager:
     """One chroma client per namespace, shared by everything in the process.
 
@@ -762,8 +777,15 @@ class VectorStoreManager:
 
         Returns how many were written. *progress_callback* is called with
         `(done, total)` after each batch -- that pair, not a percentage, so
-        the caller decides how to render it."""
-        records = list(records)
+        the caller decides how to render it. One vector per DISTINCT id,
+        whatever the batch repeats: a claim recovered twice names its rows
+        twice, and chromadb refuses an `add` that repeats an id
+        (DuplicateIDError) -- the whole batch failed, the claim stayed on
+        disk, and the next recovery queued the same duplicates again."""
+        byid = {}
+        for r in records:
+            byid.setdefault(vector_id(r), r)
+        records = list(byid.values())
         if not records:
             return 0
         _require_deps()
@@ -776,7 +798,7 @@ class VectorStoreManager:
             for start in range(0, total, EMBED_BATCH_SIZE):
                 chunk = records[start:start + EMBED_BATCH_SIZE]
                 docs = [build_embedding_document(r) for r in chunk]
-                col.add(ids=[f"{r.session_id}:{r.seg_line}" for r in chunk],
+                col.add(ids=[vector_id(r) for r in chunk],
                         documents=docs,
                         embeddings=svc.encoder()(docs),
                         metadatas=[record_metadata(r) for r in chunk])
