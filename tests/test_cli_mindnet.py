@@ -60,6 +60,7 @@ import pytest
 from mindhive import __main__ as cli_mod
 from mindhive import events, paths
 from mindhive.mindnet import controller as c_mod
+from mindhive.mindnet import executor as x_mod
 from mindhive.mindnet import phases as ph_mod
 from mindhive.mindnet import sidecar as sc_mod
 from mindhive.mindnet import tasks as t_mod
@@ -508,19 +509,41 @@ def test_validate_reports_a_failing_run_non_zero_but_still_records_it(capsys):
 
 
 def test_validate_refuses_a_destructive_script_without_executing_it(
-        capsys, worktree, tmp_path):
+        capsys, worktree):
     """KTD15's gate, through the CLI. The refusal is proved by the ABSENCE of
     the marker the mock writes as its very first act — a return value alone
-    could be produced after the child had already run."""
-    marker = tmp_path / "ran.txt"
-    script = (_script("--mode", "ok", "--marker", str(marker))
-              + " && rm -rf " + str(worktree))
+    could be produced after the child had already run.
+
+    The marker and the ``rm -rf`` target are cwd-RELATIVE, the shape a real
+    validation_script has: `executor.execute` runs the child with ``cwd=root``,
+    so ``ran.txt`` is `worktree / "ran.txt"` and ``.`` IS the worktree. Spelled
+    absolute, two tmp paths rode along, and on a long basetemp (512 chars seen
+    on Windows) the script crossed `tasks.MAX_SCRIPT_CHARS`: the declare refused
+    it for LENGTH and the test went red about nothing it tests. The production
+    cap is untouched — only the interpreter and the mock's checkout path are
+    left in the fixture, and the guard below names them if they ever grow."""
+    marker = worktree / "ran.txt"
+    benign = _script("--mode", "ok", "--marker", "ran.txt")
+    script = benign + " && rm -rf ."
+    assert len(script) <= t_mod.MAX_SCRIPT_CHARS, (
+        "the fixture outgrew the production cap — only sys.executable and the "
+        "mock's checkout path are left in it, so one of those is very long")
+
+    # Positive control: a RELATIVE marker really does land in the worktree when
+    # a child runs, so the absence asserted below is a refusal, not a misaimed
+    # probe. `execute` appends nothing, so the ledger is untouched by this.
+    run = x_mod.execute("mn-u7-canary", benign, root=worktree)
+    assert run.result == "ok" and run.executed, run.reason
+    assert marker.is_file(), "the relative marker did not land in the worktree"
+    marker.unlink()
+
     _walk_trivial(target="audit-bug", script=script)
     capsys.readouterr()
     before = len(_phase_events("satisfy"))
 
     assert _cli("mindnet", "validate", TASK) == 2
-    assert "destructive" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "destructive-command gate" in err, err    # THIS gate, not any refusal
     assert not marker.exists(), "the gate refused but the child still ran"
     assert len(_phase_events("satisfy")) == before
 
