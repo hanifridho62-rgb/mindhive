@@ -36,6 +36,7 @@ def _snapshots_in_tmp(tmp_path, monkeypatch):
     monkeypatch.setattr(vector_snapshot, "_SWEPT", False)
     monkeypatch.setattr(vector_snapshot, "_POISONED", [])
     monkeypatch.setattr(vector_snapshot, "_FAILED", {})
+    monkeypatch.setattr(vector_snapshot, "_PASSED", {})
     yield
     vector_snapshot.dispose_all()
 
@@ -257,6 +258,7 @@ class _Stubborn:
     def __init__(self, refusals):
         self.refusals = refusals
         self.copytree, self.Error = shutil.copytree, shutil.Error
+        self.copyfile = shutil.copyfile
 
     def rmtree(self, path, *args, **kwargs):
         if self.refusals > 0:
@@ -377,7 +379,7 @@ def test_copies_of_a_process_that_is_gone_are_swept_on_the_next_copy(tmp_path):
 def _shutil_with(copytree):
     """`shutil` as vector_snapshot sees it, with *copytree* swapped in."""
     return types.SimpleNamespace(copytree=copytree, rmtree=shutil.rmtree,
-                                 Error=shutil.Error)
+                                 copyfile=shutil.copyfile, Error=shutil.Error)
 
 
 def test_a_writer_that_lands_mid_copy_costs_one_more_copy(tmp_path,
@@ -450,6 +452,49 @@ def test_a_temp_dir_that_cannot_hold_a_copy_is_named(tmp_path, monkeypatch):
             pass
     assert err.value.reason == "space"
     assert str(blocked) in str(err.value)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="file share modes are Windows'")
+def test_a_copy_never_locks_a_writer_out_of_a_file_it_copies(tmp_path):
+    """`copytree` copies with `copy2`, which on Windows is CopyFile2: it
+    opens each source file denying write sharing, so a writer that opens one
+    for writing while it is copied is refused. chromadb's writer is, when a
+    persist rewrites the segment files -- measured, an `add` failed with
+    "Failed to apply logs to the hnsw segment writer" while a reader copied
+    `index_metadata.pickle`, and `hive embed` or the watcher's batch died
+    with it. A copy never keeps a writer out of the file it copies."""
+    src = _source(tmp_path)
+    big = src / "seg" / "link_lists.bin"
+    big.write_bytes(b"\1" * (32 << 20))
+    stop, copying = threading.Event(), threading.Event()
+    during, refused = [], []
+
+    def writer():
+        while not stop.is_set():
+            busy = copying.is_set()
+            try:
+                with open(big, "r+b"):
+                    pass
+            except PermissionError as e:
+                refused.append(e)
+            if busy and copying.is_set():
+                during.append(1)
+
+    opens = threading.Thread(target=writer)
+    opens.start()
+    try:
+        for _ in range(3):
+            copying.set()
+            try:
+                _fp, root, *_ = vector_snapshot._copy_stable(src)
+            finally:
+                copying.clear()
+            vector_snapshot._remove(root)
+    finally:
+        stop.set()
+        opens.join(10)
+    assert during, "no writer's open was tried while a copy was taken"
+    assert not refused, f"a copy locked a writer out {len(refused)} times"
 
 
 # --- a client whose read failed ---------------------------------------------------
@@ -762,6 +807,145 @@ def test_past_the_limit_a_collection_is_refused_with_its_own_failure(
     assert len(log) == 2
 
 
+def test_a_failure_on_older_bytes_leaves_the_newer_failure_remembered(
+        tmp_path, kept):
+    """A reads X; a writer moves the index to Y, B copies Y and fails on it,
+    and THEN A fails on X. One memo per collection held the last failure,
+    A's: R, on Y -- the very bytes B failed on -- found a memo that did not
+    match and dropped it, and copied, opened, read and failed on Y again,
+    keeping one more client for good. Each failure is remembered against the
+    bytes it happened on."""
+    src = _source(tmp_path)
+    log = []
+    with pytest.raises(_Boom):
+        with _read(src, log):                      # A, on X
+            (src / "seg" / "data_level0.bin").write_bytes(b"a writer came by")
+            b = _fail(src, log)                    # B fails on Y
+            raise _Boom("Error loading hnsw index (A)")
+    with pytest.raises(vector_snapshot.IndexUnreadable) as err:
+        with _read(src, log):                      # R, on Y
+            pass
+    assert err.value.original is b
+    assert len(log) == 2 and kept == [log[1], log[0]], \
+        "the bytes B failed on were opened, read and failed on again"
+
+
+def test_a_way_in_on_newer_bytes_keeps_the_failure_an_older_copy_needs(
+        tmp_path, kept):
+    """A has copied X and is opening it when B fails on X; a writer moves the
+    index to Y, and C reads Y. C's way in dropped the memo of X, older than
+    its fingerprint -- the one record A's install asks: A installed its copy
+    of X over C's newer one, closing it, and read and failed on the bytes B
+    had failed on. A way in forgets no failure; a failure is forgotten when
+    it expires."""
+    src = _source(tmp_path)
+    log, failed = [], []
+
+    def opener(path):
+        client = _FakeClient(path)
+        log.append(client)
+        if len(log) == 1:                          # A is opening its copy of X
+            failed.append(_fail(src, log))         # B fails on X
+            (src / "seg" / "data_level0.bin").write_bytes(b"a writer came by")
+            with _read(src, log) as c:             # C reads Y
+                assert c is log[2]
+        return client
+
+    with pytest.raises(vector_snapshot.IndexUnreadable) as err:
+        with vector_snapshot.reading(src, opener, judge=_claims,
+                                     name="events"):
+            pass
+    assert err.value.original is failed[0]
+    assert log[0].closed and not log[0].path.exists(), \
+        "A's unread client on the bytes that failed was kept"
+    assert kept == [log[1]]
+    with _read(src, log) as client:
+        assert client is log[2], "C's newer copy was closed for an older one"
+    assert not log[2].closed
+
+
+def test_an_older_copy_never_replaces_a_newer_one(tmp_path):
+    """A copies X and is still opening it when a writer moves the index to Y
+    and C reads Y. A's copy, installed last, took the place of C's newer one
+    and closed it, so the next read of Y copied the index again. The older
+    copy serves the reader that took it, and is closed after it."""
+    src = _source(tmp_path)
+    log = []
+
+    def opener(path):
+        client = _FakeClient(path)
+        log.append(client)
+        if len(log) == 1:                          # A is opening its copy of X
+            (src / "seg" / "data_level0.bin").write_bytes(b"a writer came by")
+            with vector_snapshot.reading(src, _opener(log)) as c:   # C, on Y
+                assert c is log[1]
+        return client
+
+    with vector_snapshot.reading(src, opener) as a:
+        assert a is log[0], "A did not read the copy it took"
+    assert log[0].closed and not log[0].path.exists(), \
+        "the older copy outlived its reader"
+    assert not log[1].closed, "the newer copy was closed for an older one"
+    with vector_snapshot.reading(src, _opener(log)) as c:
+        assert c is log[1] and len(log) == 2, "the newer copy was replaced"
+
+
+def test_a_source_read_since_it_failed_is_read_past_the_limit(tmp_path, kept,
+                                                             monkeypatch):
+    """Past the limit, a source is refused while its failure stands -- not
+    once a read got past it on bytes that moved on since. Kept for good, a
+    failure refused the source repaired and read fine since, until the
+    process restarted, once other sources filled the limit."""
+    monkeypatch.setattr(vector_snapshot, "POISON_LIMIT", 2)
+    a, b = _source(tmp_path / "a"), _source(tmp_path / "b")
+    log = []
+    _fail(a, log)
+    (a / "seg" / "data_level0.bin").write_bytes(b"rebuilt")
+    with _read(a, log) as client:
+        assert client is log[1]
+    _fail(b, log)                                  # the limit is reached
+    with _read(a, log) as client:
+        assert client is log[1], "a source read fine since it failed was refused"
+    (b / "seg" / "data_level0.bin").write_bytes(b"a writer came by")
+    with pytest.raises(vector_snapshot.IndexUnreadable) as err:
+        with _read(b, log):
+            pass
+    assert err.value.capped, "a source whose failure stands was read"
+
+
+def test_a_damaged_collection_refuses_only_the_reads_of_it(tmp_path, kept):
+    """The segment check runs for the collection read, once per copy. Run
+    once for the whole copy, a cut `events` segment refused every read of
+    it: `ledger` and the watcher's collection, healthy, went unread until the
+    repair, and each refused read copied the index again. chromadb loads a
+    collection's HNSW segment only once that collection is counted or
+    queried, so a client whose reads never reach the damage is sound, and is
+    closed as usual."""
+    src = _source(tmp_path)
+    log, checked = [], []
+
+    def check(copy, name):
+        checked.append(name)
+        if name == "events":
+            raise vector_snapshot.DamagedSegment("cut", collection="events")
+
+    def read(name):
+        return vector_snapshot.reading(src, _opener(log), judge=_claims,
+                                       name=name, check=check)
+
+    for _ in range(2):
+        with pytest.raises(vector_snapshot.DamagedSegment):
+            with read("events"):
+                pass
+    with read("ledger") as client:
+        assert client is log[0], "a healthy collection of the copy went unread"
+    assert len(log) == 1, "each refused read copied the index again"
+    assert checked == ["events", "ledger"], checked
+    assert kept == [], "a client that never read the damage was kept"
+    vector_snapshot.dispose_all()
+    assert log[0].closed
+
+
 def test_a_failure_the_judge_does_not_claim_leaves_the_client_in_service(
         tmp_path, kept):
     """An encoder that would not load says nothing about the chroma client:
@@ -841,9 +1025,50 @@ def test_a_catalogue_that_cannot_be_read_leaves_every_segment_judged(tmp_path):
     (seg / "index_metadata.pickle").write_bytes(b"m")
     (seg / "header.bin").write_bytes(b"h" * 7)
     (copy / "chroma.sqlite3").write_bytes(b"not a database " * 64)
-    with pytest.raises(vector_snapshot.DamagedSegment, match="seg-a") as err:
-        vector_snapshot.check_segments(copy)
-    assert err.value.collection is None
+    for read in (None, "ledger"):
+        with pytest.raises(vector_snapshot.DamagedSegment, match="seg-a") as err:
+            vector_snapshot.check_segments(copy, read)
+        assert err.value.collection is None
+
+
+def test_the_header_check_judges_the_segments_of_the_collection_read(tmp_path):
+    """A read of `ledger` touches none of `events`' segments: chromadb loads
+    a collection's HNSW segment only once that collection is counted or
+    queried. Asked for no collection, the check judges every one."""
+    copy = tmp_path / "chroma"
+    ev, led = copy / "seg-ev", copy / "seg-led"
+    for seg in (ev, led):
+        seg.mkdir(parents=True)
+        (seg / "index_metadata.pickle").write_bytes(b"m")
+        (seg / "header.bin").write_bytes(
+            b"h" * vector_snapshot.HNSW_HEADER_BYTES)
+    (ev / "header.bin").write_bytes(b"h" * 7)
+    _catalogue(copy, {"seg-ev": "events", "seg-led": "ledger"})
+    vector_snapshot.check_segments(copy, "ledger")
+    for read in ("events", None):
+        with pytest.raises(vector_snapshot.DamagedSegment, match="seg-ev") as err:
+            vector_snapshot.check_segments(copy, read)
+        assert err.value.collection == "events"
+
+
+def test_a_segment_the_catalogue_names_in_another_form_is_judged(tmp_path):
+    """chromadb finds a segment's directory by parsing its id as a UUID, so an
+    id written in capitals, or without its hyphens, still names the
+    lowercase directory. Compared as text, the check passed that segment
+    over -- cut header and all -- and chromadb read it."""
+    import uuid
+    copy = tmp_path / "chroma"
+    sid = uuid.UUID("74c1d418-8995-4cff-8747-77c06f024a03")
+    seg = copy / str(sid)
+    seg.mkdir(parents=True)
+    (seg / "index_metadata.pickle").write_bytes(b"m")
+    (seg / "header.bin").write_bytes(b"h" * 7)
+    for named in (str(sid).upper(), sid.hex):
+        (copy / "chroma.sqlite3").unlink(missing_ok=True)
+        _catalogue(copy, {named: "events"})
+        with pytest.raises(vector_snapshot.DamagedSegment) as err:
+            vector_snapshot.check_segments(copy, "events")
+        assert err.value.collection == "events", named
 
 
 def test_a_client_kept_after_a_failure_outlives_every_other_reference():
@@ -1032,8 +1257,9 @@ def test_a_copy_chromadb_cannot_open_is_not_left_registered(tmp_path):
 # The failure these defences exist for kills the interpreter, so it is driven
 # in a child: `build` persists an events segment (by default 1300 rows past
 # chroma's sync_threshold of 1000, width 8 to keep it quick) and cuts its
-# `header.bin` to 7 bytes; the read modes then count three times, the source
-# changing once between the second and third.
+# `header.bin` to 7 bytes, beside a healthy three-row `ledger`; the read modes
+# then count three times, the source changing once between the second and
+# third, and `siblings` queries `ledger` after each count.
 
 _CHILD = r'''
 import sys
@@ -1060,6 +1286,11 @@ if mode == "build":
                             for i in rows],
                 metadatas=[{"type": "decision", "ts": "t", "session_id": "s"}]
                 * len(rows))
+    vectors._client(None).get_or_create_collection(
+        vectors.LEDGER_COLLECTION, metadata=dict(vectors.HNSW_METADATA)).add(
+        ids=["a.md", "b.md", "c.md"], documents=["alpha", "beta", "gamma"],
+        embeddings=[[((i * 3 + j) % 5) / 5.0 + 0.1 for j in range(8)]
+                    for i in range(3)])
     from chromadb.api.shared_system_client import SharedSystemClient as S
     S._identifier_to_refcount.pop(str(chroma), None)
     S._identifier_to_system.pop(str(chroma)).stop()
@@ -1077,12 +1308,15 @@ if mode == "rebuild":     # the events half of `hive embed --rebuild`
     S._identifier_to_system.pop(str(chroma)).stop()
     sys.exit(0)
 if mode == "unchecked":
-    vector_snapshot.check_segments = lambda copy: None
+    vector_snapshot.check_segments = lambda copy, collection=None: None
+vectors._encoder = lambda: (lambda texts: [[0.5] * 8 for t in texts])
 for attempt in range(3):
     try:
         print("count", vectors.indexed_event_count(strict=True), flush=True)
     except vectors.SemanticQueryError as e:
         print("failed", e.stage, flush=True)
+    if mode == "siblings":
+        print("ledger", len(vectors.semantic_recall("x", limit=5)), flush=True)
     if attempt == 1:
         (chroma / "touched.txt").write_text("a writer came by")
 print("copies", len(list(snaps.glob(vector_snapshot.SNAPSHOT_PREFIX + "*"))),
@@ -1104,15 +1338,17 @@ def _child(mode, snaps, cwd, *build):
     return done.stdout
 
 
-def test_a_damaged_hnsw_segment_fails_every_read_and_never_the_process(
+def test_a_damaged_hnsw_segment_fails_every_read_of_it_and_never_the_process(
         tmp_path):
     """Measured without these defences: the count fails, and closing that
     client at the next copy corrupts the heap (0xC0000374). `unchecked` is
     the damage getting past the header check: every read still fails as a
     count, the client it failed on is kept rather than torn down, and the
-    unchanged index is not copied again. `checked` is the check itself: the
-    copy is refused before chromadb opens it, and the copies the killed-off
-    readers kept are swept by the next process."""
+    unchanged index is not copied again. `siblings` is the check itself: a
+    read of `events` is refused before chromadb reads its segment, `ledger`
+    is read from the same copy, the copy the source moved past is closed
+    and deleted, and the copies the killed-off readers kept are swept by the
+    next process. The one left is the current copy, closed at exit."""
     pytest.importorskip("chromadb")
     # Without the model the count answers 0 before it reads anything, which
     # would read here as the damage being counted as an empty index.
@@ -1122,9 +1358,10 @@ def test_a_damaged_hnsw_segment_fails_every_read_and_never_the_process(
     out = _child("unchecked", snaps, tmp_path)
     assert out.count("failed count") == 3, out
     assert "copies 2" in out, out
-    out = _child("checked", snaps, tmp_path)
+    out = _child("siblings", snaps, tmp_path)
     assert out.count("failed open") == 3, out
-    assert "copies 0" in out, out
+    assert out.count("ledger 3") == 3, out
+    assert "copies 1" in out, out
 
 
 @pytest.mark.parametrize("total,sync", [(130, 100), (35, 10)],
@@ -1135,16 +1372,18 @@ def test_the_damage_that_crashed_or_hung_the_count_never_reaches_chromadb(
     header check, runs of the count crashed the process, hung it past two
     minutes, or failed -- which one varied between runs, and nothing in the
     process survives the first two once chromadb reads the segment. The
-    check refuses the copy before it does, so each read fails as an `open`
-    and the process lives to say so. Not run `unchecked`: that is the crash
-    or the hang."""
+    check refuses each read of `events` before chromadb reads the segment,
+    so it fails as an `open`, `ledger` is read from the same client, and
+    the process lives to say so -- and to close that client at exit. Not
+    run `unchecked`: that is the crash or the hang."""
     pytest.importorskip("chromadb")
     pytest.importorskip("sentence_transformers")
     snaps = tmp_path / "child-snaps"
     assert "damaged" in _child("build", snaps, tmp_path, total, sync)
-    out = _child("checked", snaps, tmp_path)
+    out = _child("siblings", snaps, tmp_path)
     assert out.count("failed open") == 3, out
-    assert "copies 0" in out, out
+    assert out.count("ledger 3") == 3, out
+    assert "copies 1" in out, out
 
 
 def test_a_rebuild_repairs_a_cut_header_it_drops(tmp_path):

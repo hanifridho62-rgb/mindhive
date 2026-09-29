@@ -206,6 +206,30 @@ history and grouped by what each release window introduced. They summarise;
     deleted. The header check judges only segments the index still names:
     chromadb leaves a dropped collection's segment directory behind, and the
     cut header a rebuild had just dropped refused every read after it.
+  - Round-4 review: a failure is remembered per fingerprint, and only the
+    way in forgets one, once it expires — one memo per collection let a
+    failure on older bytes replace the one on newer bytes, which a reader
+    then opened and failed on again, and a way in on newer bytes dropped
+    the memo a copy still in flight asked at install; past the cap a source
+    is refused only while it has a failure no read of that collection has
+    got past since (`_PASSED`), and the refusal names a restart of the
+    process after the repair. A copy never replaces a newer one
+    (`_Snapshot.taken`). Each file is copied with `shutil.copyfile`:
+    `copy2`'s CopyFile2 refused a writer opening a 32 MB segment file 225
+    times during three copies. The header check is the read's, per
+    collection (`reading(check=…)`, cached per copy, never judged): with
+    `events` cut, `ledger` is still read from the same copy, whose client
+    closes cleanly (pinned in a child process, 5 runs of 5); segment ids
+    are compared in canonical UUID form. An event query that answers
+    nothing from a collection holding rows it could have returned is
+    `vector_errors.UnansweredQuery`, a failed query — measured on a
+    `collections.dimension` of NULL, count 1,300, every query empty, and
+    `hive recall` fell back to the file index in silence; a hit without its
+    document (`MissingDocument`) and an unanswered query are answers, so
+    the judge never poisons the copy for them. `hive embed` prints one
+    `error:` line for a write that failed and exits 1
+    (`vector_errors.embed_failure`), and `LocalVectorIndex` catches a panic
+    in the encoder like any failure.
 - README said the dashboard's auto-harvest polls every 180 seconds by default
   (`MINDHIVE_AUTOHARVEST_SECS`); the code's default is 3 seconds, floor 1
   (blueprint P8, found while building the environment-variable registry).

@@ -106,8 +106,15 @@ def cmd_embed(args) -> int | None:
 
     `--project` names the namespace verbatim: it is what a failed semantic
     read tells the operator to run, and MINDHIVE_PROJECT would be normalised
-    (`my_proj` -> `my-proj`) into another namespace."""
-    from .. import guard, vectors
+    (`my_proj` -> `my-proj`) into another namespace.
+
+    A write that fails is one `error:` line and exit 1, never a traceback:
+    measured on an `events` collection whose configuration chromadb could
+    not deserialize, `--rebuild` rebuilt `ledger` and then raised out of
+    `hive`. The line says what was written before the failure and the
+    repair `vector_errors.embed_failure` names for it. An interrupt stops
+    the embed as it is."""
+    from .. import guard, vector_errors, vectors
     try:
         guard.ensure_safe(force=args.force)
         vectors._require_deps()
@@ -116,10 +123,19 @@ def cmd_embed(args) -> int | None:
         return 2
     rebuild = bool(getattr(args, "rebuild", False))
     project = getattr(args, "project", None)
-    out = {"files": vectors.embed(project=project, force=args.force,
-                                  rebuild=rebuild),
-           "events": vectors.embed_events(project=project, force=args.force,
-                                          rebuild=rebuild)}
+    out, done = {}, []
+    for key, name, run in (("files", vectors.LEDGER_COLLECTION, vectors.embed),
+                           ("events", vectors.EVENT_COLLECTION,
+                            vectors.embed_events)):
+        try:
+            out[key] = run(project=project, force=args.force, rebuild=rebuild)
+        except BaseException as e:                 # noqa: BLE001 -- see is_failure
+            if not vector_errors.is_failure(e):
+                raise
+            print("error: " + vector_errors.embed_failure(
+                name, e, project, rebuild=rebuild, done=done), file=sys.stderr)
+            return 1
+        done.append(name)
     print(json.dumps(out))
     return None
 

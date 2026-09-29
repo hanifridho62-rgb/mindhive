@@ -25,7 +25,14 @@ tick with the size unchanged -- and a copy whose fingerprints disagree is
 thrown away and taken again. A writer that never pauses across `COPY_ATTEMPTS`
 tries is reported as `SnapshotError` (`reason` "busy"), never answered from a
 torn copy; a copy that cannot be written is "copy", a temp directory that
-cannot take one is "space".
+cannot take one is "space". Each file is copied with `shutil.copyfile`, never
+`copytree`'s default `copy2`: on Windows, Python 3.14's `copy2` copies through
+CopyFile2, which keeps any other process from opening the file for writing
+while it copies -- measured, a writer opening a 32 MB segment file during
+three copies was refused 225 times -- and a writer refused is `hive embed` or
+the watcher's batch failing, when chromadb persists a segment. `copyfile`
+shares the file for writing; its handle does not share deletion, which
+SQLite, deleting its journal, retries.
 
 **Cached per process.** An unchanged index is copied once: the next read whose
 fingerprint matches reuses the open client, so a dashboard asking ten questions
@@ -51,12 +58,18 @@ client -- `close()`, dropping its last reference, interpreter exit -- corrupts
 the heap (exit 0xC0000374); with fewer rows waiting in the log -- 130 at
 sync_threshold 100, 35 at 10 -- runs of the count itself crashed the process,
 hung past two minutes, or failed, the outcome varying between runs.
-`check_segments` refuses that damage before chromadb opens the copy, which
-contains every one of them -- in a segment the copy's catalogue still names,
-since chromadb leaves a dropped collection's segment directory behind. In
-`ledger` or `events` that damage is repaired by `hive embed --rebuild`, which
-drops the collection without reading it. Damage it cannot see is met after
-the fact only
+`check_segments` refuses that damage before chromadb reads the collection,
+which contains every one of them -- in a segment the copy's catalogue still
+names, since chromadb leaves a dropped collection's segment directory behind.
+It is the reader's *check*, asked for the collection read and once per copy:
+chromadb loads a collection's HNSW segment only once that collection is
+counted or queried, so with `events` cut, `ledger` is read from the same copy
+-- whose client, never having loaded the cut segment, closes as any other. A
+read the check refuses read nothing: it is not the client's failure, is not
+remembered, and a read of the same copy is refused the same way until the
+source changes. In `ledger` or `events` that damage is repaired by `hive
+embed --rebuild`, which drops the collection without reading it. Damage the
+check cannot see is met after the fact only
 where chromadb raises on it -- a header of whole length but garbage bytes
 failed the count with InternalError: when the caller's *judge* claims a failure
 as the client's own, the client is never closed and never freed
@@ -72,18 +85,21 @@ whole index's had silently lost its two best hits. Nothing in this process
 can contain a crash, a hang or a wrong answer; a read in a child process could
 contain the first two, and is not done here.
 
-The failure is remembered against the bytes it happened on: the same
-collection of an unchanged index is refused with `IndexUnreadable` rather than
-copied and opened again, for `FAILED_RETRY_S` -- a hiccup on an index nobody
-writes to must not end semantic search for the life of a dashboard. That memo
-is asked on the way in, again once the copy is taken and again at install, so
-a reader that overlapped a failure does not open, read and fail on the same
-bytes too; and the way in drops only a memo older than its own fingerprint,
-since a newer one may be of bytes that fingerprint never saw. A client such a
-refusal leaves unread is closed like any other. Each client a read failed on,
-and its copy, is kept until the process ends, so once `POISON_LIMIT` of them
-are held no collection of a source that has failed is read again until the
-process restarts; a source that first fails after that still keeps one more.
+The failure is remembered against the bytes it happened on, each fingerprint
+of a collection in a memo of its own: the same collection of an unchanged
+index is refused with `IndexUnreadable` rather than copied and opened again,
+for `FAILED_RETRY_S` -- a hiccup on an index nobody writes to must not end
+semantic search for the life of a dashboard. That memo is asked on the way
+in, again once the copy is taken and again at install, so a reader that
+overlapped a failure does not open, read and fail on the same bytes too. A
+client such a refusal leaves unread is closed like any other, and a copy
+never replaces a newer one: taken first and installed last, it serves the
+reader that took it and is closed after it. Each client a read failed on, and
+its copy, is kept until the process ends, so once `POISON_LIMIT` of them are
+held, a source is not read again until the process restarts while it has a
+failure no read of the same collection has got past since -- a source
+repaired and read since is still read; one that first fails after that still
+keeps one more client.
 """
 import atexit
 import logging
@@ -116,8 +132,9 @@ REMOVE_RETRY_PAUSE_S = 0.1
 #: their own tmp dir.
 SNAPSHOT_DIR = None
 #: Clients a failed read left open for good, per process, past which no
-#: collection of a source that has failed is read again until the process
-#: restarts. Not a hard bound: a source first failing past it keeps one more.
+#: collection of a source with a failure no read has got past since is read
+#: again until the process restarts. Not a hard bound: a source first failing
+#: past it keeps one more.
 POISON_LIMIT = 16
 #: How long a failed read is remembered against unchanged bytes.
 FAILED_RETRY_S = 600.0
@@ -131,7 +148,10 @@ _CURRENT: dict = {}
 _ORPHANS: set = set()      # closed copies of this process that would not delete
 _SWEPT = False             # copies of processes that are gone: swept once
 _POISONED: list = []       # snapshots a read failed on: never closed or deleted
-_FAILED: dict = {}         # (source, collection) -> (fingerprint, error, when)
+_FAILED: dict = {}         # (source, collection) -> {fingerprint: (error, when)}
+_PASSED: dict = {}         # (source, collection) -> the latest way in past its
+                           # memos: failures before it count toward no cap
+_UNCHECKED = object()      # a copy's collection the segment check has not seen
 
 
 class SnapshotError(RuntimeError):
@@ -148,7 +168,7 @@ class IndexUnreadable(RuntimeError):
     """A read refused before anything was copied: collection *name* of the
     index at *src* failed to read and has not changed since -- or, `capped`,
     too many clients are already held open by failed reads to risk another on
-    a source that has failed at all. `original` is the failure that was
+    a source with a failure no read has got past. `original` is the failure that was
     remembered, on collection `of` (*name* unless a sibling failed); `why`
     says which refusal this is, without it."""
 
@@ -171,8 +191,8 @@ class IndexUnreadable(RuntimeError):
 
 class DamagedSegment(RuntimeError):
     """A persisted HNSW segment whose `header.bin` is shorter than a whole one.
-    `collection` is the collection it belongs to, which need not be the one a
-    refused read asked for; None when the copy's catalogue could not say."""
+    `collection` is the collection it belongs to -- the one read, when the
+    check was asked for one; None when the copy's catalogue could not say."""
 
     def __init__(self, message, collection=None):
         super().__init__(message)
@@ -180,10 +200,13 @@ class DamagedSegment(RuntimeError):
 
 
 class _Snapshot:
+    """One copy and its client. `taken` is when the copy's fingerprint was
+    taken, which orders two copies of one source; `checked` holds, per
+    collection, what the segment check said of this copy -- None for a pass."""
     __slots__ = ("key", "fingerprint", "root", "client", "users", "retired",
-                 "poisoned", "copy_ms")
+                 "poisoned", "taken", "checked", "copy_ms")
 
-    def __init__(self, key, fp, root, client, copy_ms=None):
+    def __init__(self, key, fp, root, client, taken=0.0, copy_ms=None):
         self.key = key
         self.fingerprint = fp
         self.root = root
@@ -191,6 +214,8 @@ class _Snapshot:
         self.users = 0
         self.retired = False
         self.poisoned = False
+        self.taken = taken
+        self.checked = {}
         self.copy_ms = copy_ms
 
 
@@ -218,36 +243,55 @@ def fingerprint(src):
     return tuple(rows), counter
 
 
-def check_segments(copy) -> None:
-    """Refuse a copy holding a persisted HNSW segment whose `header.bin` is
-    cut short, before chromadb reads it. Only a segment chromadb persisted
-    (it has `index_metadata.pickle`) is judged: an unpersisted one is rebuilt
-    from the log, and a short header there was measured harmless. And only
-    one the copy's catalogue still names: chromadb 1.5.9 leaves a dropped
-    collection's segment directory on disk and never opens it again, and
-    judged, the cut segment `hive embed --rebuild` had just dropped refused
-    every read after the rebuild. A catalogue that cannot be read names none,
-    and every segment is judged."""
+def check_segments(copy, collection=None) -> None:
+    """Refuse a read of *collection* whose persisted HNSW segment has a
+    `header.bin` cut short, before chromadb reads it. Only a segment chromadb
+    persisted (it has `index_metadata.pickle`) is judged: an unpersisted one
+    is rebuilt from the log, and a short header there was measured harmless.
+    Only one the copy's catalogue still names: chromadb 1.5.9 leaves a
+    dropped collection's segment directory on disk and never opens it again,
+    and judged, the cut segment `hive embed --rebuild` had just dropped
+    refused every read after the rebuild. And only one of *collection*:
+    chromadb loads a collection's segment once that collection is counted or
+    queried, so a cut `events` segment is no reason to refuse `ledger`. A
+    catalogue that cannot be read names no owner, and every segment is
+    judged -- as every one is when *collection* is None."""
     live = _live_segments(copy)
     for header in Path(copy).glob("*/header.bin"):
         seg = header.parent
         if not (seg / "index_metadata.pickle").exists():
             continue
-        if live is not None and seg.name not in live:
-            continue
+        owner = None
+        if live is not None:
+            sid = _canonical(seg.name)
+            if sid not in live:
+                continue
+            owner = live[sid]
+            if collection is not None and owner != collection:
+                continue
         size = header.stat().st_size
         if size < HNSW_HEADER_BYTES:
-            owner = None if live is None else live[seg.name]
             of = f" of {owner!r}" if owner else ""
             raise DamagedSegment(
                 f"HNSW segment {seg.name}{of}: header.bin is {size} bytes, a "
                 f"whole one is {HNSW_HEADER_BYTES}", collection=owner)
 
 
+def _canonical(seg_id) -> str:
+    """*seg_id* in one form. chromadb finds a segment's directory by parsing
+    its id as a UUID, so a catalogue naming it in capitals or without its
+    hyphens still names the lowercase directory."""
+    import uuid
+    try:
+        return str(uuid.UUID(str(seg_id)))
+    except ValueError:
+        return str(seg_id).lower()
+
+
 def _live_segments(copy):
     """`{segment id: collection name}` for every segment the copy's
-    `chroma.sqlite3` names, or None when it cannot be read. Opened read-only,
-    and only ever on a copy."""
+    `chroma.sqlite3` names, ids in `_canonical` form, or None when it cannot
+    be read. Opened read-only, and only ever on a copy."""
     import sqlite3
     try:
         con = sqlite3.connect(
@@ -255,9 +299,9 @@ def _live_segments(copy):
     except Exception:                              # noqa: BLE001 -- judge them all
         return None
     try:
-        return dict(con.execute(
+        return {_canonical(sid): name for sid, name in con.execute(
             "SELECT s.id, c.name FROM segments s "
-            "LEFT JOIN collections c ON s.collection = c.id"))
+            "LEFT JOIN collections c ON s.collection = c.id")}
     except Exception:                              # noqa: BLE001 -- judge them all
         return None
     finally:
@@ -265,12 +309,12 @@ def _live_segments(copy):
 
 
 def open_chroma(copy):
-    """A chromadb client on the copy at *copy*, once `check_segments` passes.
-    chromadb registers a client's system BEFORE starting it, so an open that
-    fails leaves the half-started system in its registry for the life of the
-    process -- a leak per failed read; it is taken out here."""
+    """A chromadb client on the copy at *copy*. chromadb registers a
+    client's system BEFORE starting it, so an open that fails leaves the
+    half-started system in its registry for the life of the process -- a
+    leak per failed read; it is taken out here. The segment check is the
+    reader's, per collection (`reading`'s *check*)."""
     import chromadb
-    check_segments(copy)
     try:
         return chromadb.PersistentClient(path=str(copy))
     except BaseException:
@@ -398,19 +442,22 @@ def _sweep() -> None:
 
 
 def _copy_stable(src):
-    """`(fingerprint, root)` of a copy of *src* at `root/chroma` that held
-    still while it was taken, or `(None, None)` when *src* is gone. Whatever
-    stops a copy half-way takes its directory with it."""
+    """`(fingerprint, root, taken)` of a copy of *src* at `root/chroma` that
+    held still while it was taken, *taken* being when its fingerprint was;
+    `(None, None, None)` when *src* is gone. Whatever stops a copy half-way
+    takes its directory with it."""
     failure = None
     for attempt in range(COPY_ATTEMPTS):
         if attempt:
             time.sleep(COPY_RETRY_PAUSE_S)
+        taken = time.monotonic()
         before = fingerprint(src)
         if before is None:
-            return None, None
+            return None, None, None
         root = _new_root()
         try:
-            shutil.copytree(src, root / "chroma")
+            shutil.copytree(src, root / "chroma",
+                            copy_function=shutil.copyfile)
         except (OSError, shutil.Error) as e:
             failure = e
             _remove(root)
@@ -419,7 +466,7 @@ def _copy_stable(src):
             _remove(root)
             raise
         if fingerprint(src) == before:
-            return before, root
+            return before, root, taken
         failure = None
         _remove(root)
     if failure is not None:
@@ -442,7 +489,8 @@ def _immortalise(client) -> None:
 
 def _poison(snap, name, error) -> None:
     """Take *snap* out of service for good, and remember *error* against the
-    bytes it was read from."""
+    bytes it was read from -- beside, never in place of, a failure of the
+    same collection on other bytes."""
     with _GUARD:
         first = not snap.poisoned
         snap.poisoned = True
@@ -450,7 +498,8 @@ def _poison(snap, name, error) -> None:
             del _CURRENT[snap.key]
         if first:
             _POISONED.append(snap)
-        _FAILED[(snap.key, name)] = (snap.fingerprint, error, time.monotonic())
+        _FAILED.setdefault((snap.key, name), {})[snap.fingerprint] = (
+            error, time.monotonic())
     if first:
         _immortalise(snap.client)
         _log.warning("vector_snapshot: a read of the %r index at %s failed "
@@ -460,32 +509,52 @@ def _poison(snap, name, error) -> None:
 
 
 def _refused(key, name, fp, since=None) -> None:
-    """Raise `IndexUnreadable` when a remembered failure answers this read:
-    this collection of these very bytes failed within `FAILED_RETRY_S`, or
-    `POISON_LIMIT` clients are held and ANY collection of this source has
-    failed. Per source, not per collection: capped per collection, a read of
-    `ledger` in an index whose `events` had failed was copied, opened and
-    failed again, and each such sibling kept one more client past the limit.
-    *since*, given on the way in, is when *fp* was taken: a memo *fp* does
-    not match is dropped only if it is older than that. One recorded after
-    it may be of bytes *fp* never saw -- a writer came by, and a reader
-    failed on what it left -- and those may still be the source's: dropped,
-    the reader copied, opened and failed on them again. The checks once the
-    copy is taken never drop one: a copy can be OLDER than the failure.
-    Called under `_GUARD`."""
-    failed = _FAILED.get((key, name))
-    if failed is not None:
-        at, error, when = failed
-        if at == fp and time.monotonic() - when < FAILED_RETRY_S:
-            raise IndexUnreadable(key, name, error)
+    """Raise `IndexUnreadable` when a remembered failure answers this read.
+
+    Collection *name* of these very bytes, *fp*, failed within
+    `FAILED_RETRY_S`: each fingerprint has its own memo. One memo per
+    collection held only the last failure: a failure on older bytes replaced
+    the one on newer bytes, which a reader of those then copied, opened and
+    failed on again; and a way in on newer bytes dropped the memo of older
+    ones that a copy still in flight asked at install, which installed a copy
+    of bytes that had failed over a newer one.
+
+    Or `POISON_LIMIT` clients are held, and this source has a failure, of
+    any of its collections, that no read of that collection has got past
+    since: capped per collection, a
+    read of `ledger` in an index whose `events` had failed was copied,
+    opened and failed again, and each such sibling kept one more client past
+    the limit. *since*, given on the way in, is when *fp* was taken: a way
+    in no memo refuses marks the collection passed at *since*, and failures
+    recorded before that count toward no cap -- they still refuse their own
+    bytes until they expire. Kept for good, a failure refused a source that
+    was repaired and read fine since, until the process restarted. One
+    recorded after *since* may be of bytes *fp* never saw -- a writer came
+    by, and a reader failed on what it left -- so it still counts. Only the
+    way in expires memos and marks: the checks once the copy is taken never
+    do, since a copy can be OLDER than a failure. Called under `_GUARD`."""
+    now = time.monotonic()
+    memo = _FAILED.get((key, name), {})
+    hit = memo.get(fp)
+    if hit is not None and now - hit[1] < FAILED_RETRY_S:
+        raise IndexUnreadable(key, name, hit[0])
     if len(_POISONED) >= POISON_LIMIT:
-        mine = [(n, f) for (k, n), f in _FAILED.items() if k == key]
-        if mine:
-            of, (_at, error, _when) = next(
-                ((n, f) for n, f in mine if n == name), mine[0])
+        standing = [(n == name, when, n, error)
+                    for (k, n), fails in _FAILED.items() if k == key
+                    for error, when in fails.values()
+                    if when >= _PASSED.get((k, n), float("-inf"))]
+        if standing:
+            _own, _when, of, error = max(standing, key=lambda s: s[:2])
             raise IndexUnreadable(key, name, error, capped=True, of=of)
-    if failed is not None and since is not None and failed[2] < since:
-        del _FAILED[(key, name)]
+    if since is None:
+        return
+    live = {f: v for f, v in memo.items() if now - v[1] < FAILED_RETRY_S}
+    if live:
+        _FAILED[(key, name)] = live
+        _PASSED[(key, name)] = max(_PASSED.get((key, name), since), since)
+    else:
+        _FAILED.pop((key, name), None)
+        _PASSED.pop((key, name), None)
 
 
 def _dispose(snap) -> None:
@@ -516,7 +585,7 @@ def _acquire(src, opener, name=None):
     # or of this one, must not wait behind a copytree it does not need.
     _sweep()
     start = time.perf_counter()
-    built_fp, root = _copy_stable(src)
+    built_fp, root, taken = _copy_stable(src)
     copy_ms = (time.perf_counter() - start) * 1000.0
     if root is None:
         return None
@@ -535,7 +604,7 @@ def _acquire(src, opener, name=None):
     except BaseException:
         _remove(root)
         raise
-    fresh = _Snapshot(key, built_fp, root, client, copy_ms)
+    fresh = _Snapshot(key, built_fp, root, client, taken, copy_ms)
     doomed, refusal = [], None
     with _GUARD:
         try:
@@ -548,6 +617,13 @@ def _acquire(src, opener, name=None):
             if snap is not None and snap.fingerprint == built_fp:
                 chosen = snap              # a racing reader copied it first
                 doomed.append(fresh)
+            elif snap is not None and snap.taken > fresh.taken:
+                # A newer copy was installed while this one was opened. This
+                # one serves its reader and goes after it; installed, it took
+                # the newer one's place and closed it, and the next read of
+                # the newer bytes copied the index again.
+                fresh.retired = True
+                chosen = fresh
             else:
                 if snap is not None:
                     snap.retired = True
@@ -570,12 +646,36 @@ def _release(snap) -> None:
         _dispose(snap)
 
 
+def _checked(snap, name, check) -> None:
+    """Raise what *check* says of collection *name* in *snap*'s copy, asked
+    once per copy and collection: the copy's bytes do not change, so neither
+    does the answer. Only an Exception is kept; anything else propagates and
+    is asked again."""
+    with _GUARD:
+        known = snap.checked.get(name, _UNCHECKED)
+    if known is _UNCHECKED:
+        try:
+            check(snap.root / "chroma", name)
+            known = None
+        except Exception as e:                     # noqa: BLE001 -- kept, raised
+            known = e
+        with _GUARD:
+            snap.checked[name] = known
+    if known is not None:
+        raise known.with_traceback(None)
+
+
 @contextmanager
-def reading(src, opener, *, judge=None, name=None):
+def reading(src, opener, *, judge=None, name=None, check=None):
     """Yield `opener(copy)` for a consistent copy of the index at *src*, or
     None when there is no index there -- in which case nothing is opened and
     nothing is created. Raises `SnapshotError` when no consistent copy could
     be taken; whatever *opener* raises propagates, with the copy removed.
+
+    *check(copy, name)*, when given, is asked before collection *name* is
+    read -- once per copy -- and what it raises refuses the read. The client
+    read nothing, so that is never its failure: it is not judged, and the
+    copy stays in service for the collections the check passes.
 
     *judge(exc)* is asked about every exception that leaves the block: true
     means the client itself failed, so it is never closed and collection
@@ -584,6 +684,12 @@ def reading(src, opener, *, judge=None, name=None):
     if snap is None:
         yield None
         return
+    if check is not None:
+        try:
+            _checked(snap, name, check)
+        except BaseException:
+            _release(snap)
+            raise
     try:
         yield snap.client
     except BaseException as e:

@@ -223,8 +223,9 @@ class LocalVectorIndex(VectorIndex):
         list is "no match", "nothing indexed", or -- logged as a warning --
         "every hit was a thin `hive embed` row"; a failure raises
         `vectors.SemanticQueryError`, because a failure and an answer must not
-        look alike. A top_k below 1 asks nothing and is `[]`, as
-        `PgVectorIndex` has it."""
+        look alike -- a panic in the encoder's Rust core included, and no
+        hits from a collection holding rows (`vectors._ask`). A top_k below 1
+        asks nothing and is `[]`, as `PgVectorIndex` has it."""
         name = self._check(collection_name)
         if top_k < 1:
             return []
@@ -235,9 +236,9 @@ class LocalVectorIndex(VectorIndex):
                 return []
             try:
                 vec = self._encode()([text])
-            except Exception as e:                             # noqa: BLE001
-                raise vectors.SemanticQueryError("encode", name, e,
-                                                 self.project) from e
+            except BaseException as e:          # noqa: BLE001 -- re-raised typed
+                raise vectors._as_failure("encode", name, e,
+                                          self.project) from e
             res = vectors._ask(col, name, self.project, query_embeddings=vec,
                                n_results=top_k)
         metas = (res.get("metadatas") or [[]])[0] or []

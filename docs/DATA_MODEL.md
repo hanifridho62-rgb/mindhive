@@ -2378,7 +2378,14 @@ last reader is done. Measured against the real 9.8 MB index: fingerprint
 contention (a scratch writer adding rows while readers looped) a plain
 `copytree` accepted 1 torn copy in 179 and raised on 12 more; the checked copy
 accepted none in 234, and failed with `snapshot` on 15% of reads only while the
-writer never paused (2 in 609 with 0.3 s between writes).
+writer never paused (2 in 609 with 0.3 s between writes). Each file is copied
+with `shutil.copyfile`, not `copytree`'s default `copy2`: under Python 3.14 on
+Windows `copy2` copies through CopyFile2, which denies every other opener write
+access to the file while it copies — measured, a writer opening a 32 MB segment
+file during three copies was refused with `PermissionError` 225 times, and the
+writer refused is `hive embed` or the watcher persisting a segment. `copyfile`
+shares the file for writing; its handle does not share deletion, which SQLite
+retries when it deletes its journal.
 
 Copies live in the temp directory as `mindhive-chroma-read-<pid>-*`, and none
 is left behind silently. A delete Windows refuses — a closed client not yet
@@ -2403,7 +2410,20 @@ again as it is. `[]` means only "nothing matched",
 "nothing is indexed", or a limit below 1 — a search for no hits, answered before
 anything is copied or opened, as `PgVectorIndex.query` answers a `top_k` of 0.
 (`LocalVectorIndex.query` has a third meaning, logged as a warning: every hit
-was a row `hive embed` wrote, too thin to rebuild a record from.) The message
+was a row `hive embed` wrote, too thin to rebuild a record from.) A client that
+answered can still fail a read, as stage `query`: with a hit it returned
+without its document (`MissingDocument`, raised by `vector_errors.text_of` —
+chromadb answers `None` for a stored document it cannot decode, measured on
+invalid UTF-8), or with no hits from a collection holding rows the query could
+have returned (`UnansweredQuery`). Measured on a scratch index whose
+`collections.dimension` was set to NULL: `count` answered 1,300 and every query
+answered nothing, with no error, and `recall` fell back to the file index in
+silence, as it does for an event index never embedded.
+So when a query comes back empty, `vectors._ask` asks the collection for one
+row its `where` matches, or for its count when there is no `where`, and a
+positive answer is the failure. Neither is the client's own failure, so the
+judge claims neither: the copy stays in service, and each read of the same
+bytes fails the same way until they are repaired. The message
 names the project namespace and a remedy chosen by what broke, because the
 repairs differ and one of them does nothing on the wrong damage. A repair that
 runs `hive embed` names the namespace as `--project <ns>`, verbatim: the
@@ -2425,16 +2445,20 @@ of a repository whose name starts with `unsafe-` is enough to meet it.
 | `snapshot` | `space` | the temp directory is full or not writable |
 | `encode` | the embedding model | none on the index: the model failed to load or run |
 | `query` | an argument chromadb refused before touching the index — `ValueError`, `TypeError`, `OverflowError` (an `n_results` past 2**32 − 1), `DuplicateIDError` (an id named twice in one request) | none: the index is not at fault |
-| `query` | the collection — a damaged one, one another model built (a query of the wrong width: `InvalidDimensionException`, or `InvalidArgumentError` "Collection expecting embedding with dimension of 384, got 8"), or a log chromadb cannot read | `hive embed --rebuild --project <ns>`; if the read still fails, delete the `chroma/` directory it names and run `hive embed --project <ns>` |
+| `query` | the collection — a damaged one, one another model built (a query of the wrong width: `InvalidDimensionException`, or `InvalidArgumentError` "Collection expecting embedding with dimension of 8, got 384"), or a log chromadb cannot read | `hive embed --rebuild --project <ns>`; if the read still fails, delete the `chroma/` directory it names and run `hive embed --project <ns>` |
+| `query` | rows the client answered without — a hit without its document (`MissingDocument`), or no hits from a collection holding rows the query could have returned (`UnansweredQuery`) | the same: `--rebuild` first, then the delete. Not claimed by the judge: the client answered |
 | `count` | the collection — whatever the exception, since a count takes no argument a caller chose | the same: `--rebuild` first, then the delete |
-| `open` | a cut `header.bin` in a persisted segment of `ledger` or `events` (`DamagedSegment`, whose `collection` names the owner, whichever collection the read asked for) | the same: `--rebuild` first, then the delete |
-| `open` | anything else — files chromadb cannot open (a `chroma.sqlite3` that is not a database, a collection configuration it cannot deserialize), or a cut segment whose owner the copy's catalogue could not name | delete the `chroma/` directory it names and run `hive embed --project <ns>` — not `--rebuild`, which opens the index the way the read did and fails the same way |
-| `open`, `count`, `query` | the watcher's `mindhive_<slug>` collection — the one read, or the owner of a cut segment | delete the `chroma/` directory and run `hive embed --project <ns>` for `ledger` and `events`; the watcher's collection refills only with rows appended after that. `hive embed` never writes it, `--rebuild` included, so no rebuild is offered |
+| `open` | a cut `header.bin` in a persisted segment of the `ledger` or `events` collection read (`DamagedSegment`, whose `collection` is that one) | the same: `--rebuild` first, then the delete |
+| `open` | anything else — files chromadb cannot open (a `chroma.sqlite3` that is not a database, a collection configuration it cannot deserialize, which fails every read, since a read lists every collection), or a cut segment whose owner the copy's catalogue could not name | delete the `chroma/` directory it names and run `hive embed --project <ns>` — not `--rebuild`, which needs the files open too and fails on them (below) |
+| `open`, `count`, `query` | the watcher's `mindhive_<slug>` collection | delete the `chroma/` directory and run `hive embed --project <ns>` for `ledger` and `events`; the watcher's collection refills only with rows appended after that. `hive embed` never writes it, `--rebuild` included, so no rebuild is offered |
+| any of the above | a read refused past `POISON_LIMIT` (`IndexUnreadable`, `capped`) | the repair of its row, with a restart of this process after the rebuild or the delete — past the cap an index with a failure no read has got past is not read again until the process restarts (item 4 below) — and the delete, after a rebuild, only if a read after the restart still fails |
 
-**Why the rebuild comes first where it does.** `hive embed --rebuild` opens
-the live index as a read does — `get_or_create_collection` — then drops each
-of `ledger` and `events` with `delete_collection` and fills a new one: it never
-reads the dropped collection's segment. Measured on scratch copies of one
+**Why the rebuild comes first where it does.** `hive embed --rebuild` asks
+chromadb for `ledger` and then `events` by name — `get_or_create_collection`,
+each through a client of its own — then drops each with `delete_collection`
+and fills a new one: it never reads the dropped collection's segment. (A read
+lists every collection first, `list_collections`, and then asks for the one it
+reads.) Measured on scratch copies of one
 three-collection index (chromadb 1.5.9; `events` 1,300 rows of width 8, its
 HNSW segment persisted), each damaged one way, read, rebuilt and read again:
 with the `events` segment's `header.bin` cut to 7 bytes or overwritten with
@@ -2445,12 +2469,20 @@ cut `data_level0.bin`, which every read before it had answered without an
 error, and for a cut or a garbage `ledger` header. A garbage `max_seq_id` failed the count and
 the queries with `InternalError` "Error reading from metadata segment reader";
 the rebuild mended `ledger` and `events` and not the watcher's collection,
-which it never writes. Where chromadb cannot open the files the rebuild fails
-as the read had: on a `chroma.sqlite3` whose first 100 bytes are garbage ("file
-is not a database"), and on an `events` configuration it cannot deserialize
-("Could not fetch collections: Could not deserialize configuration"). A cut
-segment of the watcher's collection still refused every read after the
-rebuild. chromadb leaves a dropped collection's segment directory on disk,
+which it never writes. So with a `collections.dimension` set to NULL: before,
+the count answered 1,300 and the damaged collection's queries nothing; the
+rebuild mended `ledger` and `events`, and the watcher's collection still
+answered nothing. Where chromadb cannot open the files the rebuild fails too:
+at its first open on a `chroma.sqlite3` whose first 100 bytes are garbage
+("file is not a database"), and on an `events` configuration it cannot
+deserialize it rebuilt `ledger` and then failed on `events` ("Could not fetch
+collections: Could not deserialize configuration"). That failure went out of
+`hive` as a traceback; `hive embed` now prints one `error:` line — what it
+wrote before the failure, and `vector_errors.embed_failure`'s repair: the
+delete after a failed rebuild, the rebuild first after a failed plain embed, a
+retry behind another writer's lock — and exits 1. A cut segment of the
+watcher's collection still refused every read of it after the rebuild.
+chromadb leaves a dropped collection's segment directory on disk,
 which the catalogue no longer names, so `check_segments` judges only the
 segments the copy's `chroma.sqlite3` names: judging every directory, the cut
 header the rebuild had just dropped refused every read after it.
@@ -2477,7 +2509,11 @@ below 1 with `[]` (in both modes: the keyword path's `[:-3]` was all but the
 last three hits), then asks `indexed_event_count(strict=True)`, so a broken
 event index raises instead of reading as 0 and falling back to the file index
 in silence; the non-strict count, for callers that only display it, logs the
-failure and answers 0. `hive recall --limit` refuses a value below 1 as a usage
+failure and answers 0. An event query that answers nothing from an index
+holding rows it could have returned raises as well (`UnansweredQuery`,
+above), where it fell back to the file index in silence; the file index
+answers only an event query that matched nothing or an event index that holds
+nothing. `hive recall --limit` refuses a value below 1 as a usage
 error (exit 2). `hive recall --semantic` exits **1** on a `SemanticQueryError`;
 it and `hive embed` exit **2** on a refusal (LIVE_LOCK, extras missing), each
 with `error: …` on stderr. `/api/recall` answers a failure with a 500 and the
@@ -2519,31 +2555,53 @@ fails, and then ANY teardown of that client — `close()`, dropping its last
 reference, interpreter exit — corrupts the heap (exit `0xC0000374`). So the
 defence is layered, from cheapest to last resort:
 
-1. `vector_snapshot.check_segments` refuses, before chromadb opens the copy, a
-   persisted segment (one with `index_metadata.pickle`) whose `header.bin` is
-   shorter than `HNSW_HEADER_BYTES`; that surfaces as stage `open`. A
-   never-persisted segment with a short header is harmless and passes, and so
-   does the directory of a segment the copy's `chroma.sqlite3` no longer names
-   — a dropped collection's, which chromadb leaves behind and never opens
-   (`_live_segments`; a catalogue that cannot be read names none, and every
-   segment is judged). `DamagedSegment.collection` names the segment's owner,
-   and the remedy follows it: the check refuses the whole copy, so a read of
-   `ledger` refused for a cut `events` segment is told to rebuild, and one
-   refused for a cut segment of the watcher's collection to delete.
+1. `vector_snapshot.check_segments` refuses a read of a collection whose
+   persisted segment (one with `index_metadata.pickle`) has a `header.bin`
+   shorter than `HNSW_HEADER_BYTES`, before chromadb reads it; that surfaces
+   as stage `open`. It is the reader's check (`reading(check=…)`), asked for
+   the collection read, not the open's: chromadb loads a collection's HNSW
+   segment only once that collection is counted or queried, so with a cut
+   `events` segment `ledger` is read from the same copy, whose client, never
+   having loaded the cut segment, closes as any other.
+   `tests/test_vector_snapshot.py` reads `ledger` beside each of three
+   refused reads of `events` in a child process that closes the copy at exit
+   and lives — 5 runs of 5. Asked at the open, the check refused the whole
+   copy, and with it every read of `ledger` for a cut `events` segment. The
+   answer is kept on the copy, per collection (`_Snapshot.checked`): the
+   copy's bytes do not change, so neither does the answer, and a read of the
+   same copy is refused the same way until the source changes. A refused read
+   read nothing: it is not the client's failure, is never judged, and is not
+   remembered past its copy. A never-persisted segment with a short header is
+   harmless and passes, and so does the directory of a segment the copy's
+   `chroma.sqlite3` no longer names — a dropped collection's, which chromadb
+   leaves behind and never opens (`_live_segments`, which compares segment
+   ids in one form, `_canonical`: chromadb finds a segment's directory by
+   parsing its id as a UUID). A catalogue that cannot be read names no owner,
+   and every segment is judged, whichever collection is read:
+   `DamagedSegment.collection` is then None and the repair is the delete.
+   Otherwise it names the collection read, and the repair is that
+   collection's — the rebuild for `ledger` and `events`, the delete for the
+   watcher's.
 2. A failure `vector_errors.judge` claims as the client's own — stage `open`,
    `count` or `query`, with a cause other than an argument chromadb refused
-   before touching the index (the first `query` row of the table above) —
+   before touching the index (the first `query` row of the table above), and
+   other than rows the client answered without (`MissingDocument`,
+   `UnansweredQuery`: the client answered, so it did not fail, and held for
+   good it would count a readable client toward the cap) —
    poisons that copy: its client is never closed and never freed
    (`_immortalise`), and the copy is left for a later process's dead-pid
    sweep. A panic counts: before `as_failure` wrapped it, it reached no judge
    and its client stayed in service. Claimed, a refused argument poisoned a
    HEALTHY index: its client kept for good and every later read of it refused.
 3. The failure is remembered per (index, collection) against the bytes it
-   happened on: while they are unchanged, the next read of that collection is
+   happened on, each fingerprint in a memo of its own: while those bytes are
+   unchanged, the next read of that collection is
    refused (`IndexUnreadable`, reported as the original stage and cause) instead
    of copied and opened again, until `FAILED_RETRY_S` (600 s) pass — a hiccup
    on an index nobody writes to must not end semantic search for the life of a
-   dashboard. The memo is asked on the way in, again once the copy is taken,
+   dashboard. One memo per collection held only the last failure: a failure
+   on older bytes replaced the one on newer bytes, which the next reader of
+   those copied, opened and failed on again. The memo is asked on the way in, again once the copy is taken,
    and again before the new client is installed: asked only on the way in,
    every reader that overlapped one failure — copied before it, installed
    after — went on to open, read and fail on the same bytes, and kept one more
@@ -2552,26 +2610,36 @@ defence is layered, from cheapest to last resort:
    Measured on copies with a cut or a garbage `header.bin`, a cut
    `data_level0.bin` or `link_lists.bin`: a client that never read closed
    cleanly in each of 5 runs, where one whose count had failed on the cut
-   header corrupted the heap as it closed (`0xC0000374`). The re-checks never
-   drop a memo the copy does not match: a copy taken before a writer came by
-   is older than a failure on what the writer left, and those bytes may still
-   be the source's. For the same reason the way in drops a memo its
-   fingerprint does not match only when the memo is older than that
-   fingerprint: a failure recorded while the fingerprint was taken may be of
-   bytes it never saw — a writer came by, and a reader failed on what it left
-   — and dropped, the memo let the next reader copy, open and fail on them
-   again.
+   header corrupted the heap as it closed (`0xC0000374`). Only the way in
+   forgets, and only a memo older than `FAILED_RETRY_S`, never a live memo of
+   other bytes: a copy taken before a writer came by is older than a failure
+   on what the writer left, and those bytes may still be the source's. A copy
+   never replaces a newer one: each records when its fingerprint was taken
+   (`_Snapshot.taken`), and one opened while a newer copy was installed
+   serves the reader that took it and is closed after it — installed, it took
+   the newer copy's place and closed it, and the next read of the newer bytes
+   copied the index again.
 4. Every poisoned client is held until the process ends, so once
-   `POISON_LIMIT` (16) are held, no collection of a source that has failed is
-   read again until the process restarts, and the message says so. It is
-   reported as the failure of a collection that failed, with that collection's
-   stage and repair: the one read, when it failed itself, else the earliest
-   failure of its source still remembered. Per source, not per (index,
-   collection): capped per
-   collection, each sibling of a failed collection was copied, opened, failed
-   and kept one more client past the limit. A source that first fails after
-   the limit is reached still keeps one, so the bound is the limit plus one
-   per source.
+   `POISON_LIMIT` (16) are held, a source is not read again until the process
+   restarts while it has a standing failure — one of any of its collections
+   that no read of that collection has got past since — and the message says
+   so. Per source, not per (index, collection): capped per collection, each
+   sibling of a failed collection was copied, opened, failed and kept one
+   more client past the limit. A way in that no memo refuses marks its
+   collection passed at the moment its fingerprint was taken (`_PASSED`), and
+   failures recorded before that count toward no cap, though they still
+   refuse their own bytes until they expire: kept for good, a failure refused
+   a source that was repaired and read fine since, until the process
+   restarted. One recorded after it may be of bytes that fingerprint never saw
+   — a writer came by, and a reader failed on what it left — so it counts.
+   The refusal is reported as the failure of a collection that failed, with
+   that collection's stage and repair: the one read, when it has a standing
+   failure itself, else the latest standing failure of its source. Its repair
+   names the restart (the capped row of the table above): past the cap a read
+   after the rebuild is refused as well, so without the restart the rebuild is
+   never read, and "if the read still fails, delete" would delete an index the
+   rebuild had repaired. A source that first fails after the limit is reached
+   still keeps one, so the bound is the limit plus one per source.
 
 A failed `PersistentClient` open leaves chromadb's own registry holding the
 half-built system (`SharedSystemClient._identifier_to_system`, measured: one
@@ -2579,10 +2647,11 @@ entry per failed open, the copy's files still deletable); `open_chroma` pops
 it. On the same damage with fewer rows waiting in the queue — 130 rows at
 `sync_threshold` 100, 35 at 10 — runs of the count with the header check
 stubbed out crashed the process, hung past two minutes, or failed, the outcome
-varying between runs. The check contains all of them: it refuses the copy
-before chromadb reads the segment, and `tests/test_vector_snapshot.py` builds
-both indexes and requires every read to fail as stage `open` with the process
-alive. Damage the check cannot see is met after the fact only where chromadb
+varying between runs. The check contains all of them: it refuses each read
+of the damaged collection before chromadb reads the segment, and
+`tests/test_vector_snapshot.py` builds both indexes and requires every read of
+`events` to fail as stage `open`, every read of `ledger` beside it to answer,
+and the process to live — 5 runs of 5 under the per-collection check. Damage the check cannot see is met after the fact only where chromadb
 raises on it: a `header.bin` of whole length but garbage bytes failed the count
 with `InternalError`, which the judge claims, so the client is poisoned.
 
@@ -2601,7 +2670,8 @@ either cut is repaired — `hive embed --rebuild` left both cut `events`
 indexes answering, measured with the rest above — but the read that would
 make it known is one the process does not survive, or, for the cut data file,
 one that reports nothing. No in-process guard survives a crash or a hang, or
-can tell such an answer from a right one. A read in a child process would contain the first two, and a check
+can tell such an answer from a right one: the unanswered-query guard catches a
+query that answers nothing, never one that answers without its best hits. A read in a child process would contain the first two, and a check
 of the other segment files' lengths might refuse such cuts before chromadb
 opens them; neither is done here.
 

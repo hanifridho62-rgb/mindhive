@@ -39,6 +39,9 @@ class _FakeCollection:
     def query(self, query_embeddings=None, n_results=10):
         return self._query_result
 
+    def count(self):
+        return len(self.added.get("ids") or [])
+
 
 class _ReadClient:
     """What `vectors._reading` yields: a client over a private COPY of the
@@ -221,15 +224,21 @@ class _FakeEventCollection:
         self._query_result = {"documents": [[]], "ids": [[]], "distances": [[]],
                               "metadatas": [[]]}
         self.get_raises = False
+        self.matching = None        # rows a `where` matches; None: every row
+        self.probed = []            # (where, limit) of each `get` by filter
 
     def set_query_result(self, docs, ids, distances, metadatas):
         self._query_result = {"documents": [docs], "ids": [ids],
                               "distances": [distances], "metadatas": [metadatas]}
 
-    def get(self, ids=None):
+    def get(self, ids=None, where=None, limit=None):
         if self.get_raises:
             raise RuntimeError("chroma is unhappy")
-        return {"ids": [i for i in (ids or []) if i in self.present]}
+        if ids is not None:
+            return {"ids": [i for i in ids if i in self.present]}
+        self.probed.append((where, limit))
+        rows = sorted(self.present if self.matching is None else self.matching)
+        return {"ids": rows[:limit] if limit else rows}
 
     def add(self, ids=None, documents=None, embeddings=None, metadatas=None):
         self.batches.append({"ids": list(ids or []),
@@ -537,12 +546,12 @@ def test_a_broken_index_count_raises_when_strict_and_is_logged_otherwise(
 #
 # One remedy for every stage told an operator to rebuild an index that a busy
 # writer, a full temp dir or a missing package had made unreadable. Where the
-# files are damaged, what broke picks the repair: `hive embed --rebuild` opens
-# the live index the way a read does and then drops the collection unread, so
-# it mends a collection that opened and then failed, and not files chromadb
+# files are damaged, what broke picks the repair: `hive embed --rebuild` asks
+# chromadb for `ledger` and then `events` by name and drops each unread, so it
+# mends a collection that opened and then failed, and not files chromadb
 # cannot open at all.
 
-from mindhive import vector_snapshot                  # noqa: E402
+from mindhive import vector_errors, vector_snapshot   # noqa: E402
 
 
 def _snapshot_failure(tmp_path, monkeypatch, reason):
@@ -598,11 +607,12 @@ def test_a_failed_count_is_rebuilt_first_and_then_names_the_directory(
 
 def test_an_index_chromadb_cannot_open_is_deleted_not_rebuilt(tmp_path,
                                                                monkeypatch):
-    """`hive embed --rebuild` opens the index the way a read does before it
-    drops anything. Measured: on a `chroma.sqlite3` that is not a database it
-    failed as the read had, and on a collection whose configuration chromadb
-    could not deserialize it failed to fetch the collections. The delete is
-    the repair that reaches such files."""
+    """`hive embed --rebuild` needs the index files open too. Measured: on a
+    `chroma.sqlite3` that is not a database it failed at its first open, and
+    on an `events` collection whose configuration chromadb could not
+    deserialize -- which fails every read, since a read lists every
+    collection -- it rebuilt `ledger` and then failed on reaching `events`.
+    The delete is the repair that reaches such files."""
     _isolate(tmp_path, monkeypatch)
     _stub_events_backend(monkeypatch, _FakeEventCollection(), [])
     monkeypatch.setattr(vectors, "_reading",
@@ -622,19 +632,18 @@ def _cut(owner):
         collection=owner)
 
 
-def test_a_cut_segment_is_repaired_as_the_collection_it_belongs_to(
-        tmp_path, monkeypatch):
-    """The header check refuses the whole copy, whichever collection was
-    asked for, so the collection a refused read names need not be the one
-    damaged. A cut `events` segment refusing a read of `ledger` is rebuilt
-    -- the rebuild drops it unread -- and a cut segment of the watcher's
-    collection refusing a read of `events` is given the one repair that
-    reaches that collection, the delete."""
+def test_a_cut_segment_is_repaired_as_its_collection_is(tmp_path,
+                                                          monkeypatch):
+    """The header check refuses a read of the collection whose segment is
+    cut, before chromadb reads it. A cut `ledger` or `events` segment is
+    rebuilt -- the rebuild drops it unread -- and a cut segment of the
+    watcher's collection is given the one repair that reaches it, the
+    delete."""
     _isolate(tmp_path, monkeypatch)
     watcher = vectors.collection_name("test")
     _stub_backend(monkeypatch, _FakeCollection())
     monkeypatch.setattr(vectors, "_reading",
-                        _refusing(_cut(vectors.EVENT_COLLECTION)))
+                        _refusing(_cut(vectors.LEDGER_COLLECTION)))
     with pytest.raises(vectors.SemanticQueryError) as err:
         vectors.semantic_recall("x")
     msg = str(err.value)
@@ -642,15 +651,12 @@ def test_a_cut_segment_is_repaired_as_the_collection_it_belongs_to(
         "open", vectors.LEDGER_COLLECTION)
     assert "hive embed --rebuild --project test" in msg
     assert "watcher's collection" not in msg
-    monkeypatch.setattr(vectors, "_reading", _refusing(_cut(watcher)))
-    with pytest.raises(vectors.SemanticQueryError) as err:
-        vectors.indexed_event_count(strict=True)
-    msg = str(err.value)
-    assert (err.value.stage, err.value.collection) == (
-        "open", vectors.EVENT_COLLECTION)
-    assert "--rebuild" not in msg
-    assert f"{watcher!r} is the watcher's collection" in msg
-    assert f"delete {paths.project_dir() / 'chroma'}" in msg
+    for coll, rebuilt in ((vectors.EVENT_COLLECTION, True), (watcher, False)):
+        msg = str(vectors.SemanticQueryError("open", coll, _cut(coll), "test"))
+        assert ("hive embed --rebuild --project test" in msg) is rebuilt, msg
+        assert (f"{watcher!r} is the watcher's collection" in msg) \
+            is not rebuilt, msg
+        assert f"delete {paths.project_dir() / 'chroma'}" in msg
 
 
 def test_a_cut_segment_no_catalogue_names_is_deleted(tmp_path, monkeypatch):
@@ -805,6 +811,10 @@ def test_the_judge_claims_what_the_chroma_client_failed_at_and_no_more():
         assert not vectors._judge(_failed(stage, inner)), stage
     assert not vectors._judge(_failed("query", ValueError("n_results < 1")))
     assert not vectors._judge(inner)
+    # A client that answered is sound, whatever its answer lacked.
+    for answered in (vector_errors.MissingDocument("hit 'b' has no text"),
+                     vector_errors.UnansweredQuery("no hits from 2 rows")):
+        assert not vectors._judge(_failed("query", answered)), answered
 
 
 def test_an_overflowing_argument_is_not_claimed_as_the_clients_failure():
@@ -829,8 +839,8 @@ def test_an_id_named_twice_is_refused_and_a_query_of_the_wrong_width_rebuilt(
     assert not vectors._judge(_failed("query", errors.DuplicateIDError(
         "Expected IDs to be unique, found duplicates of: s1:5")))
     for cause in (errors.InvalidArgumentError(
-                      "Collection expecting embedding with dimension of 384, "
-                      "got 8"),
+                      "Collection expecting embedding with dimension of 8, "
+                      "got 384"),
                   errors.InvalidDimensionException(
                       "Embedding dimension 3 does not match collection "
                       "dimensionality 384")):
@@ -884,6 +894,11 @@ def test_no_argument_is_refused_by_a_step_that_takes_none(tmp_path,
 
 def test_an_index_remembered_as_unreadable_reports_its_failure(tmp_path,
                                                                monkeypatch):
+    """Refused for bytes that failed, a read is mended by the rebuild, which
+    changes them. Refused past the cap, no collection of the index is read
+    again until the process restarts: the advice was the rebuild and then,
+    since the read still failed -- as it must, capped -- the delete of an
+    index the rebuild had just mended. The restart comes before the delete."""
     _isolate(tmp_path, monkeypatch)
     _stub_events_backend(monkeypatch, _FakeEventCollection(), [])
     first = _failed("count", RuntimeError("Failed to apply logs"))
@@ -893,9 +908,31 @@ def test_an_index_remembered_as_unreadable_reports_its_failure(tmp_path,
                                             capped=capped)))
         with pytest.raises(vectors.SemanticQueryError) as err:
             vectors.indexed_event_count(strict=True)
+        msg = str(err.value)
         assert err.value.stage == "count"
-        assert "Failed to apply logs" in str(err.value)
-        assert ("restart" in str(err.value)) is capped
+        assert "Failed to apply logs" in msg
+        assert ("restart this process" in msg) is capped
+        assert ("if a read after the restart still fails" in msg) is capped
+        at = msg.index("rebuild it with `hive embed --rebuild --project test`")
+        if capped:
+            assert at < msg.index("restart this process") < msg.index("delete")
+        else:
+            assert "if the read still fails, delete" in msg
+
+
+def test_a_capped_index_chromadb_cannot_open_is_deleted_then_restarted(
+        tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    _stub_events_backend(monkeypatch, _FakeEventCollection(), [])
+    first = _failed("open", RuntimeError("file is not a database"))
+    monkeypatch.setattr(vectors, "_reading", _refusing(
+        vector_snapshot.IndexUnreadable("src", "events", first, capped=True)))
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        vectors.indexed_event_count(strict=True)
+    msg = str(err.value)
+    assert err.value.stage == "open" and "--rebuild" not in msg
+    assert msg.index(f"delete {paths.project_dir() / 'chroma'}") < msg.index(
+        "then restart this process")
 
 
 def test_a_capped_refusal_is_reported_on_the_collection_that_failed(
@@ -918,7 +955,7 @@ def test_a_capped_refusal_is_reported_on_the_collection_that_failed(
     msg = str(err.value)
     assert (err.value.stage, err.value.collection) == ("query", watcher)
     assert "--rebuild" not in msg and "watcher's collection" in msg
-    assert "restart" in msg
+    assert msg.index("delete") < msg.index("then restart this process")
 
 
 def test_a_quarantined_namespace_is_repaired_the_way_it_was_selected(
@@ -1044,14 +1081,165 @@ def test_a_panic_leaves_the_other_namespaces_and_the_display_count_alone(
     assert "PanicException" in caplog.text
 
 
-def test_an_interrupt_is_not_taken_for_a_failed_read(tmp_path, monkeypatch):
-    """Ctrl-C during a search stops the search; it is no index to repair."""
+class _Silent(_FakeEventCollection):
+    """A collection holding rows that answers every query with none of them
+    -- measured, what an index whose recorded dimension is NULL does. Its
+    count raises *error*, when given one."""
+
+    def __init__(self, error=None):
+        super().__init__(present={"a", "b"})
+        self.error = error
+
+    def count(self):
+        if self.error is not None:
+            raise self.error
+        return super().count()
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("at", ["open", "lookup", "encode", "count",
+                                "strict count", "query", "probe"])
+def test_an_interrupt_is_not_taken_for_a_failed_read(tmp_path, monkeypatch,
+                                                     at, interrupt):
+    """Ctrl-C during a search stops the search; it is no index to repair.
+    Every step's handler takes BaseException, for chromadb's panics, and
+    hands an interrupt back as it is. Wrapped, Ctrl-C while the index was
+    copied printed advice to delete a healthy index and exited 1, a HIVE MIND
+    search went on to the next namespace, and the copy's client was kept for
+    good."""
     _isolate(tmp_path, monkeypatch)
-    _stub_events_backend(monkeypatch, _Angry(KeyboardInterrupt()), [])
+    stop = interrupt()
+    col = {"count": _Angry(stop), "strict count": _Angry(stop),
+           "query": _Angry(stop), "probe": _Silent(stop)}.get(
+               at, _FakeEventCollection())
+    _stub_events_backend(monkeypatch, col, [])
+    if at == "open":
+        monkeypatch.setattr(vectors, "_reading", _refusing(stop))
+    elif at == "lookup":
+        monkeypatch.setattr(vectors, "_reading",
+                            _reading_per_project({None: _PanickyClient(stop)}))
+    elif at == "encode":
+        def _stopped():
+            raise stop
+        monkeypatch.setattr(vectors, "_encoder", _stopped)
+    with pytest.raises(interrupt) as got:
+        if at == "count":
+            vectors.indexed_event_count()
+        elif at == "strict count":
+            vectors.indexed_event_count(strict=True)
+        else:
+            vectors.semantic_recall_events("x")
+    assert got.value is stop
+
+
+def test_an_interrupt_leaves_the_real_snapshot_holding_no_client(
+        tmp_path, monkeypatch):
+    """Through `vector_snapshot.reading` itself: an interrupt in the
+    collection lookup is released like any read. Claimed as the client's
+    failure, it kept that client open for good and refused the index for
+    600 s."""
+    pytest.importorskip("chromadb")
+    _isolate(tmp_path, monkeypatch)
+    monkeypatch.setattr(vector_snapshot, "SNAPSHOT_DIR", tmp_path / "snaps")
+    for attr, empty in (("_CURRENT", {}), ("_ORPHANS", set()),
+                        ("_SWEPT", False), ("_POISONED", []), ("_FAILED", {}),
+                        ("_PASSED", {})):
+        monkeypatch.setattr(vector_snapshot, attr, empty)
+    chroma = paths.project_dir() / "chroma"
+    chroma.mkdir(parents=True)
+    (chroma / "chroma.sqlite3").write_bytes(b"not a database")
+    stop, opened = KeyboardInterrupt(), []
+    monkeypatch.setattr(vector_snapshot, "open_chroma", lambda copy: (
+        opened.append(_PanickyClient(stop)) or opened[-1]))
+    monkeypatch.setattr(vectors, "_require_deps", lambda: None)
     with pytest.raises(KeyboardInterrupt):
+        vectors.indexed_event_count(strict=True)
+    assert len(opened) == 1
+    assert vector_snapshot._POISONED == [] and vector_snapshot._FAILED == {}
+    vector_snapshot.dispose_all()
+
+
+# --- a query that answers nothing from rows it could have returned -------------
+#
+# Measured on a scratch index whose `collections.dimension` was NULL: `count`
+# answered 1300 and every query answered no hits, with no error. `recall` took
+# that for an index with nothing relevant in it and read the file index in
+# silence. A query that answers no hits from a collection holding rows it
+# could have returned has failed; `hive embed --rebuild` repaired `ledger`
+# and `events`, and the watcher's collection is the delete's to repair.
+
+def test_a_query_that_answers_nothing_from_a_full_collection_failed(
+        tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    _stub_events_backend(monkeypatch, _Silent(), [])
+    with pytest.raises(vectors.SemanticQueryError) as err:
         vectors.semantic_recall_events("x")
-    with pytest.raises(KeyboardInterrupt):
-        vectors.indexed_event_count()
+    msg = str(err.value)
+    assert (err.value.stage, err.value.collection) == (
+        "query", vectors.EVENT_COLLECTION)
+    assert isinstance(err.value.__cause__, vector_errors.UnansweredQuery)
+    assert "no hits" in msg and "2 rows" in msg
+    assert "hive embed --rebuild --project test" in msg
+    assert not vectors._judge(err.value), \
+        "the client answered, so its copy is not poisoned"
+
+
+def test_a_file_level_query_that_answers_nothing_from_a_full_index_failed(
+        tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    col = _FakeCollection()
+    _stub_backend(monkeypatch, col)
+    assert vectors.semantic_recall("x") == [], "an empty index is no failure"
+    col.added = {"ids": ["a.md"]}
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        vectors.semantic_recall("x")
+    assert (err.value.stage, err.value.collection) == (
+        "query", vectors.LEDGER_COLLECTION)
+    assert isinstance(err.value.__cause__, vector_errors.UnansweredQuery)
+
+
+def test_a_filtered_query_failed_only_where_its_filter_matched_rows(
+        tmp_path, monkeypatch):
+    """A filter that matches no row answers no hits, and that is an answer.
+    Whether one matches is asked of the collection itself, with the same
+    filter and for one row."""
+    _isolate(tmp_path, monkeypatch)
+    col = _Silent()
+    _stub_events_backend(monkeypatch, col, [])
+    col.matching = set()
+    assert vectors.semantic_recall_events("x", types=["caveat"]) == []
+    col.matching = {"b"}
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        vectors.semantic_recall_events("x", types=["caveat"])
+    assert isinstance(err.value.__cause__, vector_errors.UnansweredQuery)
+    assert col.probed == [({"type": {"$in": ["caveat"]}}, 1)] * 2
+
+
+def test_a_probe_that_fails_is_a_failed_count(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    boom = RuntimeError("Error loading hnsw index")
+    _stub_events_backend(monkeypatch, _Silent(boom), [])
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        vectors.semantic_recall_events("x")
+    assert err.value.stage == "count" and err.value.__cause__ is boom
+    assert vectors._judge(err.value)
+
+
+def test_recall_never_takes_an_unanswered_query_for_an_empty_index(
+        tmp_path, monkeypatch):
+    """The file index is `recall`'s answer to an EMPTY event index, never to
+    one that failed."""
+    from mindhive import recall
+    _isolate(tmp_path, monkeypatch)
+    _stub_events_backend(monkeypatch, _Silent(), [])
+
+    def _files(*_a, **_kw):
+        raise AssertionError("recall fell back to the file index")
+
+    monkeypatch.setattr(vectors, "semantic_recall", _files)
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        recall.recall("x", semantic=True)
+    assert isinstance(err.value.__cause__, vector_errors.UnansweredQuery)
 
 
 # --- a hit chromadb returns without its text -----------------------------------

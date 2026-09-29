@@ -663,6 +663,45 @@ def test_a_panic_in_the_id_probe_is_empty_and_says_why(monkeypatch, caplog):
     assert "PanicException" in caplog.text
 
 
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+def test_an_interrupt_in_the_id_probe_is_raised_not_taken_for_empty(
+        monkeypatch, interrupt):
+    """The probe answers any failure with the empty set, which re-embeds
+    every record. Wrapped as a failed read, Ctrl-C during the watcher's boot
+    recovery was logged as one and the whole claim re-encoded."""
+    col = _Col()
+    stop = interrupt()
+
+    def _raise(**_kw):
+        raise stop
+
+    monkeypatch.setattr(col, "get", _raise)
+    mgr, _c = _mgr(monkeypatch, col)
+    with pytest.raises(interrupt) as got:
+        mgr.already_indexed("proj", ["alpha:1"])
+    assert got.value is stop
+
+
+def test_a_watcher_query_that_answers_nothing_from_its_rows_failed(
+        monkeypatch):
+    """A collection holding rows that answers a query with none of them --
+    measured, a recorded dimension of NULL does this -- has failed. The
+    watcher's collection is the delete's to repair: `hive embed --rebuild`
+    never writes it."""
+    from mindhive import vector_errors
+    col = _Col()
+    mgr, _c = _mgr(monkeypatch, col)
+    assert mgr.semantic_query("proj", "q") == [], "an empty one has not"
+    col.present = {"alpha:1", "alpha:2"}
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        mgr.semantic_query("proj", "q")
+    msg = str(err.value)
+    assert (err.value.stage, err.value.collection) == (
+        "query", vectors.collection_name("proj"))
+    assert isinstance(err.value.__cause__, vector_errors.UnansweredQuery)
+    assert "--rebuild" not in msg and "watcher's collection" in msg
+
+
 def test_the_id_probe_asks_in_batches_sqlite_can_bind(monkeypatch):
     """chromadb binds one SQL variable per id, and SQLite refuses a statement
     with too many: a stale claim of 40k rows made one `get` raise
@@ -853,3 +892,79 @@ def test_the_embed_parser_refuses_a_namespace_no_directory_can_be(capsys):
     with pytest.raises(SystemExit) as exc:
         _build_parser().parse_args(["embed", "--project", "../escape"])
     assert exc.value.code == 2 and "invalid project" in capsys.readouterr().err
+
+
+def _embed_failing(monkeypatch, error, at="events"):
+    """`hive embed` whose *at* pass raises *error*; the passes it asked."""
+    asked = []
+
+    def _pass(which):
+        def run(project=None, force=False, rebuild=False):
+            asked.append(which)
+            if which == at:
+                raise error
+            return {"embedded": 1}
+        return run
+
+    monkeypatch.setattr(vectors, "_require_deps", lambda: None)
+    monkeypatch.setattr(vectors, "embed", _pass("files"))
+    monkeypatch.setattr(vectors, "embed_events", _pass("events"))
+    return asked
+
+
+@pytest.mark.parametrize("rebuild", [True, False])
+def test_an_embed_chromadb_fails_is_one_error_line_and_the_repair(
+        monkeypatch, capsys, rebuild):
+    """Measured on an `events` collection whose configuration chromadb could
+    not deserialize: `hive embed --rebuild` rebuilt `ledger`, then raised
+    InternalError out of `hive` as a traceback. It is one `error:` line and
+    exit 1, saying what was written before the failure and naming the repair:
+    the rebuild when the embed was not one, the delete when it was."""
+    errors = pytest.importorskip("chromadb.errors")
+    from mindhive.commands import maintenance as maint
+    cause = errors.InternalError(
+        "Could not fetch collections: Could not deserialize configuration")
+    asked = _embed_failing(monkeypatch, cause)
+    assert maint.cmd_embed(_embed_args(rebuild=rebuild,
+                                       project="my_proj")) == 1
+    captured = capsys.readouterr()
+    err = captured.err
+    assert captured.out == "" and asked == ["files", "events"]
+    assert err.startswith("error: ") and err.count("\n") == 1, err
+    assert "'ledger'" in err and "'events'" in err and "InternalError" in err
+    assert "Could not deserialize configuration" in err
+    assert f"delete {paths.project_dir('my_proj') / 'chroma'}" in err
+    assert "hive embed --project my_proj" in err
+    assert ("hive embed --rebuild --project my_proj" in err) is not rebuild
+
+
+def test_an_embed_behind_another_writer_says_to_retry(monkeypatch, capsys):
+    from mindhive.commands import maintenance as maint
+    _embed_failing(monkeypatch, core_locks.LockTimeoutError(
+        "chroma_lock: held for 30.0s"), at="files")
+    assert maint.cmd_embed(_embed_args()) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: ") and "retry" in err
+    assert "delete" not in err and "--rebuild" not in err
+    assert "'ledger'" in err
+
+
+def test_an_embed_that_failed_elsewhere_names_no_repair(monkeypatch, capsys):
+    """A model that is not in the local cache is no index to rebuild."""
+    from mindhive.commands import maintenance as maint
+    _embed_failing(monkeypatch, OSError(
+        "all-MiniLM-L6-v2 is not in the local cache"), at="files")
+    assert maint.cmd_embed(_embed_args(rebuild=True)) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: ") and "OSError" in err
+    assert "delete" not in err and "--rebuild" not in err
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+def test_an_interrupted_embed_is_raised(monkeypatch, capsys, interrupt):
+    from mindhive.commands import maintenance as maint
+    stop = interrupt()
+    _embed_failing(monkeypatch, stop)
+    with pytest.raises(interrupt) as got:
+        maint.cmd_embed(_embed_args())
+    assert got.value is stop and capsys.readouterr().err == ""

@@ -8,8 +8,9 @@ import time
 from contextlib import ExitStack, contextmanager
 
 from . import paths, guard
-from .vector_errors import (SemanticQueryError, as_failure as _as_failure,
-                            judge as _judge, text_of as _text)
+from .vector_errors import (SemanticQueryError, UnansweredQuery,
+                            as_failure as _as_failure, judge as _judge,
+                            text_of as _text)
 
 _log = logging.getLogger("mindhive.vectors")
 _MODEL = None
@@ -144,15 +145,17 @@ def _client(project):
 # (`vector_errors`), where the `[]` or `0` it answered made a broken index look
 # exactly like one with nothing relevant in it. `_as_failure` wraps what a step
 # raised, a panic in chromadb's Rust core included; `_judge` tells
-# `vector_snapshot` which failures were the client's own. A hit that came back
-# without its text is a failed query too (`_text`), raised once the client is
-# handed back: the client answered, so its copy is not poisoned.
+# `vector_snapshot` which failures were the client's own. A client that
+# answered can fail a read too, and its copy is not poisoned: a hit that came
+# back without its text (`_text`, asked once the client is handed back), and
+# a query that answered no hits from rows it could have returned (`_ask`).
 
 def _reading(project, name=None):
     """A client on a private copy of *project*'s index, or None when it has
     no index; used as `with _reading(project, name) as client:`. The one place
     a read path meets chromadb, and so the seam the tests replace. Without
-    chromadb it is the extras refusal, before anything is read."""
+    chromadb it is the extras refusal, before anything is read. The copy's
+    segments are checked for collection *name* before it is read."""
     try:
         import chromadb  # noqa: F401
     except ImportError as e:
@@ -160,7 +163,7 @@ def _reading(project, name=None):
     from . import vector_snapshot
     return vector_snapshot.reading(
         paths.project_dir(project) / "chroma", vector_snapshot.open_chroma,
-        judge=_judge, name=name)
+        judge=_judge, name=name, check=vector_snapshot.check_segments)
 
 
 def _existing(client, name):
@@ -185,12 +188,13 @@ def _read_view(project, name, open_col=None):
                 else _open(project, name, client=client))
         except vector_snapshot.IndexUnreadable as e:
             # Reported as the read that failed, on the collection it failed
-            # on -- past the cap that can be a sibling of the one asked for.
+            # on -- past the cap that can be a sibling of the one asked for,
+            # and the repair then ends in a restart.
             first = e.original
             raise SemanticQueryError(
                 getattr(first, "stage", "open"), e.of,
                 getattr(first, "__cause__", None) or first, project,
-                note=e.why) from e
+                note=e.why, restart=e.capped) from e
         except vector_snapshot.SnapshotError as e:
             raise SemanticQueryError("snapshot", name, e, project) from e
         except BaseException as e:                 # noqa: BLE001 -- re-raised typed
@@ -205,11 +209,41 @@ def _embed_query(query, name, project=None):
         raise _as_failure("encode", name, e, project) from e
 
 
+def _answered(res) -> bool:
+    """Whether query result *res* holds a hit, in any column a caller reads
+    hits from."""
+    for key in ("ids", "documents", "metadatas", "distances"):
+        rows = res.get(key) or []
+        if rows and rows[0]:
+            return True
+    return False
+
+
 def _ask(col, name, project=None, **kwargs):
+    """`col.query(**kwargs)`, or the failed query it was. No hits from a
+    collection holding rows the query could have returned is one: measured
+    on an index whose recorded dimension was NULL, `count` answered 1300 and
+    every query nothing, with no error. Asked of the collection only when
+    the query came back empty: for one row its `where` matches, else for its
+    count."""
     try:
-        return col.query(**kwargs)
+        res = col.query(**kwargs)
     except BaseException as e:                     # noqa: BLE001 -- re-raised typed
         raise _as_failure("query", name, e, project) from e
+    if _answered(res):
+        return res
+    where = kwargs.get("where")
+    try:
+        held = (len(col.get(where=where, limit=1).get("ids") or []) if where
+                else int(col.count()))
+    except BaseException as e:                     # noqa: BLE001 -- re-raised typed
+        raise _as_failure("count", name, e, project) from e
+    if held:
+        rows = "rows its filter matches" if where else f"{held} rows"
+        cause = UnansweredQuery(
+            f"the query answered no hits from a collection holding {rows}")
+        raise SemanticQueryError("query", name, cause, project) from cause
+    return res
 
 
 def _open(project, name, *, refill=False, rebuild=False, client=None):
