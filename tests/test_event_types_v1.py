@@ -135,15 +135,31 @@ def test_state_dir_takes_an_explicit_project():
     assert d != paths.state_dir()
 
 
-def test_state_dir_quarantines_a_hostile_project_inside_the_store():
+def test_state_dir_quarantines_a_hostile_project_inside_the_store(tmp_path,
+                                                                  monkeypatch):
     """Joined through `project_dir`, so `../../x` cannot climb out of the store:
-    it lands under the quarantined namespace `namespace_name` hands back."""
-    home = paths.store_home().resolve()
+    it lands under the quarantined namespace `namespace_name` hands back.
+
+    The store sits two levels below `tmp_path`, so the place an UNQUARANTINED
+    join would climb to -- `store_home/../../x` -- is `tmp_path / "x"`, inside
+    this test's own directory. With the autouse store at `tmp_path` itself the
+    probe was `basetemp.parent / "x"`, a directory the test does not own, and a
+    pre-existing `%TEMP%\\x` beside the basetemp failed it while the quarantine
+    held. The canary pins the probe to the hostile value: change `../../x` and
+    the escape moves, and the canary says so before the negative below could
+    pass vacuously against a path nothing was ever going to write."""
+    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path / "a" / "home"))
+    home = paths.store_home()
+    escape = tmp_path / "x"                # where `../../x` climbs to, unquarantined
+    assert (home / "../../x").resolve() == escape.resolve()
+    assert not escape.exists()             # clear beforehand: the negative is armed
+
     d = paths.state_dir("../../x")
-    assert home in d.resolve().parents
+
+    assert home.resolve() in d.resolve().parents
     assert d.parent == paths.project_dir("../../x")
     assert d.parent.name.startswith(paths.QUARANTINE_PREFIX)
-    assert not (home.parent.parent / "x").exists()
+    assert not escape.exists()
 
 
 # --- one semantic append, one entry --------------------------------------------------
