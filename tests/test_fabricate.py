@@ -209,6 +209,30 @@ def test_dispatch_honors_at_and_in_hours(tmp_path):
         fabricate.dispatch(rec["fab_id"], at="weekend", register=_no_timer)
 
 
+@pytest.mark.parametrize("hours", [0, 0.0, -1, -0.5, float("nan"),
+                                   float("inf"), "soon"])
+def test_dispatch_refuses_a_lead_that_is_not_a_positive_number(tmp_path, hours):
+    """`--in-hours 0` and a negative value put the due time at or before now,
+    so the Task Scheduler trigger was armed in the past and never fired -- a
+    dispatch recorded as scheduled while nothing was. Refused the way junk
+    `--at` is: a `ValueError` naming the flag, before any event is written."""
+    rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
+    before = len(events.read_all())
+    with pytest.raises(ValueError, match="--in-hours"):
+        fabricate.dispatch(rec["fab_id"], in_hours=hours, register=_no_timer,
+                           now=T0_EPOCH)
+    assert len(events.read_all()) == before            # nothing recorded
+
+
+def test_dispatch_keeps_a_tiny_lead_at_the_minimum(tmp_path):
+    """A positive lead shorter than the registrar needs is the same dead
+    trigger by a smaller margin; it is lifted to `MIN_LEAD_S`, as `--at` is."""
+    rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
+    p = fabricate.dispatch(rec["fab_id"], in_hours=1e-6, register=_no_timer,
+                           now=T0_EPOCH)
+    assert p["due"] == fabricate._iso(T0_EPOCH + fabricate.MIN_LEAD_S)
+
+
 def test_dispatch_requires_a_compiled_fabrication(tmp_path):
     with pytest.raises(ValueError, match="compile the PRD first"):
         fabricate.dispatch("fab-ghost", register=_no_timer)
@@ -1050,6 +1074,20 @@ def test_cli_compile_dispatch_list(tmp_path, capsys):
     assert cli_mod.main(["fabricate", "list"]) == 0
     out = capsys.readouterr().out
     assert "[fab-toggle]" in out and "runs " in out
+
+
+def test_cli_dispatch_refuses_a_lead_that_is_not_positive(tmp_path, capsys):
+    prd = tmp_path / "prd.md"
+    prd.write_text(PRD_MD, encoding="utf-8")
+    assert cli_mod.main(["fabricate", "compile", str(prd),
+                         "--dir", str(tmp_path), "--id", "fab-toggle"]) == 0
+    capsys.readouterr()
+    for hours in ("0", "-2"):
+        assert cli_mod.main(["fabricate", "dispatch", "fab-toggle",
+                             "--in-hours", hours]) == 2
+        assert "--in-hours" in capsys.readouterr().err
+    assert not [e for e in events.read_all() if e.type == "fabrication"
+                and e.payload.get("action") == "dispatched"]
 
 
 def test_cli_compile_from_learning(tmp_path, capsys, monkeypatch):
