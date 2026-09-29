@@ -23,9 +23,9 @@ one closes a real hole:
   and the arithmetic in this file is the reference the watcher is held to.
 * The marker is a SECONDARY projection; the row is the primary record.
   `post_tool_use` fires on every tool call, so a marker that cannot be read,
-  parsed or published must never lose or delay the row: a corrupt file is
-  replaced, a raising emitter is swallowed, and `append_event` returns the
-  `Event` either way. Every fail-open test here carries a positive control --
+  parsed or appended to must never lose or delay the row: a corrupt line is
+  skipped by every reader, a refused append and a raising emitter are
+  swallowed, and `append_event` returns the `Event` either way. Every fail-open test here carries a positive control --
   the seam was actually reached -- so none of them can pass vacuously against
   a build that emits nothing at all.
 
@@ -60,7 +60,7 @@ from pathlib import Path
 
 import pytest
 
-from mindhive import events, paths
+from mindhive import embedqueue, events, paths
 
 
 # --- helpers ---------------------------------------------------------------------
@@ -92,12 +92,15 @@ def _marker(project=None):
 
 
 def _entries(project=None):
-    """The marker's queue, asserting the documented top-level shape on the way:
-    one object, one key, a list under it."""
-    doc = json.loads(_marker(project).read_text(encoding="utf-8"))
-    assert isinstance(doc, dict) and set(doc) == {"entries"}, doc
-    assert isinstance(doc["entries"], list), doc
-    return doc["entries"]
+    """The marker's queue, asserting the documented shape on the way: one JSON
+    object per line, each carrying exactly the four documented keys."""
+    out = []
+    for line in _marker(project).read_text(encoding="utf-8").splitlines():
+        entry = json.loads(line)
+        assert isinstance(entry, dict), entry
+        assert set(entry) == {"session_id", "segment", "seg_line", "queued_at"}, entry
+        out.append(entry)
+    return out
 
 
 def _physical_line(seg, seg_line):
@@ -195,14 +198,19 @@ def test_the_marker_lands_in_the_namespace_the_append_targets():
     assert (paths.events_dir("other") / entry["segment"]).is_file()
 
 
-def test_the_marker_document_is_the_documented_shape():
-    """`{"entries": [...]}` serialised with `json.dumps(queue, indent=2)`,
-    verbatim PDF 8.1 -- the watcher parses this, so the shape is a contract."""
+def test_the_marker_line_is_the_documented_shape():
+    """One entry, one line: the object compact, its keys sorted, ASCII only,
+    newline-terminated -- the watcher parses this, so the shape is a
+    contract. (PDF 8.1 spelled a `{"entries": [...]}` document; that shape is
+    still READ, see `embedqueue.load_entries`, but no longer written, because
+    a document has to be rewritten whole on every append.)"""
     _decision("one")
-    text = _marker().read_text(encoding="utf-8")
-    doc = json.loads(text)
-    assert set(doc) == {"entries"}
-    assert text == json.dumps(doc, indent=2)
+    raw = _marker().read_bytes()
+    assert raw.endswith(b"\n") and raw.count(b"\n") == 1 and raw.isascii()
+    entry = json.loads(raw)
+    assert set(entry) == ENTRY_KEYS
+    assert raw == json.dumps(entry, sort_keys=True,
+                             separators=(",", ":")).encode() + b"\n"
 
 
 # --- entries accumulate; seg_line is the 1-based physical line ------------------------
@@ -369,29 +377,37 @@ def test_a_deterministic_append_alone_creates_no_marker_and_no_state_dir():
     assert [e["seg_line"] for e in _entries()] == [3]
 
 
-# --- a corrupt or foreign marker is replaced, a valid one is extended ------------------
+# --- a corrupt or foreign marker is appended to, a valid one is extended ---------------
 
 @pytest.mark.parametrize("junk", CORRUPT_MARKERS)
-def test_a_corrupt_marker_is_replaced_not_raised(junk):
+def test_a_corrupt_marker_is_appended_to_not_raised(junk):
+    """A corrupt marker used to be REPLACED on the next append -- which cost
+    the read the append no longer makes. It is appended to instead: the junk
+    is skipped by every reader, and the new entry, on a line of its own even
+    after a tail with no newline, is what they see."""
     _marker().parent.mkdir(parents=True, exist_ok=True)
     _marker().write_bytes(junk)
     ev = _decision("one")
     assert isinstance(ev, events.Event)
-    (entry,) = _entries()
+    assert _marker().read_bytes().startswith(junk)     # not replaced
+    (entry,) = embedqueue.load_entries(_marker())
     assert set(entry) == ENTRY_KEYS
     assert entry["session_id"] == "s1" and entry["seg_line"] == 1
     assert _physical_line(paths.events_dir() / "s1.jsonl", 1)["payload"] == {"text": "one"}
 
 
 def test_a_valid_existing_queue_is_preserved_and_extended():
-    """Entries ACCUMULATE. The watcher is the only consumer and the only
-    truncator; the append path never drops what an earlier append queued."""
+    """Entries ACCUMULATE. The watcher is the only consumer and, below the
+    bound, the only truncator; the append path never drops what an earlier
+    append queued. Seeded in the DOCUMENT shape an older writer left, so this
+    is also the upgrade path: the document's rows and the appended lines are
+    read together."""
     seed = {"session_id": "older", "segment": "older.jsonl", "seg_line": 7,
             "queued_at": "2026-09-13T00:00:00Z"}
     _marker().parent.mkdir(parents=True, exist_ok=True)
     _marker().write_text(json.dumps({"entries": [seed]}, indent=2), encoding="utf-8")
     _decision("one")
-    entries = _entries()
+    entries = embedqueue.load_entries(_marker())
     assert entries[0] == seed
     assert len(entries) == 2
     assert entries[1]["session_id"] == "s1" and entries[1]["seg_line"] == 1
@@ -466,23 +482,28 @@ def test_a_raising_emitter_never_loses_the_row(monkeypatch):
     assert calls == [1, 2]
 
 
-def test_a_marker_publish_the_os_refuses_never_loses_the_row(monkeypatch):
-    """The Windows shape of the failure: `os.replace` denied by a reader
-    holding the destination. The publish goes through `paths.write_text_atomic`
-    and nowhere else, so refusing THAT is refusing the marker."""
+def test_a_marker_append_the_os_refuses_never_loses_the_row(monkeypatch):
+    """The OS refusing the queue itself: a directory sits where the file
+    should be, so the append's `open(..., "a")` is denied (`IsADirectoryError`
+    on POSIX, `PermissionError` on Windows). The row must still land, and the
+    lock must still be released."""
+    _marker().mkdir(parents=True)
+    real = events._emit_pending_embed_marker
     calls = []
 
-    def denied(path, text):
-        calls.append(Path(path))
-        raise PermissionError(5, "sharing violation", str(path))
+    def spy(*args):
+        calls.append(args)
+        return real(*args)
 
-    monkeypatch.setattr(paths, "write_text_atomic", denied)
+    monkeypatch.setattr(events, "_emit_pending_embed_marker", spy)
     ev = _decision("kept")
     assert isinstance(ev, events.Event)
-    assert calls == [_marker()]                  # positive control: it was attempted
+    assert calls == [(None, "s1", "s1.jsonl", 1)]   # positive control: attempted
     assert _physical_line(paths.events_dir() / "s1.jsonl", 1)["payload"] == {"text": "kept"}
-    assert not _marker().exists()
+    assert _marker().is_dir() and list(_marker().iterdir()) == []
     assert [e.payload["text"] for e in events.read_all()] == ["kept"]
+    # And the lock was released: the next append is not wedged.
+    assert _decision("also kept").payload == {"text": "also kept"}
 
 
 def test_an_unreadable_segment_skips_the_marker_never_the_row(monkeypatch):
@@ -491,15 +512,17 @@ def test_an_unreadable_segment_skips_the_marker_never_the_row(monkeypatch):
     appendable but unreadable (a deny-read ACE, mode 0o200, an EIO from the
     read) must therefore still take the row -- and the marker is skipped
     rather than filed under line 1, because a wrong line would make the
-    watcher embed the wrong row, which is worse than no marker at all."""
+    watcher embed the wrong row, which is worse than no marker at all.
+    `embedqueue.newline_cursor` answers None for such a segment (its own
+    tests cover the raise); this pins what `append_event` does with None."""
     calls = []
     emitted = []
 
-    def unreadable(path):
+    def unreadable(path, prior=None):
         calls.append(Path(path))
-        raise PermissionError(13, "read denied", str(path))
+        return None                # what `embedqueue.newline_cursor` answers
 
-    monkeypatch.setattr(events, "_count_newlines", unreadable)
+    monkeypatch.setattr(events, "_newline_cursor", unreadable)
     monkeypatch.setattr(events, "_emit_pending_embed_marker",
                         lambda *a: emitted.append(a))
     ev = _decision("kept")
@@ -516,29 +539,35 @@ def test_an_unreadable_segment_skips_the_marker_never_the_row(monkeypatch):
 
 # --- cross-platform: atomic publish, retrying read ---------------------------------------
 
-def test_the_marker_is_published_through_write_text_atomic(monkeypatch):
+def test_a_semantic_append_adds_one_line_and_rewrites_nothing(monkeypatch):
+    """The queue used to be one JSON document, re-serialised and published
+    through `write_text_atomic` on every semantic append -- a rewrite that grew
+    with the queue, inside the append lock. An append is now one line
+    appended: the earlier bytes are untouched and nothing is published."""
     real = paths.write_text_atomic
     calls = []
 
     def spy(path, text):
-        calls.append((Path(path), text))
+        calls.append(Path(path))
         real(path, text)
 
     monkeypatch.setattr(paths, "write_text_atomic", spy)
     _decision("one")
+    first = _marker().read_bytes()
     _decision("two")
-    marker_calls = [(p, t) for p, t in calls if p == _marker()]
-    assert len(marker_calls) == 2
-    assert json.loads(marker_calls[-1][1])["entries"] == _entries()
+    second = _marker().read_bytes()
+    assert _marker() not in calls, "the append path re-published the whole queue"
+    assert second.startswith(first) and second.count(b"\n") == 2
     assert [e["seg_line"] for e in _entries()] == [1, 2]
-    # No private temp name left behind by a publish that landed.
+    # No private temp name left behind either.
     assert list((paths.project_dir() / "state").glob("*.tmp")) == []
 
 
-def test_an_existing_marker_is_read_through_read_text_retry(monkeypatch):
-    """A concurrent watcher `os.replace`-ing the marker can deny a plain
-    `read_text` on Windows for the instant it holds the destination; the
-    retrying reader is the mirror of the retrying writer."""
+def test_a_semantic_append_reads_nothing_back(monkeypatch):
+    """The other half of the old cost: the document had to be READ before it
+    could be re-serialised. An append reads no queue at all; the readers that
+    remain (compaction, recovery, the watcher) go through `read_text_retry`,
+    which `tests/test_embedqueue.py` holds them to."""
     real = paths.read_text_retry
     reads = []
 
@@ -548,9 +577,8 @@ def test_an_existing_marker_is_read_through_read_text_retry(monkeypatch):
 
     monkeypatch.setattr(paths, "read_text_retry", spy)
     _decision("one")
-    reads.clear()
     _decision("two")
-    assert _marker() in reads
+    assert _marker() not in reads
     assert [e["seg_line"] for e in _entries()] == [1, 2]
 
 

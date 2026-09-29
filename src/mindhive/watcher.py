@@ -16,7 +16,7 @@ person can point at --
 * `hive watcher run --once`, one cycle and out,
 * `hive embed`, which walks the whole eligible set rather than the queue.
 
-Four things here are load-bearing.
+Five things here are load-bearing.
 
 **The marker lifecycle is a rename (PDF 4.4.1).** `pending_embed.json` is
 renamed to `processing_embed_<ts>.json` before anything is read from it. The
@@ -44,8 +44,16 @@ holds a single segment, and the same one the migration engine (P1i) carries
 across segments in name order to reproduce the global head. It is NOT a
 whole-ledger fold: that would be the unbounded scan CLAUDE.md forbids, run on
 every append.
+
+**Without the vector extras, nothing is claimed.** `chromadb` and
+`sentence_transformers` are optional (`pip install -e .[vectors]`), and a
+watcher that claimed a queue it could not embed used to append
+`vector_sync_started`, fail on the import inside `embed_batch`, and leave the
+claim on disk -- every two seconds, in every namespace with a pending row.
+`run_once` asks `vectors.missing_extras()` first, leaves the queue where it is
+(bounded by `embedqueue.QUEUE_MAX_BYTES`) and says why once. Claims are
+idempotent besides: a row a claim names twice is embedded once.
 """
-import json
 import os
 import sys
 import threading
@@ -249,22 +257,12 @@ def read_physical_record(session_id, seg_line, segment=None, project=None):
 
 
 # --- the queue file ----------------------------------------------------------
-
-def _entries(path) -> list:
-    """The entries a marker holds; `[]` for anything that is not the
-    documented shape. A corrupt claim must be clearable, not immortal."""
-    try:
-        doc = json.loads(Path(path).read_text(encoding="utf-8"))
-    except Exception:                                      # noqa: BLE001
-        return []
-    if isinstance(doc, dict) and isinstance(doc.get("entries"), list):
-        return [e for e in doc["entries"] if isinstance(e, dict)]
-    return []
-
-
-def _entry_id(entry) -> str:
-    return f"{entry.get('session_id')}:{entry.get('seg_line')}"
-
+#
+# Its readers live in `embedqueue` (`load_entries`, `entry_key`,
+# `dedupe_entries`): one module, so the producer and the consumer cannot
+# disagree about the file's shape -- one JSON object per line, and the
+# `{"entries": [...]}` document it used to be, which a claim an older watcher
+# took may still hold.
 
 def _reconcile(project, entries) -> list:
     """Drop the entries whose vectors already exist (PDF 4.5 step 3), so a
@@ -278,17 +276,17 @@ def _reconcile(project, entries) -> list:
     try:
         from . import vectors
         have = vectors.VectorStoreManager.get_instance(project).already_indexed(
-            project_slug(project), [_entry_id(e) for e in entries])
+            project_slug(project), [embedqueue.entry_key(e) for e in entries])
     except Exception as e:                                 # noqa: BLE001
         _log.warning("watcher: could not reconcile against the index: %s", e)
         return entries
-    return [e for e in entries if _entry_id(e) not in have]
+    return [e for e in entries if embedqueue.entry_key(e) not in have]
 
 
 def status(project=None) -> dict:
     """How much work is waiting and how much is claimed. Never mkdirs."""
     sdir = _state_dir(project)
-    pending = _entries(sdir / embedqueue.MARKER_NAME)
+    pending = embedqueue.load_entries(sdir / embedqueue.MARKER_NAME)
     markers = sorted(p.name for p in sdir.glob(PROCESSING_GLOB)) \
         if sdir.exists() else []
     return {"pending": len(pending), "processing": len(markers),
@@ -313,9 +311,15 @@ def recover_stale_markers(project=None, stale_s=STALE_MARKER_S) -> int:
     for marker in sorted(sdir.glob(PROCESSING_GLOB)):
         if not is_stale(marker, stale_s):
             continue
-        entries = _reconcile(project, _entries(marker))
+        entries = _reconcile(project, embedqueue.load_entries(marker))
         if entries:
-            embedqueue.requeue_entries(project, entries)
+            # Under the APPEND lock, which every appender holds while it
+            # writes the queue: the merge reads the queue and publishes over
+            # it, and a line appended between the two would be lost to the
+            # publish. Recovery is rare (boot, `hive watcher recover`) and
+            # the merge is milliseconds; the lock fails open past its wait.
+            with events._append_lock(project):
+                embedqueue.requeue_entries(project, entries)
         try:
             marker.unlink()
         except OSError as e:                               # noqa: BLE001
@@ -341,6 +345,7 @@ class BackgroundEmbeddingWatcher:
         self.out = out
         self._stop = threading.Event()
         self._thread = None
+        self._told_missing_extras = False
 
     @staticmethod
     def _interval(given) -> float:
@@ -382,16 +387,27 @@ class BackgroundEmbeddingWatcher:
         return target
 
     def process_marker(self, marker) -> dict:
-        """Embed everything one claim names, then unlink it.
+        """Embed everything one claim names, each row once, then unlink it.
 
         `{"marker", "count", "duration_s"}`, plus `"error"` when the embed
         raised -- in which case the claim is LEFT ON DISK. Unlinking a failed
         claim would drop the rows silently: the marker is the only record that
         they were never indexed, and the next boot's recovery is what gets
-        them back."""
+        them back. Plus `"skipped"`, with the reason, when the vector extras
+        are missing: then nothing is read, appended or unlinked -- the claim
+        waits, intact, for the install that can drain it, and no sync row is
+        written for a sync that never happened."""
         marker = Path(marker)
+        reason = self._missing_extras()
+        if reason is not None:
+            return {"marker": marker.name, "count": 0, "duration_s": 0.0,
+                    "skipped": reason}
         started = time.monotonic()
-        entries = _entries(marker)
+        # Each row once, whatever the claim repeats (a claim recovered twice, a
+        # line the append path wrote again): chromadb refuses an `add` that
+        # repeats an id, which failed the whole batch and left the claim to be
+        # recovered -- and refused -- again.
+        entries = embedqueue.dedupe_entries(embedqueue.load_entries(marker))
         records = [r for r in (read_physical_record(
             e.get("session_id"), e.get("seg_line"), e.get("segment"),
             self.project) for e in entries) if r is not None]
@@ -452,11 +468,37 @@ class BackgroundEmbeddingWatcher:
     # --- cycles --------------------------------------------------------------
 
     def run_once(self) -> dict:
-        """Claim the queue and drain it. `count` 0 when there was nothing."""
+        """Claim the queue and drain it. `count` 0 when there was nothing.
+
+        Without the vector extras nothing is claimed either: the queue stays
+        where it is -- bounded, `embedqueue.QUEUE_MAX_BYTES` -- for the install
+        that can drain it, the result carries `skipped` and the reason, and the
+        reason is said once per watcher rather than once per tick. It used to
+        claim, append `vector_sync_started`, fail on the import inside
+        `embed_batch` and leave the claim on disk: every two seconds, in every
+        namespace with a pending row, a sync row for a sync that never happened
+        and a claim for recovery to chew on. An idle queue asks no question."""
+        idle = {"marker": None, "count": 0, "duration_s": 0.0}
+        if not (_state_dir(self.project) / embedqueue.MARKER_NAME).exists():
+            return idle
+        reason = self._missing_extras()
+        if reason is not None:
+            return {**idle, "skipped": reason}
         marker = self.claim()
-        if marker is None:
-            return {"marker": None, "count": 0, "duration_s": 0.0}
-        return self.process_marker(marker)
+        return idle if marker is None else self.process_marker(marker)
+
+    def _missing_extras(self):
+        """`vectors.missing_extras()`, said once: to *out* (the CLI's stdout,
+        the dashboard job's ring) and to the log, the first time it is asked.
+        Asked again every cycle that has work, so an install made while the
+        dashboard runs is noticed without a restart."""
+        from . import vectors
+        reason = vectors.missing_extras()
+        if reason is not None and not self._told_missing_extras:
+            self._told_missing_extras = True
+            _log.warning("watcher: %s", reason)
+            self._write(f"{PROGRESS_PREFIX} skipped: {reason}\n")
+        return reason
 
     def recover(self, stale_s=STALE_MARKER_S) -> int:
         return recover_stale_markers(self.project, stale_s)
