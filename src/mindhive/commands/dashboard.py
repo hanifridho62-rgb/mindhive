@@ -289,8 +289,25 @@ def cmd_harvest(args) -> int | None:
             projector.project(proj)
         print(json.dumps(res))
     elif args.transcripts and args.project:
-        print(json.dumps(harvest_mod.harvest(args.transcripts, args.project,
-                                             skip_captured=not args.include_captured)))
+        # The same mutex `catch_up` holds. The dashboard's auto-harvest tick
+        # reaches `harvest.harvest` under it, and `harvest.harvest` stamps each
+        # event with the transcript line's own timestamp, so a direct run
+        # racing that tick over one directory appends byte-identical rows the
+        # canonical serialiser cannot tell apart -- permanent, in an
+        # append-only, hash-chained ledger. The lock wraps the CALL rather than
+        # `harvest.harvest` itself: `_catch_up_unlocked` calls that while the
+        # lock is already held, and a second acquisition from inside would be
+        # refused.
+        with harvest_mod._harvest_lock() as got:
+            if got:
+                res = harvest_mod.harvest(args.transcripts, args.project,
+                                          skip_captured=not args.include_captured)
+            else:
+                # Refused, exit 0, like `--catch-up`: the keys `harvest.harvest`
+                # returns, zeroed, so a caller reading counts never KeyErrors.
+                res = {"processed_files": 0, "new_events": 0, "skipped_captured": 0,
+                       "unclosed_skill_calls": 0, "locked": True}
+        print(json.dumps(res))
     else:
         print("error: give --transcripts and --project, or use --catch-up", file=sys.stderr)
         return 2

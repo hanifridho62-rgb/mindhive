@@ -180,6 +180,18 @@ history and grouped by what each release window introduced. They summarise;
 
 ### Fixed
 
+- **`hive harvest --transcripts D --project P` now takes the harvest lock.**
+  The direct path of `cmd_harvest` called `harvest.harvest` with no mutex,
+  while `--catch-up` and the dashboard's auto-harvest tick run under
+  `harvest._harvest_lock()`. `harvest.harvest` stamps each event with the
+  transcript line's own timestamp, so a direct run racing that tick over the
+  same directory could append byte-identical rows the canonical serialiser
+  cannot distinguish -- permanent, in an append-only, hash-chained ledger.
+  While another harvester holds the lock the command now prints the shape
+  `harvest.harvest` returns with zero counts plus `"locked": true` and exits
+  0, the same refusal `--catch-up` gives; the cursor is left alone, so the
+  next run picks the lines up. `harvest.harvest` itself is unchanged:
+  `_catch_up_unlocked` calls it while the lock is already held.
 - **The embedding watcher no longer records syncs that never happened.**
   Without the vector extras (`pip install -e .[vectors]`) it claims nothing,
   leaves the queue for the install that can drain it, and says why once per

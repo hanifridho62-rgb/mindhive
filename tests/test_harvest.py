@@ -3,6 +3,7 @@ import json
 import os
 import time
 from mindhive import harvest, hookcapture, events, paths
+from mindhive import __main__ as cli
 
 
 def _isolate(tmp_path, monkeypatch):
@@ -331,6 +332,48 @@ def test_catch_up_releases_lock(tmp_path, monkeypatch):
     root = tmp_path / "projects"
     monkeypatch.setattr(harvest, "claude_projects_root", lambda: root)
     harvest.catch_up(known_only=False)
+    assert not (paths.store_home() / "harvest.lock").exists()
+
+
+def test_direct_harvest_refused_while_lock_held_then_harvests_after_release(
+        tmp_path, monkeypatch, capsys):
+    """`hive harvest --transcripts D --project P` takes the same mutex `catch_up`
+    holds. The dashboard's auto-harvest tick reaches `harvest.harvest` under
+    it, and `harvest.harvest` stamps each event with the transcript line's own
+    timestamp -- so a direct run racing that tick over one directory appends
+    byte-identical rows the canonical serialiser cannot tell apart, permanent
+    in an append-only, hash-chained ledger. While the lock is held the command
+    must refuse: exit 0, `locked: true`, zero counts in the shape a successful
+    run returns, nothing appended, cursor untouched. Once released, the same
+    command harvests."""
+    _isolate(tmp_path, monkeypatch)
+    tdir = tmp_path / "tx"
+    _write_transcript(tdir, "s1", [_tooluse("Edit", {"file_path": "a.py"})])
+    argv = ["harvest", "--transcripts", str(tdir), "--project", "test"]
+
+    with harvest._harvest_lock() as held:
+        assert held is True                 # the test itself is the other harvester
+        rc = cli.main(argv)
+        refused = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert refused["locked"] is True
+    assert refused["new_events"] == 0
+    assert [e for e in events.read_all("test") if e.type == "file_touched"] == []
+
+    # Released: the SAME command over the SAME transcript now harvests. That
+    # also proves the refusal left the cursor alone (an advanced cursor would
+    # make this run find nothing) and that the input was harvestable at all --
+    # the silence above was the lock, not an empty directory.
+    rc = cli.main(argv)
+    harvested = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert not harvested.get("locked")
+    assert harvested["new_events"] == 1
+    assert len([e for e in events.read_all("test") if e.type == "file_touched"]) == 1
+    # The refusal carries every key a successful run returns (plus `locked`),
+    # so a caller reading counts off either result never KeyErrors.
+    assert set(refused) == set(harvested) | {"locked"}
+    # And the direct path releases the lock after a normal run.
     assert not (paths.store_home() / "harvest.lock").exists()
 
 
