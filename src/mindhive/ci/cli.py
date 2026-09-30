@@ -233,15 +233,36 @@ def _ci_rows(args) -> list:
 def _print_ci(row) -> None:
     print(f"PR #{row.get('pr_id', 0)} on {row.get('branch') or '(no branch)'}")
     print(f"{row.get('gate') or 'unknown gate'}: exit {row.get('exit_code')}")
+    if row.get("verdict"):
+        print(f"verdict: {row['verdict']}"
+              + (f" -- {row['reason']}" if row.get("reason") else ""))
     print(f"mode: {row.get('mode') or 'unknown'}, "
           f"merge: {row.get('merge_state') or 'unknown'}")
     counts = row.get("counts") or {}
     if counts:
         print("counts: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
+    legs = [leg for leg in row.get("legs") or [] if isinstance(leg, dict)]
+    if legs:
+        tally = {}
+        for leg in legs:
+            state = str(leg.get("state") or "unknown")
+            tally[state] = tally.get(state, 0) + 1
+        missing = [str(u.get("name")) for u in row.get("unavailable") or []
+                   if isinstance(u, dict)]
+        print("legs: " + ", ".join(f"{n} {s}" for s, n in sorted(tally.items()))
+              + ("; not run: " + ", ".join(missing) if missing else ""))
     if row.get("commit_sha"):
         print(f"commit: {row['commit_sha'][:12]}")
     if row.get("artifact"):
         print(f"artifact: {row['artifact']}")
+
+
+def _green(row) -> bool:
+    """A pre-merge run is judged by its verdict: its exit 3 is a green run whose
+    `--merge` did not happen, and calling that red would misreport the tests."""
+    if row.get("gate") == "premerge":
+        return row.get("verdict") == "green"
+    return int(row.get("exit_code") or 0) == 0
 
 
 def cmd_ci_status(args) -> int:
@@ -259,7 +280,7 @@ def cmd_ci_status(args) -> int:
         print(json.dumps(row, ensure_ascii=False, sort_keys=True))
     else:
         _print_ci(row)
-    return 0 if int(row.get("exit_code") or 0) == 0 else 1
+    return 0 if _green(row) else 1
 
 
 # --- `hook-install`: put the gate where pushes pass ---------------------------------------
@@ -374,3 +395,6 @@ def register(subparsers) -> None:
     reset.add_argument("--json", action="store_true",
                        help="machine-readable report")
     reset.set_defaults(func=cmd_ci_breaker_reset)
+
+    from . import premerge_cli      # lazy: its handlers import what they run
+    premerge_cli.register(group)

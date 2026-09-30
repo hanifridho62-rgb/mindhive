@@ -171,8 +171,11 @@ SURFACE = {'append': {},
  # blueprint P1f: QUARANTINED is reachable and `manual_reset` is its only exit,
  # so the breaker verbs shipped WITH the state rather than waiting for P1g.
  # P1g added the gate itself: `run`, `status` and `hook-install`.
+ # The native pre-merge CI (spec 2026-09-30) added `premerge`, `watch`,
+ # `conflicts` and `legs`, registered by `ci.premerge_cli`.
  'ci': {'run': {}, 'status': {}, 'hook-install': {},
-        'breaker': {'status': {}, 'reset': {}}},
+        'breaker': {'status': {}, 'reset': {}},
+        'premerge': {}, 'watch': {}, 'conflicts': {}, 'legs': {}},
  'watcher': {'run': {}, 'status': {}, 'recover': {}},
  # blueprint P1i: the DATA half of `hive pg migrate`'s SCHEMA. Registered
  # last, so it sits at the tail of this list as well as of `hive --help`.
@@ -334,9 +337,13 @@ LEAF_HANDLERS = {'append': 'cmd_append',
  'worksession status': 'cmd_worksession',
  'ci breaker reset': 'cmd_ci_breaker_reset',
  'ci breaker status': 'cmd_ci_breaker_status',
+ 'ci conflicts': 'cmd_ci_conflicts',
  'ci hook-install': 'cmd_ci_hook_install',
+ 'ci legs': 'cmd_ci_legs',
+ 'ci premerge': 'cmd_ci_premerge',
  'ci run': 'cmd_ci_run',
  'ci status': 'cmd_ci_status',
+ 'ci watch': 'cmd_ci_watch',
  'watcher recover': 'cmd_watcher_recover',
  'watcher run': 'cmd_watcher_run',
  'watcher status': 'cmd_watcher_status',
