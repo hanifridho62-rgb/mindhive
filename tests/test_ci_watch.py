@@ -213,3 +213,27 @@ def test_a_run_of_fewer_legs_than_the_watch_asks_for_is_tested_again():
     assert narrow.once()[0]["action"] == "unchanged" and pm.runs == []
     wide, _ = watcher(pm)
     assert wide.once()[0]["action"] == "tested" and pm.runs == [(151, None, False)]
+
+
+def test_a_red_pr_whose_base_moves_but_still_merges_stays_red_without_a_rerun():
+    remembered(verdict="red")
+    pm = FakePremerge(FakeGitHub(), base=NEWBASE)
+    w, _ = watcher(pm, merge_tree=MergeTree((TREE2, (), "")))
+    action = w.once()[0]
+    assert (action["action"], action["verdict"]) == ("base-moved", "red") and pm.runs == []
+
+def test_a_pr_retargeted_to_another_base_is_tested_again():
+    remembered()
+    pm = FakePremerge(FakeGitHub([pr(base="release")]))
+    w, _ = watcher(pm)
+    assert w.once()[0]["action"] == "tested" and pm.runs == [(151, None, False)]
+
+def test_a_conflict_over_many_files_names_five_and_counts_the_rest():
+    remembered()
+    gh = FakeGitHub()
+    pm = FakePremerge(gh, base=NEWBASE)
+    files = tuple(f"src/f{i}.py" for i in range(7))
+    w, _ = watcher(pm, merge_tree=MergeTree((TREE2, files, "")))
+    detail = w.once()[0]["detail"]
+    assert detail.endswith("src/f0.py, src/f1.py, src/f2.py, src/f3.py, src/f4.py and 2 more")
+    assert gh.statuses[0][3] == detail

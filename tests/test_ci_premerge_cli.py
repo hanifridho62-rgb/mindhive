@@ -10,6 +10,7 @@ import pytest
 from mindhive import __main__ as cli_mod
 from mindhive import events
 from mindhive.ci import cli as ci_cli
+from mindhive.ci import github as gh_mod
 from mindhive.ci import legrun, legs, premerge, premerge_cli, preview, watch
 
 
@@ -213,3 +214,103 @@ def test_status_judges_a_premerge_run_by_its_verdict_and_names_its_legs(capsys):
     events.append_event("verification", {**payload, "verdict": "red", "exit_code": 1},
                         project="test")
     assert ci_cli.cmd_ci_status(args) == 1
+
+
+# --- every verb's exit codes and --json, pinned -------------------------------------
+
+
+class _FW:
+    def __init__(self, pm, **kw):
+        pass
+
+def test_watch_once_exits_2_for_a_tested_pr_whose_verdict_was_error(monkeypatch, tmp_path):
+    monkeypatch.setattr(premerge, "Premerge", Recorder())
+
+    class FW(_FW):
+        def once(self):
+            return [{"pr": 1, "action": "tested", "verdict": "error",
+                     "detail": "no full-suite leg ran on this machine"}]
+    monkeypatch.setattr(watch, "Watcher", FW)
+    assert run("watch", "--once", "--root", str(tmp_path)) == 2
+
+def test_watch_without_once_loops_and_ctrl_c_is_a_clean_exit(monkeypatch, tmp_path):
+    monkeypatch.setattr(premerge, "Premerge", Recorder())
+    calls = []
+
+    class FW(_FW):
+        def loop(self):
+            calls.append("loop")
+            raise KeyboardInterrupt
+    monkeypatch.setattr(watch, "Watcher", FW)
+    try:
+        code = run("watch", "--root", str(tmp_path))
+    except KeyboardInterrupt:
+        pytest.fail("Ctrl+C escaped `hive ci watch`")
+    assert code == 0 and calls == ["loop"]
+
+def _conflicts_pm(open_prs=None, heads=("1" * 40, {146: "2" * 40, 151: "3" * 40}, "")):
+    class PM:
+        spawn = "s"
+        github = SimpleNamespace(open_prs=open_prs or (lambda: [
+            {"number": 146, "baseRefName": "master"},
+            {"number": 151, "baseRefName": "master"}]))
+
+        def __init__(self, root, **kw):
+            pass
+
+        def fetch_heads(self, numbers, base_ref):
+            return heads
+    return PM
+
+CLEAN = {"base": {146: [], 151: []}, "pairs": [], "errors": {}}
+
+@pytest.mark.parametrize("matrix,code", [
+    ({**CLEAN, "base": {146: [], 151: ["a.py"]}}, 1),                       # base only
+    ({**CLEAN, "pairs": [{"a": 146, "b": 151, "paths": ["x.py"]}]}, 1),     # pair only
+    (CLEAN, 0),                                                             # canary
+    ({**CLEAN, "errors": {"146+151": "boom"}}, 2),
+])
+def test_conflicts_exit_codes(monkeypatch, tmp_path, matrix, code):
+    monkeypatch.setattr(premerge, "Premerge", _conflicts_pm())
+    monkeypatch.setattr(preview, "conflict_matrix", lambda *a, **k: matrix)
+    assert run("conflicts", "--root", str(tmp_path)) == code
+
+def test_conflicts_that_cannot_check_exits_2_and_says_why(monkeypatch, tmp_path, capsys):
+    def boom():
+        raise gh_mod.GitHubError("gh pr list: not logged in")
+    monkeypatch.setattr(premerge, "Premerge", _conflicts_pm(open_prs=boom))
+    assert run("conflicts", "--root", str(tmp_path)) == 2
+    assert "not logged in" in capsys.readouterr().err
+    monkeypatch.setattr(premerge, "Premerge",
+                        _conflicts_pm(heads=("", {}, "git fetch origin: down")))
+    assert run("conflicts", "--root", str(tmp_path)) == 2
+    assert "git fetch origin: down" in capsys.readouterr().err
+
+def test_legs_exits_2_when_only_a_non_full_suite_leg_can_run(monkeypatch):
+    class NodeOnly:
+        def check(self, leg):
+            if leg.name == "node":
+                return legs.Availability(leg, True, python="C:/py.exe", via="native")
+            return legs.Availability(leg, False, reason="no")
+    monkeypatch.setattr(legs, "Probe", NodeOnly)
+    assert run("legs") == 2
+
+def test_conflicts_json_is_the_matrix_under_stable_keys(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(premerge, "Premerge", _conflicts_pm())
+    monkeypatch.setattr(preview, "conflict_matrix",
+                        lambda *a, **k: {**CLEAN, "base": {146: [], 151: ["a.py"]}})
+    assert run("conflicts", "--json", "--root", str(tmp_path)) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "base": "master", "base_sha": "1" * 40, "prs": [146, 151],
+        "against_base": {"146": [], "151": ["a.py"]}, "pairs": [], "errors": {}}
+
+def test_watch_once_json_prints_what_the_pass_did(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(premerge, "Premerge", Recorder())
+    done = [{"pr": 1, "action": "tested", "verdict": "green", "exit_code": 0, "detail": "ok"}]
+
+    class FW(_FW):
+        def once(self):
+            return done
+    monkeypatch.setattr(watch, "Watcher", FW)
+    assert run("watch", "--once", "--json", "--root", str(tmp_path)) == 0
+    assert json.loads(capsys.readouterr().out) == done

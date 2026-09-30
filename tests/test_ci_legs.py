@@ -352,3 +352,41 @@ def test_on_linux_the_ubuntu_legs_run_natively_and_the_windows_ones_do_not():
     w = probe.check(_leg("windows-py3.12"))
     assert not w.ok and w.reason == "a windows leg needs a Windows host"
     assert not any("wsl.exe" in c["argv"] for c in fake.calls)
+
+
+def test_a_wsl_probe_that_exits_0_without_its_sentinel_is_not_an_answer():
+    rules = machine(wsl=(0, "MHCI py 3.12 /usr/bin/python3.12\nMHCI tool tar\n", ""))
+    a = _probe(Fake(*rules)).check(_leg("ubuntu-py3.12"))
+    assert not a.ok and a.reason.startswith("WSL could not answer:")
+
+def test_an_interpreter_that_cannot_make_a_venv_with_pip_says_why():
+    rules = machine()
+    rules.insert(0, (lambda a: _is_check(a) and "Python312" in a[0],
+                     (1, "", "No module named ensurepip")))
+    probe = _probe(Fake(*rules))
+    a = probe.check(_leg("windows-py3.12"))
+    assert not a.ok and a.reason.endswith("cannot make a venv with pip: No module named ensurepip")
+    assert probe.check(_leg("windows-py3.11")).ok                  # canary
+
+def test_a_wsl_without_the_legs_python_is_named_not_papered_over():
+    wsl = WSL_OK.replace("MHCI py 3.12 /usr/bin/python3.12\n", "")
+    probe = _probe(Fake(*machine(wsl=(0, wsl, ""))))
+    a = probe.check(_leg("ubuntu-py3.12"))
+    assert not a.ok and a.reason == "no python3.12 on WSL's login PATH"
+    assert probe.check(_leg("ubuntu-py3.14")).ok                   # canary
+
+def test_every_legs_pytest_args_are_its_jobs_command_verbatim():
+    job, cmds = None, {}
+    for line in CI_YML.read_text(encoding="utf-8").splitlines():
+        if line.strip().startswith("#"):
+            continue
+        m = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)
+        if m:
+            job = m.group(1)
+            continue
+        m = re.search(r"run: python -m pytest((?: \S+)*)\s*$", line)
+        if job and m:
+            cmds[job] = tuple(m.group(1).split())
+    assert len(cmds) == 4                                                # canary: every job seen
+    for leg in legs.CATALOG:
+        assert leg.pytest_args == cmds[leg.job], leg.name

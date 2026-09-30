@@ -12,10 +12,13 @@ test's own store.
 import itertools
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from mindhive import events
+from mindhive.ci import cli as ci_cli
+from mindhive.ci import github as gh_mod
 from mindhive.ci import legrun, legs, premerge
 from mindhive.ci import preview as preview_mod
 
@@ -581,3 +584,237 @@ def test_a_partial_run_posts_its_legs_but_never_the_verdict_and_never_merges(tmp
     full = Rig(tmp_path, probe=only("windows-py3.12")).pm.run_pr(151)
     assert not full.partial and full.selected == [leg.name for leg in legs.CATALOG]
     assert full.as_dict()["partial"] is False
+
+
+# --- the merge guard: every refusal, every read-back ------------------------------
+
+
+@pytest.mark.parametrize("probe,states,verdict,code", [
+    (("windows-py3.12",), {"windows-py3.12": "failure"}, "red", 1),
+    (("node",), {}, "error", 2),                     # no full-suite leg could run
+])
+def test_merge_is_not_attempted_unless_the_verdict_is_green(tmp_path, probe, states,
+                                                            verdict, code):
+    rig = Rig(tmp_path, probe=only(*probe), legs_=Legs(states=states))
+    res = rig.pm.run_pr(151, merge=True)
+    assert (res.verdict, res.exit_code) == (verdict, code)
+    assert rig.gh.merges == [] and res.merge_state == ""
+    assert rig.gh.pr_calls == 1                       # never re-read for a merge
+
+
+def test_allow_base_drift_never_merges_over_a_conflict(tmp_path):
+    git = FakeGit()
+    conflicted = preview_mod.Preview(NEWBASE, HEAD, conflicts=("a.py",), tree=TREE2)
+    rig = Rig(tmp_path, probe=only("windows-py3.12"), git=git,
+              legs_=Legs(on_run=lambda: git.remote.update({"refs/heads/master": NEWBASE})),
+              previews=Previews({(NEWBASE, HEAD): conflicted}))
+    res = rig.pm.run_pr(151, merge=True, allow_base_drift=True)
+    assert rig.gh.merges == []
+    assert (res.verdict, res.exit_code, res.rounds) == ("red", 1, 2)
+
+def test_a_moved_base_with_the_tested_merge_tree_merges_without_a_retest(tmp_path):
+    git = FakeGit()
+    rig = Rig(tmp_path, probe=only("windows-py3.12"), git=git,
+              legs_=Legs(on_run=lambda: git.remote.update({"refs/heads/master": NEWBASE})))
+    res = rig.pm.run_pr(151, merge=True)
+    assert (res.rounds, res.merge_state) == (1, "merged")
+    assert rig.gh.merges == [(151, HEAD)]
+    assert any("the merge tree is the one tested" in n for n in res.notes)
+
+class ReadBackFails(FakeGitHub):
+    def merged(self, number):
+        raise gh_mod.GitHubError("gh pr view 151: HTTP 502")
+
+def test_a_failed_read_back_is_a_failed_merge_not_a_merged_one(tmp_path):
+    rig = Rig(tmp_path, probe=only("windows-py3.12"), gh=ReadBackFails())
+    res = rig.pm.run_pr(151, merge=True)
+    assert res.merge_state.startswith("failed: gh pr merge exit 0")
+    assert (res.exit_code, res.merge_commit) == (premerge.EXIT_NOT_MERGED, "")
+    assert any("could not read the PR back after the merge" in n for n in res.notes)
+
+class RereadFails(FakeGitHub):
+    def pr(self, number):
+        if self.pr_calls >= 1:
+            raise gh_mod.GitHubError("gh pr view: HTTP 502")
+        return super().pr(number)
+
+def test_gh_failing_to_re_read_the_pr_refuses_the_merge(tmp_path):
+    rig = Rig(tmp_path, probe=only("windows-py3.12"), gh=RereadFails())
+    res = rig.pm.run_pr(151, merge=True)
+    assert res.merge_state == "refused: could not read the PR again: gh pr view: HTTP 502"
+    assert rig.gh.merges == [] and res.exit_code == premerge.EXIT_NOT_MERGED
+
+class FetchDiesLater(FakeGit):
+    def __call__(self, argv, **kw):
+        if str(argv[1]) == "fetch" and any(c[1] == "fetch" for c in self.calls):
+            self.calls.append([str(a) for a in argv])
+            return 128, "", "fatal: unable to access: Could not resolve host"
+        return super().__call__(argv, **kw)
+
+def test_a_base_that_cannot_be_re_fetched_before_the_merge_refuses_it(tmp_path):
+    rig = Rig(tmp_path, probe=only("windows-py3.12"), git=FetchDiesLater())
+    res = rig.pm.run_pr(151, merge=True)
+    assert res.merge_state.startswith("refused: git fetch origin: fatal: unable to access")
+    assert rig.gh.merges == [] and res.exit_code == premerge.EXIT_NOT_MERGED
+
+def test_a_merge_commit_git_cannot_read_leaves_the_landed_tree_unknown(tmp_path):
+    rig = Rig(tmp_path, probe=only("windows-py3.12"), gh=FakeGitHub(merged_answer=("MERGED", "")))
+    res = rig.pm.run_pr(151, merge=True)
+    assert res.merge_state == "merged" and res.landed_tree_matches is None
+    assert "merge: merged" in res.report_text                       # canary
+    assert "the landed tree is" not in res.report_text
+
+def test_a_nonzero_gh_exit_with_a_merged_pr_is_still_merged(tmp_path):
+    rig = Rig(tmp_path, probe=only("windows-py3.12"), gh=FakeGitHub(merge_answer=(1, "warning: could not delete branch")))
+    res = rig.pm.run_pr(151, merge=True)
+    assert (res.merge_state, res.exit_code) == ("merged", 0)
+
+def test_a_moved_base_whose_new_merge_cannot_be_computed_refuses_the_merge(tmp_path):
+    git = FakeGit()
+    broken = preview_mod.Preview(NEWBASE, HEAD, error="git merge-tree: boom")
+    rig = Rig(tmp_path, probe=only("windows-py3.12"), git=git,
+              legs_=Legs(on_run=lambda: git.remote.update({"refs/heads/master": NEWBASE})),
+              previews=Previews({(NEWBASE, HEAD): broken}))
+    res = rig.pm.run_pr(151, merge=True)
+    assert rig.gh.merges == []
+    assert res.merge_state.endswith("and the new merge failed: git merge-tree: boom")
+    assert res.exit_code == premerge.EXIT_NOT_MERGED
+
+
+# --- what a run says when GitHub, git or the ledger will not ------------------------
+
+
+class StatusesRefused(FakeGitHub):
+    def post_status(self, sha, state, context="mindhive-ci", description=""):
+        super().post_status(sha, state, context, description)
+        return f"status {context}={state} on {sha[:12]}: HTTP 403: Resource not accessible"
+
+def test_a_status_that_cannot_be_posted_is_reported_and_the_verdict_stands(tmp_path):
+    rig = Rig(tmp_path, gh=StatusesRefused(), probe=only("windows-py3.12"))
+    res = rig.pm.run_pr(151)
+    assert (res.verdict, res.exit_code) == ("green", 0)
+    assert res.status_errors and "HTTP 403" in res.status_errors[0]
+    assert len(res.status_errors) == len(rig.gh.statuses)
+    assert "could not be posted" in res.report_text
+
+
+class FetchesNothing(FakeGit):
+    def __call__(self, argv, **kw):
+        if str(argv[1]) == "fetch":
+            self.calls.append([str(a) for a in argv])
+            return 0, "", ""
+        return super().__call__(argv, **kw)
+
+def test_a_fetch_that_leaves_nothing_to_resolve_is_an_error(tmp_path):
+    rig = Rig(tmp_path, git=FetchesNothing())
+    res = rig.pm.run_pr(151)
+    assert (res.verdict, res.exit_code) == ("error", 2)
+    assert "does not resolve" in res.reason and rig.legs.runs == []
+
+class NoSuchPR(FakeGitHub):
+    def pr(self, number):
+        raise gh_mod.GitHubError("gh pr view: Could not resolve to a PullRequest")
+
+def test_gh_that_cannot_read_the_pr_is_an_error_naming_why(tmp_path):
+    rig = Rig(tmp_path, gh=NoSuchPR())
+    res = rig.pm.run_pr(151)
+    assert (res.verdict, res.exit_code) == ("error", 2)
+    assert "Could not resolve" in res.reason and rig.git.calls == [] and recorded() == []
+
+def test_a_ledger_that_cannot_be_written_does_not_turn_a_verdict_into_a_crash(
+        tmp_path, monkeypatch):
+    def broken(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(premerge.events, "append_event", broken)
+    res = Rig(tmp_path).pm.run_pr(151, legs_spec="windows-py3.12")
+    assert res.verdict == "green"
+    assert any(n.startswith("the run was not recorded: OSError") for n in res.notes)
+
+
+# --- the report, the defaults, the bounds -----------------------------------------
+
+
+def test_render_names_a_red_legs_failed_tests_and_its_log():
+    red = legrun.LegResult(name="windows-py3.12", state="failure",
+                           counts={"failed": 1, "passed": 9},
+                           failed_tests=("FAILED tests/test_a.py::test_b - boom",),
+                           artifact="C:/runs/premerge-x.txt")
+    ok = legrun.LegResult(name="node", state="success", counts={"passed": 3},
+                          artifact="C:/runs/premerge-y.txt")
+    res = premerge.PremergeResult(pr_id=151, branch="b", base_ref="master", legs=[red, ok],
+                                  verdict="red", exit_code=1,
+                                  reason="red: windows-py3.12 (failure)")
+    text = premerge.render(res)
+    assert "      FAILED tests/test_a.py::test_b - boom" in text
+    assert "      log: C:/runs/premerge-x.txt" in text
+    assert "premerge-y.txt" not in text                        # canary: green legs stay quiet
+
+def test_the_default_previewer_merges_head_into_base_and_the_default_probe_sees_the_environment(
+        tmp_path):
+    seen = []
+
+    def run(argv, **kw):
+        seen.append([str(a) for a in argv])
+        return 1, "", "stop here"
+    dsn = "postgresql://ci@localhost/throwaway"
+    pm = premerge.Premerge(tmp_path / "repo", project="test", run=run,
+                           environ={"PATH": "P", legs.PG_DSN_ENV: dsn}, github=FakeGitHub())
+    pv = pm._preview(BASE, HEAD)
+    assert seen[0][:2] == ["git", "merge-tree"] and seen[0][-2:] == [BASE, HEAD]
+    assert pv.error.startswith("git merge-tree: ") and not pv.clean
+    assert pm.probe.environ[legs.PG_DSN_ENV] == dsn
+
+def test_status_prints_what_a_real_premerge_run_recorded(tmp_path, capsys):
+    rig = Rig(tmp_path, probe=FakeProbe({"pg": "no dsn"}))
+    res = rig.pm.run_pr(151, legs_spec="windows-py3.12,pg")
+    assert res.verdict == "green" and res.reason.endswith("not run here: pg")
+    args = SimpleNamespace(project="test", pr=None, page=1, json=False)
+    assert ci_cli.cmd_ci_status(args) == 0
+    out = capsys.readouterr().out
+    assert f"verdict: green -- {res.reason}" in out
+    assert "legs: 1 success; not run: pg" in out
+
+def _peak_concurrency(tmp_path, jobs):
+    import threading
+    import time
+
+    lock, live, peak = threading.Lock(), [0], [0]
+
+    def hold():
+        with lock:
+            live[0] += 1
+            peak[0] = max(peak[0], live[0])
+        time.sleep(0.15)
+        with lock:
+            live[0] -= 1
+    rig = Rig(tmp_path, legs_=Legs(on_run=hold), jobs=jobs)
+    res = rig.pm.run_pr(151, legs_spec="ubuntu-*,windows-*")
+    return res, len(rig.legs.runs), peak[0]
+
+@pytest.mark.parametrize("jobs,bound", [(2, 2), (1, 1), (0, 1)])
+def test_jobs_bounds_how_many_legs_run_at_once(tmp_path, jobs, bound):
+    res, ran, peak = _peak_concurrency(tmp_path, jobs)
+    assert res.verdict == "green" and ran >= 4          # canary: enough legs to overlap
+    assert peak == bound
+
+def _leaving(tmp_path):
+
+    class LeavesTrees(Legs):
+        def __call__(self, run_tag):
+            inner = super().__call__(run_tag)
+
+            class _Runner:
+                def run(_self, leg, avail, commit):
+                    d = tmp_path / "work" / run_tag / leg.name
+                    d.mkdir(parents=True, exist_ok=True)
+                    (d / "left.txt").write_text("x")
+                    return inner.run(leg, avail, commit)
+            return _Runner()
+    return LeavesTrees()
+
+@pytest.mark.parametrize("keep,left", [(False, False), (True, True)])
+def test_the_run_directory_is_removed_unless_keep_is_asked_for(tmp_path, keep, left):
+    rig = Rig(tmp_path, legs_=_leaving(tmp_path), keep=keep)
+    res = rig.pm.run_pr(151, legs_spec="windows-py3.12")
+    assert res.verdict == "green" and len(rig.legs.runs) == 1          # canary: a leg did run
+    assert any((tmp_path / "work").rglob("left.txt")) is left

@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -532,3 +533,128 @@ def test_a_real_leg_exports_commits_and_runs_the_suite_in_a_fresh_repo(
     # only its: a file the tree holds 100644 stays so.
     assert _git(repo, "ls-files", "-s", "run.sh").split()[0] == "100755"
     assert _git(repo, "ls-files", "-s", "data.txt").split()[0] == "100644"
+
+
+# --- what the runner refuses, and what it does when a step cannot -------------------
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_extract_refuses_members_that_leave_the_leg_in_both_branches(
+        tmp_path, monkeypatch, fallback):
+    if fallback:
+        monkeypatch.setattr(legrun, "tarfile", SimpleNamespace(open=tarfile.open))  # the fallback
+    good = tmp_path / "good.tar"
+    make_tar(good)
+    legrun.extract(good, tmp_path / "ok")
+    assert (tmp_path / "ok" / "pyproject.toml").is_file()             # canary
+    for name, kind, link in (("../escaped.txt", tarfile.REGTYPE, ""),
+                             ("src/link", tarfile.SYMTYPE, "../../../outside")):
+        evil = tmp_path / "evil.tar"
+        with tarfile.open(evil, "w") as tar:
+            info = tarfile.TarInfo(name)
+            info.type, info.linkname = kind, link
+            if kind == tarfile.REGTYPE:
+                info.size = 1
+                tar.addfile(info, io.BytesIO(b"x"))
+            else:
+                tar.addfile(info)
+        with pytest.raises((ValueError, tarfile.TarError)):
+            legrun.extract(evil, tmp_path / "leg")
+    assert not (tmp_path / "escaped.txt").exists()
+
+@pytest.mark.skipif(_bash() is None, reason="no POSIX sh on this machine")
+def test_the_leg_script_scrubs_the_environment_before_it_builds_anything(tmp_path):
+    root = tmp_path / "leg"
+    root.mkdir()
+    (root / "f.txt").write_text("x", encoding="utf-8")
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    dump = tmp_path / "env.out"
+    (shim / "git").write_text(f'#!/bin/sh\nenv > "{dump.as_posix()}"\nexit 0\n',
+                              encoding="utf-8", newline="\n")
+    os.chmod(shim / "git", 0o755)
+    env = {**os.environ, "PATH": shim.as_posix() + os.pathsep + os.environ["PATH"],
+           "GITHUB_TOKEN": "t", "gh_token": "t", "npm_config_token": "t",
+           "MINDHIVE_PROJECT": "leaky", "PYTHONPATH": "/elsewhere", "KEEP_ME": "1"}
+    proc = subprocess.run([_bash(), "-s", "--", root.as_posix(), "python3.99", "dev",
+                           "60", "-q"], input=legrun.POSIX_LEG_SCRIPT.encode("utf-8"),
+                          capture_output=True, env=env, timeout=120)
+    assert proc.returncode == legrun.SETUP_FAILED_EXIT, proc.stderr    # stops at the venv
+    names = {line.split("=", 1)[0] for line in dump.read_text(encoding="utf-8").splitlines()}
+    assert "KEEP_ME" in names and "MINDHIVE_HOME" in names             # canary
+    leaked = names & {"GITHUB_TOKEN", "gh_token", "npm_config_token", "MINDHIVE_PROJECT",
+                      "PYTHONPATH"}
+    assert leaked == set()
+
+@pytest.mark.skipif(_bash() is None, reason="no POSIX sh on this machine")
+def test_the_leg_script_takes_windows_mnt_directories_off_path(tmp_path):
+    root = tmp_path / "leg"
+    root.mkdir()
+    (root / "f.txt").write_text("x", encoding="utf-8")
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    dump = tmp_path / "env.out"
+    (shim / "git").write_text(f'#!/bin/sh\nenv > "{dump.as_posix()}"\nexit 0\n',
+                              encoding="utf-8", newline="\n")
+    os.chmod(shim / "git", 0o755)
+    env = {**os.environ, "PATH": "/mnt/c/Windows/System32" + os.pathsep + shim.as_posix() + os.pathsep
+           + os.environ["PATH"]}
+    proc = subprocess.run([_bash(), "-s", "--", root.as_posix(), "python3.99", "dev",
+                           "60", "-q"], input=legrun.POSIX_LEG_SCRIPT.encode("utf-8"),
+                          capture_output=True, env=env, timeout=120)
+    assert proc.returncode == legrun.SETUP_FAILED_EXIT, proc.stderr
+    seen = [l for l in dump.read_text(encoding="utf-8").splitlines() if l.startswith("PATH=")]
+    assert seen and any(shim.name in part for part in seen[0][5:].split(":"))   # canary
+    assert not any(part.startswith("/mnt/") for part in seen[0][5:].split(":"))
+
+
+def _wsl_run(tmp_path, fake, name="ubuntu-py3.12"):
+    the_leg = leg(name)
+    return runner(tmp_path, fake).run(
+        the_leg, avail(the_leg, python="/usr/bin/python3.12", via="wsl"),
+        COMMIT)
+
+@pytest.mark.parametrize("answer,exit_code,reason", [
+    ((1, "", "mktemp: failed to create directory"), 1, "mktemp: failed to create directory"),
+    ((0, "wsl: a banner, not a path" + chr(10), ""), 0, "wsl: a banner, not a path")])
+def test_a_wsl_that_cannot_make_its_temp_dir_is_an_error_at_mktemp(tmp_path, answer, exit_code, reason):
+    base = FakeRun(script=(WSL_OK, 0))
+
+    def run(argv, **kw):
+        if "mktemp" in [str(a) for a in argv]:
+            return answer
+        return base(argv, **kw)
+    res = _wsl_run(tmp_path, run)
+    assert (res.state, res.step, res.exit_code) == ("error", "mktemp", exit_code)
+    assert res.reason == reason
+    assert not any("bash" in c["argv"] or "rm" in c["argv"] for c in base.calls)
+
+@pytest.mark.parametrize("code", [124, 137])
+def test_a_wsl_suite_killed_by_timeout_says_so(tmp_path, code):
+    text = f"::mindhive-ci:: step pytest: x\n....\n::mindhive-ci:: pytest-exit {code}\n"
+    res = _wsl_run(tmp_path, FakeRun(script=(text, code)))
+    assert (res.state, res.step, res.exit_code) == ("error", "pytest", code)
+    assert res.reason == f"pytest exit {code} -- killed at the cap"
+
+def test_leg_env_drops_every_credential_shape_it_names(tmp_path):
+    secrets = {"AWS_ACCESS_KEY_ID": "a", "GOOGLE_APPLICATION_CREDENTIALS": "g",
+               "SSH_PRIVATE_KEY": "k", "STRIPE_APIKEY": "s", "DB_PASSWD": "d",
+               "CONDA_PREFIX": "c", "UV_CACHE_DIR": "u", "MINDNETWORK_X": "m"}
+    env = legrun.leg_env({"PATH": "p", "SYSTEMROOT": "C:/Windows", **secrets}, tmp_path)
+    assert env["SYSTEMROOT"] == "C:/Windows"                             # canary
+    assert set(env) & set(secrets) == set()
+
+def test_a_runlog_that_cannot_be_written_loses_the_evidence_not_the_verdict(tmp_path, monkeypatch):
+    the_leg = leg("windows-py3.12")
+    text = "....\n1 passed in 0.10s\n"
+    kept = runner(tmp_path / "a", FakeRun(pytest=(0, text))).run(
+        the_leg, avail(the_leg), COMMIT)
+    assert kept.state == "success" and kept.artifact                      # canary: it is written
+
+    def refuse(*args, **kw):
+        raise OSError("disk full")
+    monkeypatch.setattr(legrun.runlog, "write_once", refuse)
+    lost = runner(tmp_path / "b", FakeRun(pytest=(0, text))).run(
+        the_leg, avail(the_leg), COMMIT)
+    assert (lost.state, lost.step, lost.exit_code) == ("success", "pytest", 0)
+    assert lost.artifact == ""

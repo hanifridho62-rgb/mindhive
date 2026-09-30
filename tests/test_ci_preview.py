@@ -146,3 +146,27 @@ def test_the_conflict_matrix_reports_a_head_it_could_not_merge(repo):
                                   {12: repo["clean"], 99: "0" * 40})
     assert got["base"] == {12: []}
     assert set(got["errors"]) == {"99"}
+
+
+# --- git failing after a clean merge-tree: an error, never a clean preview ----------
+
+_TREE, _BASE, _HEAD = "a" * 40, "b" * 40, "c" * 40
+
+
+def test_merge_preview_reports_git_failures_after_a_clean_merge_tree():
+    def commit_tree_fails(argv, **kw):
+        return {"merge-tree": (0, _TREE + "\0", ""), "merge-base": (1, "", "")}.get(
+            argv[1], (128, "", "fatal: unable to write"))
+    pv = preview.merge_preview(".", _BASE, _HEAD, run=commit_tree_fails, environ={})
+    assert not pv.clean and pv.tested_sha == "" and pv.error.startswith("git commit-tree: ")
+
+    def ancestor_check_fails(argv, **kw):
+        return (0, _TREE + "\0", "") if argv[1] == "merge-tree" else (128, "", "fatal: bad object")
+    pv = preview.merge_preview(".", _BASE, _HEAD, run=ancestor_check_fails, environ={})
+    assert not pv.clean and pv.error.startswith("git merge-base --is-ancestor: ")
+
+def test_conflict_matrix_reports_a_pair_it_could_not_merge():
+    def run(argv, **kw):
+        return (0, _TREE + "\0", "") if argv[-2] == _BASE else (128, "", "fatal: bad object")
+    got = preview.conflict_matrix(".", _BASE, {1: "1" * 40, 2: "2" * 40}, run=run)
+    assert got == {"base": {1: [], 2: []}, "pairs": [], "errors": {"1+2": "fatal: bad object"}}

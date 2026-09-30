@@ -134,3 +134,18 @@ def test_every_call_runs_in_the_repository():
     gh.pr(1)
     gh.post_status("a" * 40, "pending", "mindhive-ci", "")
     assert {c["cwd"] for c in fake.calls} == {"C:/repo"}
+
+
+def test_gh_answers_of_the_wrong_shape_are_errors_not_garbage():
+    good = github.GitHub("R", run=Fake((SLUG, (0, "owner/repo\n", ""))))
+    assert good.slug() == "owner/repo"                                   # canary
+    fake = Fake((SLUG, (0, "no-slash\n", "")),
+                    (("gh", "pr", "view"), (0, "[]", "")),
+                    (("gh", "pr", "list"), (0, "{}", "")))
+    gh = github.GitHub("R", run=fake)
+    with pytest.raises(github.GitHubError, match="no owner/name"):
+        gh.slug()
+    with pytest.raises(github.GitHubError, match="not an object"):
+        gh.pr(151)
+    with pytest.raises(github.GitHubError, match="not a list"):
+        gh.open_prs()
