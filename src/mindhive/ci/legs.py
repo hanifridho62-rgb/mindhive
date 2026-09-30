@@ -62,7 +62,9 @@ PROBE_TIMEOUT_S = 120.0
 #: What the POSIX probe prints before each fact, so a login profile's own
 #: banner can never be read as an answer.
 _MARK = "MHCI"
-POSIX_TOOLS = ("tar", "git", "timeout")
+#: What a WSL leg runs besides its interpreter: `git` checks the commit out,
+#: `wslpath` names this machine's object store to it, `timeout` caps pytest.
+POSIX_TOOLS = ("git", "timeout", "wslpath")
 #: Run by each candidate interpreter: its version, and proof it can build a
 #: venv with pip (a Debian python without python3-venv has no `ensurepip`).
 _CHECK = "import sys, venv, ensurepip; print('%d.%d' % sys.version_info[:2])"

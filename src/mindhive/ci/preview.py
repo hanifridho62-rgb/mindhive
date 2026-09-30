@@ -21,7 +21,7 @@ A clean merge whose base is already inside the head needs no merge commit of
 its own: GitHub's merge commit would carry the head's tree, so the head itself
 is tested. Otherwise `git commit-tree` records the preview as an unreferenced
 merge commit (parents base and head, identity `mindhive-ci`), so the run has
-one sha to name and `git archive` one commit to export.
+one sha to name and each leg one commit to check out.
 """
 import os
 import re

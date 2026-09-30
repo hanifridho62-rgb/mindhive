@@ -29,7 +29,7 @@ WSL_OK = ("Welcome to Ubuntu (a banner a login profile might print)\n"
           "MHCI py 3.11 /home/u/.local/bin/python3.11\n"
           "MHCI py 3.12 /usr/bin/python3.12\n"
           "MHCI py 3.14 /home/u/.local/bin/python3.14\n"
-          "MHCI tool tar\nMHCI tool git\nMHCI tool timeout\nMHCI tool pip\n"
+          "MHCI tool git\nMHCI tool timeout\nMHCI tool wslpath\nMHCI tool pip\n"
           "MHCI ok\n")
 
 
@@ -123,6 +123,48 @@ def test_each_leg_carries_its_jobs_name_tier_extras_and_runner(ci_jobs):
         assert leg.runs_on in job["runs_on"], leg.name
         if leg.python and leg.job != "test":
             assert job["pythons"] == [leg.python], leg.name
+
+
+def parse_checkouts(text) -> list:
+    """The `with:` of each `actions/checkout` step, in file order, as ``{key:
+    value}`` -- read by indentation, as `parse_ci_yml` reads the jobs."""
+    steps, step, indent, keyed = [], None, 0, False
+    for line in text.splitlines():
+        if not line.strip() or line.strip().startswith("#"):
+            continue
+        m = re.match(r"^(\s*)- uses:\s*actions/checkout@\S+\s*$", line)
+        if m:
+            step, indent, keyed = {}, len(m.group(1)), False
+            steps.append(step)
+            continue
+        if step is None:
+            continue
+        if len(line) - len(line.lstrip()) <= indent:       # the next step, or job
+            step = None
+        elif re.match(r"^\s+with:\s*$", line):
+            keyed = True
+        elif keyed and (m := re.match(r"^\s+([\w-]+):\s*(.+?)\s*$", line)):
+            step[m.group(1)] = m.group(2).strip("\"'")
+    return steps
+
+
+def test_the_checkout_parser_sees_a_step_that_fetches_one_commit():
+    """Canary: "every checkout fetches the history" must not pass on a parser
+    that finds no checkout, or none without the key."""
+    text = ("jobs:\n  a:\n    steps:\n      - uses: actions/checkout@v5\n"
+            "        with:\n          fetch-depth: 0\n      - run: x\n"
+            "  b:\n    steps:\n      - uses: actions/checkout@v5\n      - run: y\n")
+    assert parse_checkouts(text) == [{"fetch-depth": "0"}, {}]
+
+
+def test_every_job_checks_out_the_whole_history_as_every_leg_has_it(ci_jobs):
+    """A leg's HEAD is the commit under test with its whole history readable
+    (`legrun`), so a job that checked out one commit would be red where the
+    leg is green: `tests/test_implementation_plan.py` reads a commit from the
+    history."""
+    steps = parse_checkouts(CI_YML.read_text(encoding="utf-8"))
+    assert len(steps) == len(ci_jobs)                     # one per job
+    assert [step.get("fetch-depth") for step in steps] == ["0"] * len(ci_jobs)
 
 
 def test_a_leg_runs_its_jobs_test_command_verbatim():
@@ -292,10 +334,11 @@ def test_a_wsl_that_cannot_answer_takes_every_ubuntu_leg_with_its_own_words():
     assert probe.check(_leg("windows-py3.12")).ok           # canary: only WSL is down
 
 
-def test_a_wsl_without_a_needed_tool_says_which():
-    rules = machine(wsl=(0, WSL_OK.replace("MHCI tool timeout\n", ""), ""))
+@pytest.mark.parametrize("tool", ["timeout", "wslpath"])
+def test_a_wsl_without_a_needed_tool_says_which(tool):
+    rules = machine(wsl=(0, WSL_OK.replace(f"MHCI tool {tool}\n", ""), ""))
     a = _probe(Fake(*rules)).check(_leg("ubuntu-py3.12"))
-    assert not a.ok and a.reason == "WSL lacks timeout"
+    assert not a.ok and a.reason == f"WSL lacks {tool}"
 
 
 def test_node_needs_node_and_browser_needs_a_chromium_that_launches():
@@ -355,7 +398,7 @@ def test_on_linux_the_ubuntu_legs_run_natively_and_the_windows_ones_do_not():
 
 
 def test_a_wsl_probe_that_exits_0_without_its_sentinel_is_not_an_answer():
-    rules = machine(wsl=(0, "MHCI py 3.12 /usr/bin/python3.12\nMHCI tool tar\n", ""))
+    rules = machine(wsl=(0, "MHCI py 3.12 /usr/bin/python3.12\nMHCI tool git\n", ""))
     a = _probe(Fake(*rules)).check(_leg("ubuntu-py3.12"))
     assert not a.ok and a.reason.startswith("WSL could not answer:")
 

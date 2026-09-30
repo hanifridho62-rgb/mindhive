@@ -2,24 +2,25 @@
 # src/mindhive/ci/legrun.py
 """One leg, run the way its ci.yml job runs it (spec 2026-09-30).
 
-**A fresh repository per leg**, not a linked worktree: `git archive` of the
-tested commit, extracted, then `git init` + `add` + ONE commit under the
-`mindhive-ci` identity. That is what an Actions checkout is -- one commit, no
-history, no hooks, no other branch -- and it shares nothing with the
-operator's repository, so a test that runs `git` in its root sees the tree
-under test and nothing else.
+**A fresh repository per leg whose HEAD is the commit under test**, not a
+linked worktree and not a copy of its tree: `git init`, the operator's object
+store named in `.git/objects/info/alternates`, then `git reset --hard <commit>`
+on `master`. That is what ci.yml's checkout is -- `fetch-depth: 0`, the commit
+itself with its whole history readable, no hooks -- and the operator's
+repository is only ever read: git never writes to an alternate, and no ref of
+theirs moves. A WSL leg names the same store through `wslpath` and reads it
+over `/mnt`. `tests/test_implementation_plan.py` reads a commit from that
+history; a one-commit copy of the tree made every leg red on it.
 
-**Executable bits are the tested tree's.** NTFS has none, so `git add` on
-Windows records every file 100644; a native leg reads the tree's 100755
-entries with `git ls-tree` and puts them back with `git update-index
---chmod=+x` before its commit, as a runner's checkout has them. A WSL leg's
-tar carries the modes, and Linux keeps them.
+**Modes are the tree's.** A checkout writes each entry's mode into the index
+from the tree, so a 100755 file is 100755 in the leg on every OS, whatever
+NTFS keeps of an executable bit.
 
 **Line endings follow the runner.** A windows job's checkout is CRLF (git for
 Windows ships `core.autocrlf=true`, as the runner image does) and an ubuntu
-job's is LF. `git archive` honours `core.autocrlf` (measured), so the
-conversion happens on export, and the leg repository keeps the same setting,
-so `git status` in it is clean.
+job's is LF: the leg sets `core.autocrlf` before its checkout, so `git status`
+in it is clean. It sets `core.longpaths` too -- the leg's path under the temp
+directory plus the tree's longest path can pass Windows' 260.
 
 **Then the job's own steps**: a venv from the leg's interpreter, `pip install
 --upgrade pip`, `pip install -e .[extras]`, the pg tier's cluster check and
@@ -47,7 +48,6 @@ directory is removed afterwards unless `keep`. `LegRunner.run` never raises.
 """
 import os
 import re
-import tarfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,7 +59,7 @@ from .runner import _rmtree_force
 
 __all__ = ["FAILED_CAP", "LEG_TIMEOUT_S", "LegResult", "LegRunner", "MARK",
            "PG_CLUSTER_CHECK", "POSIX_LEG_SCRIPT", "SETUP_FAILED_EXIT", "STATES",
-           "autocrlf_for", "classify", "extract", "leg_env", "venv_python"]
+           "autocrlf_for", "classify", "leg_env", "venv_python"]
 
 GIT = "git"
 #: Every line the runner -- or the WSL script -- writes into a leg's log starts
@@ -75,12 +75,6 @@ SETUP_TIMEOUT_S = 1800.0
 STEP_TIMEOUT_S = 600.0
 SETUP_FAILED_EXIT = 97
 FAILED_CAP = 20
-CI_NAME = "mindhive-ci"
-CI_EMAIL = "mindhive-ci@localhost.invalid"
-COMMIT_MESSAGE = "mindhive-ci leg tree"
-#: Paths per `git update-index --chmod=+x`: a Windows command line holds about
-#: 32k characters, and a tree may hold many executables.
-CHMOD_BATCH = 100
 _DROP_PREFIXES = ("PYTHON", "PYTEST_", "MINDHIVE_", "MINDNETWORK_", "CLAUDE",
                   "ANTHROPIC_", "GIT_", "VIRTUAL_ENV", "CONDA_", "UV_")
 _DROP_WORDS = ("TOKEN", "SECRET", "PASSWORD", "PASSWD", "API_KEY", "APIKEY",
@@ -107,8 +101,10 @@ if rows:
              + ": the pg leg needs a Postgres cluster of its own")
 """
 
-#: A WSL leg's whole job, fed to `bash -l -s -- ROOT PY EXTRAS CAP <pytest args>`
-#: on stdin. A LOGIN shell, because uv's interpreters live in `~/.local/bin`,
+#: A WSL leg's whole job, fed to `bash -l -s -- ROOT SHA OBJECTS PY EXTRAS CAP
+#: <pytest args>` on stdin. OBJECTS is this machine's object store as git on
+#: Windows names it; `wslpath` turns it into the `/mnt/...` path Linux reads it
+#: through. A LOGIN shell, because uv's interpreters live in `~/.local/bin`,
 #: which only the login profile puts on PATH (measured). The body is one
 #: function called with `</dev/null`: bash reads a stdin script as it runs it,
 #: so without that a step that reads stdin -- pip, a test's child -- would eat
@@ -127,8 +123,8 @@ mhci_scrub() {
     shopt -u nocasematch
 }
 mhci_leg() {
-    ROOT=$1 PY=$2 EXTRAS=$3 CAP=$4
-    shift 4
+    ROOT=$1 SHA=$2 OBJECTS=$3 PY=$4 EXTRAS=$5 CAP=$6
+    shift 6
     cd "$ROOT" || mhci_fail cd
     IFS=: read -r -a mhci_dirs <<< "$PATH"
     PATH=
@@ -139,15 +135,18 @@ mhci_leg() {
     mhci_scrub
     export MINDHIVE_HOME="$ROOT-home" PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1
     mkdir -p "$MINDHIVE_HOME" || mhci_fail home
-    mhci_mark "step git-init"
+    mhci_mark "step checkout: $SHA"
+    if command -v wslpath >/dev/null 2>&1; then
+        OBJECTS=$(wslpath -u "$OBJECTS") || mhci_fail checkout
+    fi
     git -c init.defaultBranch=master init -q \
+        && mkdir -p .git/objects/info \
+        && printf '%s\n' "$OBJECTS" > .git/objects/info/alternates \
         && git config core.autocrlf false \
         && git config core.safecrlf false \
-        && git add -A -f \
-        && git -c user.name=@CI_NAME@ -c user.email=@CI_EMAIL@ \
-               -c commit.gpgsign=false -c core.hooksPath=/dev/null \
-               commit -q --no-verify -m "@COMMIT_MESSAGE@" \
-        || mhci_fail git-init
+        && git config core.hooksPath /dev/null \
+        && git reset -q --hard "$SHA" \
+        || mhci_fail checkout
     VENV="$ROOT-venv"
     mhci_mark "step venv: $PY -m venv $VENV"
     if ! "$PY" -m venv "$VENV"; then
@@ -173,9 +172,7 @@ mhci_leg "$@" </dev/null
 #: matched without regard to case, as `leg_env` matches them.
 _SCRUB_PATTERN = "|".join([p + "*" for p in _DROP_PREFIXES]
                           + ["*" + w + "*" for w in _DROP_WORDS])
-POSIX_LEG_SCRIPT = (_POSIX_LEG_TEMPLATE.replace("@SCRUB@", _SCRUB_PATTERN)
-                    .replace("@CI_NAME@", CI_NAME).replace("@CI_EMAIL@", CI_EMAIL)
-                    .replace("@COMMIT_MESSAGE@", COMMIT_MESSAGE))
+POSIX_LEG_SCRIPT = _POSIX_LEG_TEMPLATE.replace("@SCRUB@", _SCRUB_PATTERN)
 
 
 def classify(rc) -> str:
@@ -210,25 +207,6 @@ def leg_env(environ, leg_dir, bin_dir=None) -> dict:
         prior = env.get(key, "")
         env[key] = str(bin_dir) + (os.pathsep + prior if prior else "")
     return env
-
-
-def extract(tar_path, dest) -> None:
-    """Unpack a `git archive` tar into *dest*, refusing any member that would
-    land outside it -- the stdlib `data` filter where the interpreter has it."""
-    dest = Path(dest)
-    dest.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(tar_path) as archive:
-        if hasattr(tarfile, "data_filter"):
-            archive.extractall(dest, filter="data")
-            return
-        root = dest.resolve()
-        for member in archive.getmembers():
-            target = (dest / member.name).resolve()
-            if target != root and root not in target.parents:
-                raise ValueError(f"archive member outside the leg: {member.name}")
-            if member.issym() or member.islnk():
-                raise ValueError(f"archive link refused: {member.name}")
-        archive.extractall(dest)
 
 
 def _read(path) -> str:
@@ -377,70 +355,64 @@ class LegRunner:
         if res.state == "error":
             res.reason = _last_line(err) or f"pytest exit {rc}"
 
-    def _executables(self, res, commit, *, log, env):
-        """The paths *commit* holds as executable (mode 100755), or None -- with
-        *res* an error at `exec-bits` -- when git cannot list them: a leg that
-        quietly lost its executable bits would test another tree."""
-        argv = [GIT, "ls-tree", "-r", "-z", commit]
-        _append(log, f"{MARK} step exec-bits: {' '.join(argv)}\n")
+    def _objects(self, res, *, log, env):
+        """The operator's object store as git names it, absolute -- the history
+        every leg reads -- or None, with *res* an error at `objects`, when git
+        cannot name one."""
+        argv = [GIT, "rev-parse", "--path-format=absolute", "--git-path", "objects"]
+        _append(log, f"{MARK} step objects: {' '.join(argv)}\n")
         rc, out, err = self._run(argv, cwd=self.repo_root, env=env,
                                  timeout_s=STEP_TIMEOUT_S)
-        if rc != 0:
-            if err:
-                _append(log, str(err).rstrip() + "\n")
-            res.state, res.step, res.exit_code = "error", "exec-bits", int(rc)
-            res.reason = _last_line(err) or f"exit {rc}"
-            return None
-        found = []
-        for entry in str(out or "").split("\0"):
-            meta, _, path = entry.partition("\t")
-            if path and meta.split(" ", 1)[0] == "100755":
-                found.append(path)
-        return found
+        objects = str(out or "").strip()
+        if rc == 0 and objects:
+            return objects
+        if err:
+            _append(log, str(err).rstrip() + "\n")
+        res.state, res.step, res.exit_code = "error", "objects", int(rc)
+        res.reason = (_last_line(err) or _last_line(out)
+                      or (f"exit {rc}" if rc else "git named no object store"))
+        return None
 
-    def _init_repo(self, res, repo, crlf, leg_dir, env, log, executables=()) -> bool:
+    def _checkout(self, res, repo, commit, crlf, objects, leg_dir, env, log) -> bool:
+        """Make *repo* a repository whose HEAD is *commit*, on `master`, reading
+        every object -- the commit and its whole history -- from *objects*
+        through `alternates`. False, with *res* an error at `checkout`, when
+        it could not."""
         hooks = leg_dir / "no-hooks"
         hooks.mkdir(exist_ok=True)
-        # Only what was exported: an `export-ignore` path is in the tree and
-        # not in the leg, and update-index refuses a path the index lacks.
-        marked = [path for path in executables if (repo / path).is_file()]
-        chmods = [[GIT, "update-index", "--chmod=+x", "--", *marked[i:i + CHMOD_BATCH]]
-                  for i in range(0, len(marked), CHMOD_BATCH)]
+        repo.mkdir(parents=True, exist_ok=True)
+        if not self._step(res, "checkout",
+                          [GIT, "-c", "init.defaultBranch=master", "init", "-q"],
+                          log=log, cwd=repo, env=env):
+            return False
+        res.step = "checkout"
+        info = repo / ".git" / "objects" / "info"
+        info.mkdir(parents=True, exist_ok=True)
+        # Bytes and one LF: git reads this file itself, whatever the OS.
+        (info / "alternates").write_bytes((objects + "\n").encode("utf-8"))
+        res.step = ""
         steps = (
-            [GIT, "-c", "init.defaultBranch=master", "init", "-q"],
             [GIT, "config", "core.autocrlf", crlf],
             [GIT, "config", "core.safecrlf", "false"],
-            # -f: every file here was TRACKED; a .gitignore in the tree must
-            # not drop one that was force-added upstream.
-            [GIT, "add", "-A", "-f"],
-            *chmods,
-            [GIT, "-c", f"user.name={CI_NAME}", "-c", f"user.email={CI_EMAIL}",
-             "-c", "commit.gpgsign=false", "-c", f"core.hooksPath={hooks}",
-             "commit", "-q", "--no-verify", "-m", COMMIT_MESSAGE],
+            [GIT, "config", "core.longpaths", "true"],
+            [GIT, "config", "core.hooksPath", str(hooks)],
+            [GIT, "reset", "-q", "--hard", commit],
         )
-        return all(self._step(res, "git-init", argv, log=log, cwd=repo, env=env)
+        return all(self._step(res, "checkout", argv, log=log, cwd=repo, env=env)
                    for argv in steps)
+
 
     # --- a leg on this machine --------------------------------------------------------
 
     def _native(self, leg, avail, commit, leg_dir, log, res) -> None:
-        crlf = autocrlf_for(leg)
-        repo, tar = leg_dir / "repo", leg_dir / "tree.tar"
+        repo = leg_dir / "repo"
         (leg_dir / "home").mkdir(exist_ok=True)
         env = leg_env(self.environ, leg_dir)
-        executables = self._executables(res, commit, log=log, env=env)
-        if executables is None:
+        objects = self._objects(res, log=log, env=env)
+        if objects is None:
             return
-        if not self._step(res, "archive",
-                          [GIT, "-c", f"core.autocrlf={crlf}", "archive",
-                           "--format=tar", "-o", str(tar), commit],
-                          log=log, cwd=self.repo_root, env=env):
-            return
-        res.step = "extract"
-        extract(tar, repo)
-        tar.unlink()
-        res.step = ""
-        if not self._init_repo(res, repo, crlf, leg_dir, env, log, executables):
+        if not self._checkout(res, repo, commit, autocrlf_for(leg), objects,
+                              leg_dir, env, log):
             return
         if leg.clean_venv:
             venv = leg_dir / "venv"
@@ -479,15 +451,11 @@ class LegRunner:
     # --- a leg in WSL -----------------------------------------------------------------
 
     def _wsl(self, leg, avail, commit, leg_dir, log, res) -> None:
-        tar = leg_dir / "tree.tar"
-        env = leg_env(self.environ, leg_dir)
-        if not self._step(res, "archive",
-                          [GIT, "-c", "core.autocrlf=false", "archive",
-                           "--format=tar", "-o", str(tar), commit],
-                          log=log, cwd=self.repo_root, env=env):
+        # Named as git on Windows names it; the script turns it into the
+        # `/mnt/...` path Linux reads the same store through.
+        objects = self._objects(res, log=log, env=leg_env(self.environ, leg_dir))
+        if objects is None:
             return
-        data = tar.read_bytes()
-        tar.unlink()
         rc, out, err = self._run(self.wsl_prefix + ["mktemp", "-d", "/tmp/mindhive-ci.XXXXXX"],
                                  env=self.wsl_env, timeout_s=STEP_TIMEOUT_S)
         root = (out or "").strip()
@@ -496,13 +464,10 @@ class LegRunner:
             res.reason = _last_line(err) or _last_line(out) or f"exit {rc}"
             return
         try:
-            if not self._step(res, "extract", self.wsl_prefix + ["tar", "-x", "-C", root],
-                              log=log, env=self.wsl_env, stdin=data):
-                return
             res.argv = (avail.python, "-m", "pytest", *leg.pytest_args)
-            argv = self.wsl_prefix + ["bash", "-l", "-s", "--", root, avail.python,
-                                      leg.extras, str(int(self.timeout_s)),
-                                      *leg.pytest_args]
+            argv = self.wsl_prefix + ["bash", "-l", "-s", "--", root, commit, objects,
+                                      avail.python, leg.extras,
+                                      str(int(self.timeout_s)), *leg.pytest_args]
             rc, _, err = self._run(argv, env=self.wsl_env, stdin=POSIX_LEG_SCRIPT,
                                    log=log, timeout_s=self.timeout_s + SETUP_TIMEOUT_S)
             if err:

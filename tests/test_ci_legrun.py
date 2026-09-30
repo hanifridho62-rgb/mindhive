@@ -4,25 +4,24 @@
 Most tests drive `LegRunner` through a fake `run` that answers each child the
 way the real one would, and writes into the leg's log what the real child
 would have printed -- so what is asserted is the order of the steps, their
-argv, where they ran and what environment they got. Two tests use the real
-thing: a toy repository run end to end through the host interpreter (export,
-extract, fresh repository, pytest), and the WSL leg script under a real bash,
-stopping at the first step it cannot do.
+argv, where they ran and what environment they got. Some use the real thing: a
+toy repository run end to end through the host interpreter (a fresh repository
+whose HEAD is the toy's commit, its history borrowed, then pytest), and the WSL
+leg script under a real bash, stopping at the first step it cannot do.
 """
-import io
 import os
 import shutil
 import subprocess
 import sys
-import tarfile
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from mindhive.ci import legrun, legs
 
 COMMIT = "c" * 40
+#: What `git rev-parse --git-path objects` answers for the operator's repository.
+OBJECTS = "C:/origin/.git/objects"
 REAL_DSN = "postgresql://owner@localhost/real-mirror"
 ENV = {"PATH": "C:/Windows/system32", "SYSTEMROOT": "C:/Windows", "TEMP": "C:/t",
        "PYTHONPATH": "C:/elsewhere/src", "PYTHONHOME": "C:/py", "VIRTUAL_ENV": "C:/v",
@@ -36,19 +35,6 @@ GONE = ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "PYTEST_ADDOPTS",
 WSL_ROOT = "/tmp/mindhive-ci.AbC123"
 
 
-def make_tar(path) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(path, "w") as tar:
-        for name, text in (("pyproject.toml", "[project]\nname = 'toy'\n"),
-                           ("src/toy/__init__.py", ""),
-                           ("hooks/a.sh", "#!/bin/sh\n"), ("hooks/b.sh", "#!/bin/sh\n")):
-            data = text.encode("utf-8")
-            info = tarfile.TarInfo(name)
-            info.size = len(data)
-            tar.addfile(info, io.BytesIO(data))
-
-
 def _is_pytest(argv) -> bool:
     return "-m" in argv and argv[argv.index("-m") + 1:argv.index("-m") + 2] == ["pytest"]
 
@@ -58,10 +44,8 @@ class FakeRun:
 
     def __init__(self, pytest=(0, "...\n3 passed in 0.10s\n"), fail=None,
                  script=("", 0), raises=None,
-                 fail_text="ERROR: No matching distribution found for pytest>=8\n",
-                 tree=""):
+                 fail_text="ERROR: No matching distribution found for pytest>=8\n"):
         self.pytest = pytest
-        self.tree = tree
         self.fail = fail
         self.fail_text = fail_text
         self.script = script
@@ -82,12 +66,14 @@ class FakeRun:
         if self.raises and self.raises in line:
             raise RuntimeError("the runner itself broke")
         if self.fail and self.fail in line:
-            say(self.fail_text)
-            return 1, "", ""
-        if "ls-tree" in argv:
-            return 0, self.tree, ""
-        if "archive" in argv:
-            make_tar(argv[argv.index("-o") + 1])
+            say(self.fail_text)             # a captured child's stderr comes back
+            return 1, "", ("" if log is not None else self.fail_text)
+        if "--git-path" in argv:
+            return 0, OBJECTS + "\n", ""
+        if "reset" in argv and "--hard" in argv and cwd is not None:
+            # What a checkout leaves behind: the tree, in the leg's repository.
+            Path(cwd, "pyproject.toml").write_text("[project]\nname = 'toy'\n",
+                                                   encoding="utf-8")
             return 0, "", ""
         if "mktemp" in argv:
             return 0, WSL_ROOT + "\n", ""
@@ -155,7 +141,7 @@ def test_line_endings_follow_the_runner_the_job_names():
 # --- a native leg, step by step ------------------------------------------------------
 
 
-def test_a_windows_leg_runs_its_jobs_steps_in_a_fresh_repo_and_venv(tmp_path):
+def test_a_windows_leg_checks_out_the_commit_itself_then_runs_its_jobs_steps(tmp_path):
     fake = FakeRun()
     the_leg = leg("windows-py3.12")
     res = runner(tmp_path, fake).run(the_leg, avail(the_leg), COMMIT)
@@ -164,23 +150,27 @@ def test_a_windows_leg_runs_its_jobs_steps_in_a_fresh_repo_and_venv(tmp_path):
     work = tmp_path / "work" / "windows-py3.12"
     venv, repo = work / "venv", work / "repo"
     py = str(venv / "Scripts" / "python.exe")
-    archive = fake.call(lambda a: "archive" in a)
-    assert archive["argv"][:4] == ["git", "-c", "core.autocrlf=true", "archive"]
-    assert archive["argv"][-1] == COMMIT and archive["cwd"] == str(tmp_path / "origin")
-    order = [fake.index(lambda a: "archive" in a),
+    named = fake.call(lambda a: "--git-path" in a)
+    assert named["argv"] == ["git", "rev-parse", "--path-format=absolute",
+                             "--git-path", "objects"]
+    assert named["cwd"] == str(tmp_path / "origin")
+    order = [fake.index(lambda a: "--git-path" in a),
              fake.index(lambda a: a[-2:] == ["init", "-q"]),
              fake.index(lambda a: a[1:] == ["config", "core.autocrlf", "true"]),
-             fake.index(lambda a: a[1:] == ["add", "-A", "-f"]),
-             fake.index(lambda a: "commit" in a),
+             fake.index(lambda a: a[1:] == ["config", "core.longpaths", "true"]),
+             fake.index(lambda a: a[1:] == ["config", "core.hooksPath",
+                                            str(work / "no-hooks")]),
+             fake.index(lambda a: a[1:] == ["reset", "-q", "--hard", COMMIT]),
              fake.index(lambda a: a == ["C:/py312/python.exe", "-m", "venv", str(venv)]),
              fake.index(lambda a: a == [py, "-m", "pip", "install", "--upgrade", "pip"]),
              fake.index(lambda a: a == [py, "-m", "pip", "install", "-e", ".[dev]"]),
              fake.index(lambda a: a == [py, "-m", "pytest", "-q"])]
     assert order == sorted(order)
-    committed = fake.call(lambda a: "commit" in a)["argv"]
-    assert "user.name=mindhive-ci" in committed and "--no-verify" in committed
+    # The commit itself, checked out: nothing exported, added or committed.
+    assert not any({"archive", "add", "commit", "update-index"} & set(a)
+                   for a in fake.argvs())
     for c in fake.calls:
-        if c["argv"][:2] == [py, "-m"] or c["argv"][0] == "git" and not {"archive", "ls-tree"} & set(c["argv"]):
+        if c["argv"][:2] == [py, "-m"] or c["argv"][0] == "git" and "--git-path" not in c["argv"]:
             assert c["cwd"] == str(repo), c["argv"]
     ran = fake.call(lambda a: a == [py, "-m", "pytest", "-q"])
     assert ran["env"]["PATH"].split(os.pathsep)[0] == str(venv / "Scripts")
@@ -191,47 +181,34 @@ def test_a_windows_leg_runs_its_jobs_steps_in_a_fresh_repo_and_venv(tmp_path):
     assert "3 passed" in Path(res.artifact).read_text(encoding="utf-8")
 
 
-def _tree(*entries) -> str:
-    """What `git ls-tree -r -z` prints for *entries*, each a (mode, path)."""
-    return "".join(f"{mode} blob {'a' * 40}\t{path}\0" for mode, path in entries)
+def test_the_leg_reads_the_operators_history_through_alternates(tmp_path):
+    fake = FakeRun()
+    the_leg = leg("windows-py3.12")
+    runner(tmp_path, fake, keep=True).run(the_leg, avail(the_leg), COMMIT)
+    info = tmp_path / "work" / "windows-py3.12" / "repo" / ".git" / "objects" / "info"
+    assert (info / "alternates").read_bytes() == (OBJECTS + "\n").encode("utf-8")
+    assert [p.name for p in info.iterdir()] == ["alternates"]
 
 
-def test_a_native_leg_puts_back_the_executable_bits_git_add_drops(tmp_path):
-    # `git add` on Windows records every file 100644: a test that checks a
-    # shim's bit passes on a runner and fails on the leg, unless the bits the
-    # tested tree holds are put back before the commit.
-    fake = FakeRun(tree=_tree(("100755", "hooks/a.sh"), ("100644", "pyproject.toml"),
-                              ("100755", "not/exported.sh"), ("120000", "hooks/link")))
+@pytest.mark.parametrize("via", ["native", "wsl"])
+def test_an_object_store_git_cannot_name_is_an_error_before_any_checkout(tmp_path, via):
+    fake = FakeRun(fail="--git-path", fail_text="fatal: not a git repository\n")
+    the_leg = leg("ubuntu-py3.12" if via == "wsl" else "windows-py3.12")
+    res = runner(tmp_path, fake).run(the_leg, avail(the_leg, via=via), COMMIT)
+    assert (res.state, res.step, res.exit_code) == ("error", "objects", 1)
+    assert res.reason == "fatal: not a git repository"
+    assert fake.argvs() == [["git", "rev-parse", "--path-format=absolute",
+                             "--git-path", "objects"]]
+
+
+def test_a_commit_git_cannot_check_out_is_an_error_at_checkout(tmp_path):
+    fake = FakeRun(fail="reset -q --hard", fail_text=f"fatal: bad object {COMMIT}\n")
     the_leg = leg("windows-py3.12")
     res = runner(tmp_path, fake).run(the_leg, avail(the_leg), COMMIT)
-    assert res.state == "success", (res.step, res.reason)
-    listed = fake.call(lambda a: "ls-tree" in a)
-    assert listed["argv"] == ["git", "ls-tree", "-r", "-z", COMMIT]
-    assert listed["cwd"] == str(tmp_path / "origin")
-    chmods = [c["argv"] for c in fake.calls if "update-index" in c["argv"]]
-    assert chmods == [["git", "update-index", "--chmod=+x", "--", "hooks/a.sh"]]
-    assert fake.call(lambda a: "update-index" in a)["cwd"] == str(
-        tmp_path / "work" / "windows-py3.12" / "repo")
-    assert (fake.index(lambda a: a[1:] == ["add", "-A", "-f"])
-            < fake.index(lambda a: "update-index" in a)
-            < fake.index(lambda a: "commit" in a))
+    assert (res.state, res.step, res.exit_code) == ("error", "checkout", 1)
+    assert res.reason == f"fatal: bad object {COMMIT}"
+    assert not any(_is_pytest(a) or "venv" in a for a in fake.argvs())
 
-
-def test_the_executable_bits_go_back_a_bounded_batch_at_a_time(tmp_path, monkeypatch):
-    monkeypatch.setattr(legrun, "CHMOD_BATCH", 1)
-    fake = FakeRun(tree=_tree(("100755", "hooks/a.sh"), ("100755", "hooks/b.sh")))
-    the_leg = leg("windows-py3.12")
-    assert runner(tmp_path, fake).run(the_leg, avail(the_leg), COMMIT).state == "success"
-    assert [c["argv"][4:] for c in fake.calls if "update-index" in c["argv"]] == [
-        ["hooks/a.sh"], ["hooks/b.sh"]]
-
-
-def test_a_tree_git_cannot_list_is_an_error_before_anything_is_exported(tmp_path):
-    fake = FakeRun(fail="ls-tree")
-    the_leg = leg("windows-py3.12")
-    res = runner(tmp_path, fake).run(the_leg, avail(the_leg), COMMIT)
-    assert (res.state, res.step, res.exit_code) == ("error", "exec-bits", 1)
-    assert not any("archive" in a for a in fake.argvs())
 
 
 def test_a_red_suite_is_a_failure_with_its_failed_tests_named(tmp_path):
@@ -344,8 +321,7 @@ def test_an_ubuntu_leg_on_linux_keeps_lf_and_uses_the_venvs_bin(tmp_path):
     res = runner(tmp_path, fake, windows=False).run(
         the_leg, avail(the_leg, python="/usr/bin/python3.12"), COMMIT)
     assert res.state == "success"
-    assert fake.call(lambda a: "archive" in a)["argv"][:3] == [
-        "git", "-c", "core.autocrlf=false"]
+    assert fake.call(lambda a: a[1:3] == ["config", "core.autocrlf"])["argv"][3] == "false"
     py = str(tmp_path / "work" / "ubuntu-py3.12" / "venv" / "bin" / "python")
     assert fake.call(_is_pytest)["argv"] == [py, "-m", "pytest", "-q"]
 
@@ -366,26 +342,23 @@ def test_keep_leaves_the_leg_for_inspection(tmp_path):
 
 # --- a WSL leg ------------------------------------------------------------------------
 
-WSL_OK = ("::mindhive-ci:: step git-init\n::mindhive-ci:: step venv: ...\n"
+WSL_OK = ("::mindhive-ci:: step checkout\n::mindhive-ci:: step venv: ...\n"
           f"::mindhive-ci:: step pytest: {WSL_ROOT}-venv/bin/python -m pytest -q\n"
           "....\n5 passed in 1.00s\n::mindhive-ci:: pytest-exit 0\n")
 
 
-def test_a_wsl_leg_ships_the_tree_on_stdin_and_runs_the_script_in_a_login_shell(tmp_path):
+def test_a_wsl_leg_runs_the_script_in_a_login_shell_on_the_commit_and_its_store(tmp_path):
     fake = FakeRun(script=(WSL_OK, 0))
     the_leg = leg("ubuntu-py3.14")
     py = "/home/u/.local/bin/python3.14"
     res = runner(tmp_path, fake).run(the_leg, avail(the_leg, python=py, via="wsl"), COMMIT)
     assert (res.state, res.step, res.exit_code, res.counts) == (
         "success", "pytest", 0, {"passed": 5})
-    assert fake.call(lambda a: "archive" in a)["argv"][:3] == [
-        "git", "-c", "core.autocrlf=false"]
-    extract = fake.call(lambda a: a[:3] == ["wsl.exe", "--exec", "tar"])
-    assert extract["argv"] == ["wsl.exe", "--exec", "tar", "-x", "-C", WSL_ROOT]
-    assert isinstance(extract["stdin"], bytes) and extract["stdin"][257:262] == b"ustar"
+    assert fake.call(lambda a: "--git-path" in a)["cwd"] == str(tmp_path / "origin")
+    assert not any("archive" in a or "tar" in a for a in fake.argvs())
     script = fake.call(lambda a: "bash" in a)
     assert script["argv"] == ["wsl.exe", "--exec", "bash", "-l", "-s", "--", WSL_ROOT,
-                              py, "dev", "5", "-q"]
+                              COMMIT, OBJECTS, py, "dev", "5", "-q"]
     assert script["stdin"] == legrun.POSIX_LEG_SCRIPT
     assert script["env"] == {"WSLENV": "", "WSL_UTF8": "1"}
     assert fake.calls[-1]["argv"] == ["wsl.exe", "--exec", "rm", "-rf", "--", WSL_ROOT,
@@ -438,8 +411,8 @@ def _bash():
 @pytest.mark.skipif(_bash() is None, reason="no POSIX sh on this machine")
 def test_the_leg_script_stops_at_the_first_step_it_cannot_do(tmp_path):
     missing = tmp_path / "no such dir"
-    proc = subprocess.run([_bash(), "-s", "--", str(missing), "python3.99", "dev",
-                           "60", "-q"],
+    proc = subprocess.run([_bash(), "-s", "--", str(missing), COMMIT, OBJECTS,
+                           "python3.99", "dev", "60", "-q"],
                           input=legrun.POSIX_LEG_SCRIPT.encode("utf-8"),
                           capture_output=True, timeout=60)
     out = proc.stdout.decode("utf-8", "replace")
@@ -468,22 +441,22 @@ def test_the_leg_script_unsets_what_leg_env_drops_whatever_its_case():
     assert not names & {n for n in names if n.upper() == "GH_TOKEN"}
 
 
-TOY_TEST = '''\
+TOY_TEST = """\
 import os
 import subprocess
 
 
-def test_the_leg_is_a_fresh_repository_with_one_commit():
+def test_the_leg_holds_the_commit_under_test_and_its_history():
     out = subprocess.run(["git", "rev-list", "--count", "HEAD"],
                          capture_output=True, text=True, check=True)
-    assert out.stdout.strip() == "1"
+    assert out.stdout.strip() == "2"
 
 
 def test_the_leg_environment_was_built_not_inherited():
     assert "MINDHIVE_PROJECT" not in os.environ
     assert "PYTEST_ADDOPTS" not in os.environ
     assert os.path.basename(os.environ["MINDHIVE_HOME"]) == "home"
-'''
+"""
 
 
 def _git(repo, *args) -> str:
@@ -493,10 +466,9 @@ def _git(repo, *args) -> str:
     return proc.stdout.strip()
 
 
-@pytest.mark.parametrize("runs_on,data", [("windows-latest", b"one\r\ntwo\r\n"),
-                                          ("ubuntu-latest", b"one\ntwo\n")])
-def test_a_real_leg_exports_commits_and_runs_the_suite_in_a_fresh_repo(
-        tmp_path, runs_on, data):
+def _toy_origin(tmp_path):
+    """Two commits; the second -- the one a leg tests -- holds a toy project.
+    ``(origin, first, second)``."""
     origin = tmp_path / "origin"
     (origin / "tests").mkdir(parents=True)
     for rel, text in (("pyproject.toml", '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n'),
@@ -506,10 +478,20 @@ def test_a_real_leg_exports_commits_and_runs_the_suite_in_a_fresh_repo(
     ident = ["-c", "user.name=t", "-c", "user.email=t@example.invalid",
              "-c", "commit.gpgsign=false", "-c", "core.autocrlf=false"]
     _git(origin, "init", "-q", "-b", "master")
+    _git(origin, *ident, "commit", "-q", "--allow-empty", "-m", "first")
+    first = _git(origin, "rev-parse", "HEAD")
     _git(origin, *ident, "add", "-A")
     _git(origin, "update-index", "--chmod=+x", "run.sh")
     _git(origin, *ident, "commit", "-q", "-m", "toy")
-    commit = _git(origin, "rev-parse", "HEAD")
+    return origin, first, _git(origin, "rev-parse", "HEAD")
+
+
+@pytest.mark.parametrize("runs_on,data", [("windows-latest", b"one\r\ntwo\r\n"),
+                                          ("ubuntu-latest", b"one\ntwo\n")])
+def test_a_real_leg_checks_out_the_commit_with_its_history_and_runs_the_suite(
+        tmp_path, runs_on, data):
+    origin, first, commit = _toy_origin(tmp_path)
+    refs = _git(origin, "for-each-ref")
     toy = legs.Leg(name="toy", job="test", ci_name="toy", runs_on=runs_on,
                    host=legs.HOST_LOCAL, python="", tier=legs.TIER_DEFAULT,
                    extras="dev", note="a toy leg")
@@ -523,44 +505,47 @@ def test_a_real_leg_exports_commits_and_runs_the_suite_in_a_fresh_repo(
     assert res.counts.get("passed") == 2
     repo = tmp_path / "work" / "toy" / "repo"
     assert (repo / "data.txt").read_bytes() == data
-    assert _git(repo, "rev-list", "--count", "HEAD") == "1"
+    # The commit itself, with its history readable -- what `fetch-depth: 0`
+    # checks out -- never a one-commit copy of its tree.
+    assert _git(repo, "rev-parse", "HEAD") == commit
+    assert _git(repo, "rev-list", "--count", "HEAD") == "2"
+    assert _git(repo, "cat-file", "-t", first) == "commit"
     # Tracked files only: the leg's own pytest writes `tests/__pycache__/`, as
     # CI's does. What this proves is that the checkout's line endings and the
     # repository's autocrlf agree, so no tracked file reads as modified.
     assert _git(repo, "status", "--porcelain", "--untracked-files=no") == ""
-    assert _git(repo, "log", "-1", "--format=%an") == "mindhive-ci"
-    # The tested tree's executable bit survives wherever `git add` ran, and
-    # only its: a file the tree holds 100644 stays so.
+    # The modes are the tree's own, on every OS: a file the tree holds 100755
+    # is so in the leg's index, and one it holds 100644 stays so.
     assert _git(repo, "ls-files", "-s", "run.sh").split()[0] == "100755"
     assert _git(repo, "ls-files", "-s", "data.txt").split()[0] == "100644"
+    # The operator's repository was only read.
+    assert _git(origin, "for-each-ref") == refs
+    assert _git(origin, "status", "--porcelain") == ""
+
+
+@pytest.mark.skipif(_bash() is None, reason="no POSIX sh on this machine")
+def test_the_leg_script_checks_out_the_commit_with_its_history_first(tmp_path):
+    origin, first, commit = _toy_origin(tmp_path)
+    objects = _git(origin, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+    root = tmp_path / "leg"
+    root.mkdir()
+    proc = subprocess.run([_bash(), "-s", "--", root.as_posix(), commit, objects,
+                           "python3.99", "dev", "60", "-q"],
+                          input=legrun.POSIX_LEG_SCRIPT.encode("utf-8"),
+                          capture_output=True, timeout=120)
+    out = proc.stdout.decode("utf-8", "replace")
+    assert proc.returncode == legrun.SETUP_FAILED_EXIT, (out, proc.stderr)
+    assert out.splitlines()[-1] == "::mindhive-ci:: setup-failed venv"   # past the checkout
+    assert _git(root, "rev-parse", "HEAD") == commit
+    assert _git(root, "rev-list", "--count", "HEAD") == "2"
+    assert _git(root, "cat-file", "-t", first) == "commit"
+    assert _git(root, "status", "--porcelain") == ""
+    assert (root / "data.txt").read_bytes() == b"one\ntwo\n"          # LF, as ubuntu has it
+
 
 
 # --- what the runner refuses, and what it does when a step cannot -------------------
 
-
-@pytest.mark.parametrize("fallback", [False, True])
-def test_extract_refuses_members_that_leave_the_leg_in_both_branches(
-        tmp_path, monkeypatch, fallback):
-    if fallback:
-        monkeypatch.setattr(legrun, "tarfile", SimpleNamespace(open=tarfile.open))  # the fallback
-    good = tmp_path / "good.tar"
-    make_tar(good)
-    legrun.extract(good, tmp_path / "ok")
-    assert (tmp_path / "ok" / "pyproject.toml").is_file()             # canary
-    for name, kind, link in (("../escaped.txt", tarfile.REGTYPE, ""),
-                             ("src/link", tarfile.SYMTYPE, "../../../outside")):
-        evil = tmp_path / "evil.tar"
-        with tarfile.open(evil, "w") as tar:
-            info = tarfile.TarInfo(name)
-            info.type, info.linkname = kind, link
-            if kind == tarfile.REGTYPE:
-                info.size = 1
-                tar.addfile(info, io.BytesIO(b"x"))
-            else:
-                tar.addfile(info)
-        with pytest.raises((ValueError, tarfile.TarError)):
-            legrun.extract(evil, tmp_path / "leg")
-    assert not (tmp_path / "escaped.txt").exists()
 
 @pytest.mark.skipif(_bash() is None, reason="no POSIX sh on this machine")
 def test_the_leg_script_scrubs_the_environment_before_it_builds_anything(tmp_path):
@@ -576,8 +561,8 @@ def test_the_leg_script_scrubs_the_environment_before_it_builds_anything(tmp_pat
     env = {**os.environ, "PATH": shim.as_posix() + os.pathsep + os.environ["PATH"],
            "GITHUB_TOKEN": "t", "gh_token": "t", "npm_config_token": "t",
            "MINDHIVE_PROJECT": "leaky", "PYTHONPATH": "/elsewhere", "KEEP_ME": "1"}
-    proc = subprocess.run([_bash(), "-s", "--", root.as_posix(), "python3.99", "dev",
-                           "60", "-q"], input=legrun.POSIX_LEG_SCRIPT.encode("utf-8"),
+    proc = subprocess.run([_bash(), "-s", "--", root.as_posix(), COMMIT, OBJECTS,
+                           "python3.99", "dev", "60", "-q"], input=legrun.POSIX_LEG_SCRIPT.encode("utf-8"),
                           capture_output=True, env=env, timeout=120)
     assert proc.returncode == legrun.SETUP_FAILED_EXIT, proc.stderr    # stops at the venv
     names = {line.split("=", 1)[0] for line in dump.read_text(encoding="utf-8").splitlines()}
@@ -599,8 +584,8 @@ def test_the_leg_script_takes_windows_mnt_directories_off_path(tmp_path):
     os.chmod(shim / "git", 0o755)
     env = {**os.environ, "PATH": "/mnt/c/Windows/System32" + os.pathsep + shim.as_posix() + os.pathsep
            + os.environ["PATH"]}
-    proc = subprocess.run([_bash(), "-s", "--", root.as_posix(), "python3.99", "dev",
-                           "60", "-q"], input=legrun.POSIX_LEG_SCRIPT.encode("utf-8"),
+    proc = subprocess.run([_bash(), "-s", "--", root.as_posix(), COMMIT, OBJECTS,
+                           "python3.99", "dev", "60", "-q"], input=legrun.POSIX_LEG_SCRIPT.encode("utf-8"),
                           capture_output=True, env=env, timeout=120)
     assert proc.returncode == legrun.SETUP_FAILED_EXIT, proc.stderr
     seen = [l for l in dump.read_text(encoding="utf-8").splitlines() if l.startswith("PATH=")]

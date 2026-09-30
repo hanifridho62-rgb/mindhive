@@ -12,6 +12,11 @@ name: CI
 # as `mindhive-ci` commit statuses; `tests/test_ci_legs.py` pins its leg
 # catalog to the jobs below, so a job added here fails that test until it has
 # a leg.
+#
+# Every checkout is `fetch-depth: 0`: the suite reads history
+# (`tests/test_implementation_plan.py` names a commit), so a one-commit
+# checkout is red on master itself. Each pre-merge leg checks out the tested
+# commit with its whole history the same way, and one test pins both.
 on:
   workflow_dispatch:
   push:
@@ -42,6 +47,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v6
@@ -79,6 +86,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -119,6 +128,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -173,6 +184,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v6
