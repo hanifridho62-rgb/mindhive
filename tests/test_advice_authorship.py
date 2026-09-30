@@ -1577,3 +1577,23 @@ def test_every_spawn_site_is_counted_and_an_agent_module_calls_the_scrub():
     for rel in TOOL_SPAWNERS:
         assert SPAWN_SITES[rel][1] == 0, rel
 
+
+def test_the_legend_names_every_child_handed_neither_token_nor_secret():
+    """`docs/session-legend.md`'s `advice.py` row is where an auditor reads which
+    children run with the secret withheld as well as the token; a child it does
+    not name reads as one that keeps the secret."""
+    import ast
+    from pathlib import Path
+    root = Path(advice.__file__).resolve().parent
+    withholding = set()
+    for path in sorted(root.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Call) and any(
+                    k.arg == "withhold_secret" and getattr(k.value, "value", None) is True
+                    for k in node.keywords):
+                withholding.add(path.relative_to(root).with_suffix("").as_posix())
+    assert {"ci/runner", "ci/proc"} <= withholding        # canary: the walk sees them
+    legend = Path(__file__).resolve().parents[1] / "docs" / "session-legend.md"
+    row = next(line for line in legend.read_text(encoding="utf-8").splitlines()
+               if line.startswith("| `advice.py` |"))
+    assert [m for m in sorted(withholding) if f"`{m}." not in row] == []

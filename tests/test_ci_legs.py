@@ -185,6 +185,19 @@ def test_leg_names_are_unique_and_every_departure_is_written_down():
             assert leg.note == "", leg.name
 
 
+def test_the_readme_counts_and_names_every_leg_that_departs_from_its_job():
+    """README.md is where the operator reads the departures: it says how many
+    there are and names each, as the catalog does, so a leg given a note is
+    written down there too."""
+    departing = [leg.name for leg in legs.CATALOG if leg.note]
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    paras = [" ".join(p.split()) for p in readme.split("\n\n")]
+    para = next((p for p in paras if "legs depart from their `ci.yml` job" in p), "")
+    count = ("No", "One", "Two", "Three", "Four", "Five", "Six")[len(departing)]
+    assert f"{count} legs depart" in para, para[:120]
+    assert [n for n in departing if f"`{n}` leg" not in para] == []
+
+
 # --- select ---------------------------------------------------------------------------
 
 

@@ -419,13 +419,15 @@ therefore `fetch-depth: 0`, and each leg has the history the same way.
 
 A leg this machine cannot run is **named, never counted**: the verdict says
 `not run here: pg`. `hive ci legs` shows which legs can run and why the others
-cannot. Two legs depart from their `ci.yml` job, and say so in `hive ci legs
---json`: the `browser` leg runs the interpreter running `hive` (which must
+cannot. Three legs depart from their `ci.yml` job, and say so in `hive ci
+legs --json`: the `browser` leg runs the interpreter running `hive` (which must
 launch playwright's Chromium) against the leg's own `src`, so no Chromium is
-downloaded per run, and the `pg` leg runs only against a throwaway Postgres
-cluster of its own, named by `MINDHIVE_CI_PG_DSN` and `MINDHIVE_CI_PG_DSN_RO`
-— never the operator's own DSNs. A leg whose pytest passed no test is not a
-pass: a tier whose every test skipped proved nothing.
+downloaded per run; the `node` leg runs on this machine with a fresh Python
+3.12 venv rather than on ubuntu-latest, because its cases have no OS or Python
+dimension; and the `pg` leg runs only against a throwaway Postgres cluster of
+its own, named by `MINDHIVE_CI_PG_DSN` and `MINDHIVE_CI_PG_DSN_RO` — never the
+operator's own DSNs. A leg whose pytest passed no test is not a pass: a tier
+whose every test skipped proved nothing.
 
 A PR from a fork is refused unless `--trust`: its legs would run its code on
 this machine as you, so read its diff first. `--legs` runs some legs only:
