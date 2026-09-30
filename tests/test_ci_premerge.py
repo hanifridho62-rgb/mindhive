@@ -11,6 +11,8 @@ test's own store.
 """
 import itertools
 import tempfile
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -818,3 +820,87 @@ def test_the_run_directory_is_removed_unless_keep_is_asked_for(tmp_path, keep, l
     res = rig.pm.run_pr(151, legs_spec="windows-py3.12")
     assert res.verdict == "green" and len(rig.legs.runs) == 1          # canary: a leg did run
     assert any((tmp_path / "work").rglob("left.txt")) is left
+
+
+# --- a verdict GitHub did not take, a conflict the watch found, the sidecar's writers ----
+
+
+def test_a_verdict_github_took_is_published_and_one_it_refused_is_not(tmp_path):
+    ok = Rig(tmp_path / "a", probe=only("windows-py3.12")).pm.run_pr(151)
+    assert ok.published is True
+    refused = Rig(tmp_path / "b", gh=StatusesRefused(),
+                  probe=only("windows-py3.12")).pm.run_pr(151)
+    assert refused.published is False
+    kept = premerge.load_sidecar("test")["prs"]["151"]
+    assert (kept["published"], kept["reason"]) == (False, refused.reason)
+    assert recorded()[-1]["published"] is False
+
+
+def test_a_run_that_posts_no_verdict_has_nothing_to_publish(tmp_path):
+    partial = Rig(tmp_path / "a").pm.run_pr(151, legs_spec="windows-py3.12")
+    silent = Rig(tmp_path / "b", probe=only("windows-py3.12"),
+                 post_statuses=False).pm.run_pr(151)
+    assert (partial.published, silent.published) == (None, None)
+
+
+def test_a_conflict_the_watch_finds_is_a_recorded_red_verdict(tmp_path):
+    rig = Rig(tmp_path)
+    files = tuple(f"src/f{i}.py" for i in range(7))
+    res = rig.pm.record_conflict(151, branch="claude/x", base_ref="master",
+                                 base_sha=NEWBASE, head_sha=HEAD, conflicts=files,
+                                 tree=TREE2)
+    assert (res.verdict, res.exit_code, res.published) == ("red", 1, True)
+    assert res.reason == ("conflicts with master at 333333333333: src/f0.py, src/f1.py, "
+                          "src/f2.py, src/f3.py, src/f4.py and 2 more")
+    assert rig.gh.statuses == [(HEAD, "failure", "mindhive-ci", res.reason)]
+    row = recorded()[0]
+    assert (row["verdict"], row["exit_code"], row["argv"]) == ("red", 1, ["hive", "ci", "watch"])
+    assert (row["commit_sha"], row["base_sha"], row["conflicts"]) == (HEAD, NEWBASE, list(files))
+    assert row["partial"] is False and row["legs"] == []
+    kept = premerge.load_sidecar("test")["prs"]["151"]
+    assert (kept["head_sha"], kept["base_sha"], kept["checked_base_sha"]) == (HEAD, NEWBASE, NEWBASE)
+    assert (kept["verdict"], kept["conflicts"]) == ("red", list(files))
+    assert rig.git.calls == [] and rig.legs.runs == []       # one merge-tree was the check
+
+
+def test_a_conflict_with_statuses_off_posts_nothing(tmp_path):
+    rig = Rig(tmp_path, post_statuses=False)
+    res = rig.pm.record_conflict(151, branch="b", base_ref="master", base_sha=NEWBASE,
+                                 head_sha=HEAD, conflicts=("a.py",))
+    assert res.verdict == "red" and rig.gh.statuses == [] and res.published is None
+
+
+def test_a_retried_mark_survives_a_run_of_the_same_head_and_no_other(tmp_path):
+    premerge.remember("test", 151, {"head_sha": HEAD, "retried": True})
+    Rig(tmp_path / "a", probe=only("windows-py3.12")).pm.run_pr(151)
+    assert premerge.load_sidecar("test")["prs"]["151"]["retried"] is True
+    premerge.remember("test", 151, {"head_sha": NEWHEAD, "retried": True})
+    Rig(tmp_path / "b", probe=only("windows-py3.12")).pm.run_pr(151)
+    assert "retried" not in premerge.load_sidecar("test")["prs"]["151"]
+
+
+def test_a_sidecar_that_cannot_be_read_is_never_overwritten(monkeypatch):
+    premerge.remember("test", 146, {"head_sha": "x"})
+    before = premerge.sidecar_path("test").read_text(encoding="utf-8")
+
+    def denied(path):
+        raise PermissionError(13, "the file is being replaced")
+    monkeypatch.setattr(premerge.paths, "read_text_retry", denied)
+    assert premerge.remember("test", 151, {"head_sha": "y"}) is False
+    assert premerge.sidecar_path("test").read_text(encoding="utf-8") == before
+
+
+def test_writers_of_the_sidecar_take_turns_and_lose_no_entry(monkeypatch):
+    real = premerge.paths.write_text_atomic
+
+    def slow(path, text):
+        time.sleep(0.05)
+        real(path, text)
+    monkeypatch.setattr(premerge.paths, "write_text_atomic", slow)
+    writers = [threading.Thread(target=premerge.remember, args=("test", n, {"head_sha": str(n)}))
+               for n in range(8)]
+    for t in writers:
+        t.start()
+    for t in writers:
+        t.join()
+    assert sorted(premerge.load_sidecar("test")["prs"]) == [str(n) for n in range(8)]

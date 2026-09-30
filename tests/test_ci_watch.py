@@ -6,6 +6,7 @@ store, because what `watch` decides is a function of what `premerge` last
 remembered."""
 import pytest
 
+from mindhive import events
 from mindhive.ci import github as gh_mod
 from mindhive.ci import premerge, watch
 
@@ -36,16 +37,26 @@ class FakeGitHub:
 
 
 class FakePremerge:
-    def __init__(self, gh, base=BASE, fetch_error="", verdict="green"):
+    """`run_pr` and `fetch_base` are fakes; `record_conflict` is the real one,
+    so what a conflict records and posts is what premerge would."""
+
+    def __init__(self, gh, base=BASE, fetch_error="", verdict="green", status_errors=()):
         self.github, self.project, self.post_statuses = gh, "test", True
         self.base, self.fetch_error, self.verdict = base, fetch_error, verdict
+        self.status_errors = list(status_errors)
         self.runs, self.fetches = [], []
 
     def run_pr(self, number, *, legs_spec=None, merge=False, allow_base_drift=False):
         self.runs.append((number, legs_spec, merge))
         return premerge.PremergeResult(pr_id=number, verdict=self.verdict,
                                        exit_code={"green": 0, "red": 1}.get(self.verdict, 2),
-                                       reason=f"{self.verdict}: 9 leg(s)")
+                                       reason=f"{self.verdict}: 9 leg(s)",
+                                       status_errors=list(self.status_errors))
+
+    def record_conflict(self, number, **kw):
+        real = premerge.Premerge("repo", project=self.project, github=self.github,
+                                 probe=object(), post_statuses=self.post_statuses)
+        return real.record_conflict(number, **kw)
 
     def fetch_base(self, base_ref="master"):
         self.fetches.append(base_ref)
@@ -237,3 +248,81 @@ def test_a_conflict_over_many_files_names_five_and_counts_the_rest():
     detail = w.once()[0]["detail"]
     assert detail.endswith("src/f0.py, src/f1.py, src/f2.py, src/f3.py, src/f4.py and 2 more")
     assert gh.statuses[0][3] == detail
+
+
+class _RefusingGitHub(FakeGitHub):
+    def post_status(self, sha, state, context="mindhive-ci", description=""):
+        super().post_status(sha, state, context, description)
+        return "status mindhive-ci=failure on 222222222222: HTTP 403: Resource not accessible"
+
+
+def test_a_conflict_whose_status_could_not_be_posted_says_so():
+    remembered()
+    pm = FakePremerge(_RefusingGitHub(), base=NEWBASE)
+    w, said = watcher(pm, merge_tree=MergeTree((TREE2, ("src/a.py",), "")))
+    action = w.once()[0]
+    assert action["action"] == "conflict"
+    assert "HTTP 403" in action["detail"] and "HTTP 403" in said[0]
+    assert premerge.load_sidecar("test")["prs"]["151"]["published"] is False
+
+
+def test_a_conflict_the_watch_finds_reaches_the_ledger():
+    remembered()
+    pm = FakePremerge(FakeGitHub(), base=NEWBASE)
+    w, _ = watcher(pm, merge_tree=MergeTree((TREE2, ("src/a.py",), "")))
+    w.once()
+    rows = [e.payload for e in events.read_all("test") if e.type == "verification"]
+    assert [(r["gate"], r["verdict"], r["conflicts"]) for r in rows] == [
+        ("premerge", "red", ["src/a.py"])]
+
+
+def test_a_red_that_errors_alone_made_is_tried_again_once():
+    remembered(verdict="red", legs={"windows-py3.12": "error", "node": "success"})
+    pm = FakePremerge(FakeGitHub(), verdict="red")
+    w, said = watcher(pm)
+    action = w.once()[0]
+    assert action["action"] == "tested" and pm.runs == [(151, None, False)]
+    assert said[0].startswith("PR #151: tested -- RED: tried again once")
+    assert premerge.load_sidecar("test")["prs"]["151"]["retried"] is True
+    assert w.once()[0]["action"] == "unchanged" and len(pm.runs) == 1
+
+
+@pytest.mark.parametrize("legs_", [{"windows-py3.12": "failure", "node": "error"},
+                                   {"windows-py3.12": "failure"}])
+def test_a_red_a_failing_test_made_is_not_tried_again(legs_):
+    remembered(verdict="red", legs=legs_)
+    pm = FakePremerge(FakeGitHub())
+    w, _ = watcher(pm)
+    assert w.once()[0]["action"] == "unchanged" and pm.runs == []
+
+
+def test_a_verdict_github_refused_is_posted_again_on_the_next_pass():
+    remembered(published=False, reason="green: 8 leg(s) passed")
+    gh = FakeGitHub()
+    pm = FakePremerge(gh)
+    w, said = watcher(pm)
+    action = w.once()[0]
+    assert (action["action"], action["verdict"]) == ("republished", "green")
+    assert gh.statuses == [(HEAD, "success", "mindhive-ci", "green: 8 leg(s) passed")]
+    assert said == ["PR #151: its green verdict is posted again -- green: 8 leg(s) passed"]
+    assert premerge.load_sidecar("test")["prs"]["151"]["published"] is True
+    assert w.once()[0]["action"] == "unchanged" and len(gh.statuses) == 1
+    assert pm.runs == []
+
+
+def test_a_watch_with_statuses_off_posts_no_verdict_again():
+    remembered(published=False, reason="green: 8 leg(s) passed")
+    gh = FakeGitHub()
+    pm = FakePremerge(gh)
+    pm.post_statuses = False
+    w, _ = watcher(pm)
+    assert w.once()[0]["action"] == "unchanged" and gh.statuses == []
+
+
+def test_a_tested_pr_whose_statuses_were_refused_says_so():
+    pm = FakePremerge(FakeGitHub(), status_errors=["status mindhive-ci on 2222: HTTP 403"])
+    w, said = watcher(pm)
+    action = w.once()[0]
+    assert action["status_errors"] == ["status mindhive-ci on 2222: HTTP 403"]
+    assert said == ["PR #151: tested -- GREEN: green: 9 leg(s); "
+                    "1 status(es) could not be posted"]

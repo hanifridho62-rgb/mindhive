@@ -18,6 +18,13 @@ A pass reads the open PRs and, for each, what `premerge` last tested
   merges cleanly is tested in full: no leg ever ran on it. A PR whose last
   check could not be made is tried again when the base moves.
 
+A conflict is recorded as `premerge` records a verdict (`Premerge.
+record_conflict`), so the ledger and `hive ci status` see the PR go red. A red
+that errors alone made -- a leg whose setup broke, no test failing and no
+conflict -- is tested again once for its head: what broke may have been this
+machine. A verdict GitHub refused to take as a status is posted again on the
+next pass.
+
 A PR from a fork is skipped: its legs would run its code here, and only
 `hive ci premerge N --trust`, once its diff is read, runs it. A PR whose last
 run tested fewer legs than this watch asks for is tested again.
@@ -29,7 +36,6 @@ and the loop goes on.
 """
 import time
 
-from .. import events
 from . import github as gh_mod
 from . import legs as legs_mod
 from . import premerge as premerge_mod
@@ -47,7 +53,11 @@ def describe(action) -> str:
     kind, detail = action.get("action"), action.get("detail") or ""
     verdict = str(action.get("verdict") or "")
     if kind == "tested":
-        return f"{subject}: tested -- {verdict.upper()}: {detail}"
+        refused = len(action.get("status_errors") or ())
+        return (f"{subject}: tested -- {verdict.upper()}: {detail}"
+                + (f"; {refused} status(es) could not be posted" if refused else ""))
+    if kind == "republished":
+        return f"{subject}: its {verdict} verdict is posted again -- {detail}"
     if kind == "conflict":
         return f"{subject}: RED -- {detail}"
     if kind == "base-moved":
@@ -126,12 +136,43 @@ class Watcher:
         selected = last.get("selected")
         return selected is None or self._wanted <= set(selected)
 
-    def _test(self, n) -> dict:
+    @staticmethod
+    def _retryable(last) -> bool:
+        """A red that errors alone made -- no conflict, no failing test -- and
+        not tried again yet for this head."""
+        if last.get("verdict") != "red" or last.get("conflicts") or last.get("retried"):
+            return False
+        states = set((last.get("legs") or {}).values())
+        return "error" in states and "failure" not in states
+
+    def _test(self, n, why="") -> dict:
         res = self.premerge.run_pr(n, legs_spec=self.legs_spec)
-        return {"pr": n, "action": "tested", "verdict": res.verdict,
-                "exit_code": res.exit_code, "detail": res.reason}
+        action = {"pr": n, "action": "tested", "verdict": res.verdict,
+                  "exit_code": res.exit_code, "detail": why + res.reason}
+        if res.status_errors:
+            action["status_errors"] = list(res.status_errors)
+        return action
+
+    def _republish(self, n, last) -> dict:
+        verdict = str(last.get("verdict") or "error")
+        reason = str(last.get("reason") or "")
+        why = self.github.post_status(str(last.get("head_sha") or ""),
+                                      premerge_mod.OVERALL_STATE.get(verdict, "error"),
+                                      gh_mod.CONTEXT, reason)
+        if why:
+            return {"pr": n, "action": "error",
+                    "detail": f"the {verdict} verdict still could not be posted: {why}"}
+        premerge_mod.remember(self.project, n, {**last, "published": True})
+        return {"pr": n, "action": "republished", "verdict": verdict, "detail": reason}
 
     def _recheck(self, n, pr, last) -> dict:
+        if last.get("published") is False and self.premerge.post_statuses:
+            return self._republish(n, last)
+        # The mark goes down before the run: a run that cannot record it
+        # must not be tried again on every pass.
+        if self._retryable(last) and premerge_mod.remember(
+                self.project, n, {**last, "retried": True}):
+            return self._test(n, why="tried again once, its last red was errors alone: ")
         base_ref = str(pr.get("baseRefName") or "")
         base_now, error = self.premerge.fetch_base(base_ref)
         if error:
@@ -146,7 +187,7 @@ class Watcher:
         if error:
             return self._test(n)
         if conflicts:
-            return self._conflict(n, base_ref, base_now, head, conflicts, last)
+            return self._conflict(n, pr, base_ref, base_now, head, tree, conflicts)
         if last.get("verdict") == "red" and last.get("conflicts"):
             return self._test(n)
         premerge_mod.remember(self.project, n, {**last, "checked_base_sha": base_now,
@@ -154,14 +195,11 @@ class Watcher:
         return {"pr": n, "action": "base-moved", "verdict": last.get("verdict"),
                 "detail": f"{base_ref} at {base_now[:12]}"}
 
-    def _conflict(self, n, base_ref, base_now, head, conflicts, last) -> dict:
-        shown = ", ".join(conflicts[:5])
-        if len(conflicts) > 5:
-            shown += f" and {len(conflicts) - 5} more"
-        detail = f"conflicts with {base_ref} at {base_now[:12]}: {shown}"
-        if self.premerge.post_statuses:
-            self.github.post_status(head, "failure", gh_mod.CONTEXT, detail)
-        premerge_mod.remember(self.project, n, {
-            **last, "verdict": "red", "exit_code": 1, "conflicts": list(conflicts),
-            "checked_base_sha": base_now, "ts": events.now_iso()})
-        return {"pr": n, "action": "conflict", "verdict": "red", "detail": detail}
+    def _conflict(self, n, pr, base_ref, base_now, head, tree, conflicts) -> dict:
+        res = self.premerge.record_conflict(
+            n, branch=str(pr.get("headRefName") or ""), base_ref=base_ref,
+            base_sha=base_now, head_sha=head, conflicts=conflicts, tree=tree)
+        detail = res.reason
+        if res.status_errors:
+            detail += f"; the status could not be posted: {res.status_errors[0]}"
+        return {"pr": n, "action": "conflict", "verdict": res.verdict, "detail": detail}

@@ -58,6 +58,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .. import events, paths, runlog, verify
+from ..core import locks
 from . import github as gh_mod
 from . import legrun
 from . import legs as legs_mod
@@ -81,6 +82,9 @@ MAX_ROUNDS = 3
 DEFAULT_JOBS = 3
 EXIT_NOT_MERGED = 3
 SIDECAR = "ci_premerge.json"
+#: A watch and a hand-run premerge both write the sidecar: they take turns.
+SIDECAR_LOCK = SIDECAR + ".lock"
+_SIDECAR_LOCK_POLICY = locks.LockPolicy(timeout_s=10.0, stale_s=60.0)
 #: Where the legs run unless told: `<tempdir>/mindhive-ci`, outside the
 #: repository. Under it, a leg would sit inside the operator's checkout -- a
 #: `.claude/worktrees/...` path when that is a linked worktree, which tests
@@ -171,6 +175,9 @@ class PremergeResult:
     rounds: int = 0
     duration_s: float = 0.0
     status_errors: list = field(default_factory=list)
+    #: Whether GitHub took the overall `mindhive-ci` status: None when this
+    #: run posted none (statuses off, a partial run, a branch).
+    published: object = None
     merge_state: str = ""
     merge_commit: str = ""
     landed_tree_matches: object = None
@@ -196,6 +203,7 @@ class PremergeResult:
                 "reason": self.reason, "rounds": self.rounds,
                 "duration_s": round(self.duration_s, 3),
                 "status_errors": list(self.status_errors),
+                "published": self.published,
                 "merge_state": self.merge_state, "merge_commit": self.merge_commit,
                 "landed_tree_matches": self.landed_tree_matches,
                 "notes": list(self.notes)}
@@ -271,16 +279,19 @@ def sidecar_path(project=None) -> Path:
     return paths.state_dir(project) / SIDECAR
 
 
-def load_sidecar(project=None) -> dict:
-    """The last tested head, base and tree per PR (and per branch). Total: a
-    missing or unreadable file is an empty one."""
-    empty = {"version": 1, "prs": {}, "branches": {}}
+def _read_sidecar(project) -> dict:
+    """The sidecar. A missing file is an empty one, and so is one too damaged
+    to parse; one that is there but cannot be read raises OSError."""
     try:
-        data = json.loads(sidecar_path(project).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return empty
+        text = paths.read_text_retry(sidecar_path(project))
+    except FileNotFoundError:
+        text = ""
+    try:
+        data = json.loads(text) if text.strip() else {}
+    except ValueError:
+        data = {}
     if not isinstance(data, dict):
-        return empty
+        data = {}
     for bucket in ("prs", "branches"):
         if not isinstance(data.get(bucket), dict):
             data[bucket] = {}
@@ -288,14 +299,27 @@ def load_sidecar(project=None) -> dict:
     return data
 
 
-def remember(project, key, entry, bucket="prs") -> bool:
-    """Record *entry* under *key*. Never raises: False when it could not."""
+def load_sidecar(project=None) -> dict:
+    """The last tested head, base and tree per PR (and per branch). Total: a
+    missing, damaged or unreadable file is an empty one."""
     try:
-        data = load_sidecar(project)
-        data[bucket][str(key)] = dict(entry)
-        paths.write_text_atomic(sidecar_path(project),
-                                json.dumps(data, indent=2, sort_keys=True,
-                                           ensure_ascii=False) + "\n")
+        return _read_sidecar(project)
+    except OSError:
+        return {"version": 1, "prs": {}, "branches": {}}
+
+
+def remember(project, key, entry, bucket="prs") -> bool:
+    """Record *entry* under *key* with the sidecar's lock held, so two writers
+    cannot drop each other's entries, and never over a file that is there but
+    could not be read. Never raises: False when it could not."""
+    try:
+        with locks.file_lock(paths.state_dir(project) / SIDECAR_LOCK,
+                             _SIDECAR_LOCK_POLICY, name=SIDECAR_LOCK):
+            data = _read_sidecar(project)
+            data[bucket][str(key)] = dict(entry)
+            paths.write_text_atomic(sidecar_path(project),
+                                    json.dumps(data, indent=2, sort_keys=True,
+                                               ensure_ascii=False) + "\n")
         return True
     except Exception:                                   # noqa: BLE001
         return False
@@ -391,7 +415,7 @@ class Premerge:
             res.verdict, res.exit_code = "error", 2
             res.reason = f"premerge broke: {type(exc).__name__}: {exc}"
             if self.post_statuses and res.head_sha and not res.partial:
-                self._status(res, "error", gh_mod.CONTEXT, res.reason)
+                res.published = self._status(res, "error", gh_mod.CONTEXT, res.reason)
         finally:
             self._drop(tag)
         if merge and res.verdict == "green" and res.merge_state != "merged":
@@ -464,12 +488,37 @@ class Premerge:
         finally:
             self._drop(tag)
 
+    def record_conflict(self, number, *, branch, base_ref, base_sha, head_sha,
+                        conflicts, tree="") -> PremergeResult:
+        """`hive ci watch` found PR *number*'s head no longer merging into
+        *base_ref* at *base_sha*. One `git merge-tree` was the check -- a
+        conflict needs no leg -- and the verdict is posted, recorded and
+        remembered as any run's is, so the ledger sees the PR go red."""
+        started = self._clock()
+        res = PremergeResult(pr_id=int(number), branch=str(branch),
+                             base_ref=str(base_ref), mode="github",
+                             argv=["hive", "ci", "watch"],
+                             selected=[leg.name for leg in legs_mod.CATALOG],
+                             base_sha=str(base_sha), head_sha=str(head_sha),
+                             tree=str(tree or ""), conflicts=tuple(conflicts), rounds=1)
+        res.verdict, res.exit_code, _ = decide(
+            preview_mod.Preview(res.base_sha, res.head_sha, conflicts=res.conflicts), [])
+        shown = ", ".join(res.conflicts[:5])
+        more = len(res.conflicts) - 5
+        res.reason = (f"conflicts with {res.base_ref} at {_short(res.base_sha)}: {shown}"
+                      + (f" and {more} more" if more > 0 else ""))
+        if self.post_statuses:
+            res.published = self._status(res, OVERALL_STATE[res.verdict], gh_mod.CONTEXT,
+                                         res.reason)
+        return self._finish(res, started, self._tag(f"pr{res.pr_id}"),
+                            checked_base_sha=res.base_sha)
+
     # --- one round ----------------------------------------------------------------------------
 
     def _round(self, res, tag, chosen, number) -> None:
         res.base_sha = res.head_sha = res.tested_sha = res.tree = ""
         res.conflicts, res.up_to_date, res.legs, res.unavailable = (), False, [], []
-        res.verdict, res.exit_code, res.reason = "error", 2, ""
+        res.verdict, res.exit_code, res.reason, res.published = "error", 2, "", None
         refs = f"{REF_ROOT}/{tag}"
         error = self._fetch([f"+refs/heads/{res.base_ref}:{refs}/base",
                              f"+refs/pull/{number}/head:{refs}/head"])
@@ -508,7 +557,8 @@ class Premerge:
         res.legs = self._run_legs(run_tag, runnable, pv.tested_sha, res, post)
         res.verdict, res.exit_code, res.reason = decide(pv, res.legs, res.unavailable)
         if overall:
-            self._status(res, OVERALL_STATE[res.verdict], gh_mod.CONTEXT, res.reason)
+            res.published = self._status(res, OVERALL_STATE[res.verdict], gh_mod.CONTEXT,
+                                         res.reason)
 
     def _runner_for(self, run_tag):
         if self._leg_runner is not None:
@@ -653,24 +703,27 @@ class Premerge:
         return preview_mod.merge_preview(self.repo_root, base, head, run=self.spawn,
                                          environ=self.environ)
 
-    def _status(self, res, state, context, description) -> None:
+    def _status(self, res, state, context, description) -> bool:
+        """Post one commit status: False, with GitHub's reason kept, when refused."""
         why = self.github.post_status(res.head_sha, state, context, description)
         if why:
             res.status_errors.append(why)
+        return not why
 
     def _tag(self, prefix) -> str:
         return f"{prefix}-{_NOT_STAMP.sub('', self._now_iso())}-{os.getpid()}"
 
     # --- the record ---------------------------------------------------------------------------
 
-    def _finish(self, res, started, tag) -> PremergeResult:
-        """Report, and -- for a run that reached git -- record and remember."""
+    def _finish(self, res, started, tag, **remembered) -> PremergeResult:
+        """Report, and -- for a run that reached git -- record and remember
+        (*remembered* added to the sidecar entry)."""
         res.duration_s = max(0.0, self._clock() - started)
         res.reason = res.reason or "the check could not be made"
         res.report_text = render(res)
         if tag:
             self._record(res, tag)
-            self._remember(res)
+            self._remember(res, **remembered)
             res.report_text = render(res)
         return res
 
@@ -703,7 +756,7 @@ class Premerge:
             "selected": list(res.selected), "partial": res.partial,
             "unavailable": [dict(u) for u in res.unavailable],
             "merge_state": res.merge_state or "skipped",
-            "merge_commit": res.merge_commit,
+            "merge_commit": res.merge_commit, "published": res.published,
             "landed_tree_matches": res.landed_tree_matches,
             "rounds": res.rounds, "duration_s": round(res.duration_s, 3),
         }
@@ -717,7 +770,9 @@ class Premerge:
         except Exception as exc:                        # noqa: BLE001
             res.notes.append(f"the run was not recorded: {type(exc).__name__}: {exc}")
 
-    def _remember(self, res) -> None:
+    def _remember(self, res, **extra) -> None:
+        """Keep what was tested for `hive ci watch`. A `retried` mark -- the
+        watch tried an error-only red again -- lasts as long as the head does."""
         if not res.head_sha:
             return
         entry = {"head_sha": res.head_sha, "base_ref": res.base_ref,
@@ -726,7 +781,12 @@ class Premerge:
                  "exit_code": int(res.exit_code), "ts": self._now_iso(),
                  "conflicts": list(res.conflicts),
                  "legs": {leg.name: leg.state for leg in res.legs},
-                 "selected": list(res.selected)}
+                 "selected": list(res.selected), "published": res.published,
+                 "reason": res.reason, **extra}
+        if res.pr_id:
+            prior = load_sidecar(self.project)["prs"].get(str(res.pr_id)) or {}
+            if prior.get("retried") and prior.get("head_sha") == res.head_sha:
+                entry["retried"] = True
         ok = (remember(self.project, res.pr_id, entry) if res.pr_id
               else remember(self.project, res.branch, entry, bucket="branches"))
         if not ok:
