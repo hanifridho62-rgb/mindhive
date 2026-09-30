@@ -4,6 +4,7 @@ import hashlib
 import itertools
 import os
 import shutil
+import stat
 import sys
 import time
 import re
@@ -652,3 +653,34 @@ def resolve_interpreter(argv, which=None, executable=None) -> tuple:
     why = (f"`{head}` resolves to nothing on PATH" if not found
            else f"`{head}` resolves to a Windows App Execution Alias ({found})")
     return (exe,) + argv[1:], f"{why}; using {exe}"
+
+
+#: `onexc` replaced `onerror` in 3.12 and `onerror` is deprecated for removal.
+#: Both hand the callback the same three positional arguments, so one function
+#: serves either spelling and this build keeps working on 3.11.
+_RMTREE_HANDLER_KW = "onexc" if sys.version_info >= (3, 12) else "onerror"
+
+
+def _force_remove_readonly(func, path, _exc=None) -> None:
+    """Clear the read-only bit and retry, the MEB CI-01 mechanism -- made total
+    over the path that is NOT there, which the MEB spelling is not: on this
+    interpreter `rmtree` of a MISSING root calls the handler with `os.lstat`,
+    so `os.chmod` would be handed a path that does not exist and raise out of
+    the cleanup, on the COMMON case: a tree that never ran pytest has no
+    `.pytest_cache`."""
+    if not os.path.lexists(path):
+        return
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
+def rmtree_force(path) -> None:
+    """`rmtree` that survives read-only files, and a root that is not there.
+    Best-effort: a tree that still cannot go is left, never raised about."""
+    path = Path(path)
+    if not path.exists():
+        return
+    try:
+        shutil.rmtree(path, **{_RMTREE_HANDLER_KW: _force_remove_readonly})
+    except OSError:                                     # noqa: BLE001
+        pass

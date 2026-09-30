@@ -140,10 +140,14 @@ CATALOG = (
 def select(spec=None, catalog=CATALOG) -> tuple:
     """The legs *spec* names -- comma-separated names or globs, like
     ``"windows-*,node"`` -- in catalog order; every leg when *spec* is empty.
-    Raises ValueError naming whatever matched nothing."""
+    Raises ValueError naming whatever matched nothing, and on a *spec* that
+    names nothing at all (``","``)."""
     if not spec:
         return tuple(catalog)
     wanted = [p.strip() for p in str(spec).split(",") if p.strip()]
+    if not wanted:
+        raise ValueError(f"{str(spec)!r} names no leg; legs are: "
+                         + ", ".join(leg.name for leg in catalog))
     unknown = [p for p in wanted
                if not any(fnmatch.fnmatchcase(leg.name, p) for leg in catalog)]
     if unknown:
@@ -196,7 +200,7 @@ class Availability:
 
 class Probe:
     """What this machine can run of the catalog. Each question -- `py -0p`,
-    each interpreter, WSL -- is asked at most once per probe."""
+    each interpreter, WSL -- is asked at most once per probe, until `forget`."""
 
     def __init__(self, run=proc.run, platform=None, which=shutil.which,
                  environ=None, executable=None, wsl_distro=None):
@@ -206,6 +210,12 @@ class Probe:
         self.environ = dict(os.environ if environ is None else environ)
         self.executable = executable or sys.executable
         self.wsl_distro = wsl_distro or ""
+        self.forget()
+
+    def forget(self) -> None:
+        """Drop every answer, so the next check asks again: `hive ci watch`
+        calls it each pass, and a WSL that could not answer one pass -- a cold
+        start past the cap -- is asked again on the next."""
         self._native = None
         self._native_bad = {}
         self._posix = None

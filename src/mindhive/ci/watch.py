@@ -32,7 +32,11 @@ run tested fewer legs than this watch asks for is tested again.
 It never merges: that is `hive ci premerge N --merge`, asked for by name.
 `--once` makes one pass, for a scheduled task. Without it the watch loops,
 sleeping `--interval` seconds between passes; a pass that fails is reported
-and the loop goes on.
+and the loop goes on. Each pass asks this machine again what it can run.
+
+Every action carries the same five keys -- `pr`, `action`, `verdict`,
+`exit_code` and `detail` -- so a script reads one shape; `--json` prints each
+pass's actions as one JSON line.
 """
 import time
 
@@ -44,6 +48,18 @@ from . import preview as preview_mod
 __all__ = ["DEFAULT_INTERVAL_S", "Watcher", "describe"]
 
 DEFAULT_INTERVAL_S = 300.0
+
+#: A verdict's exit code, as `hive ci premerge` exits on it.
+_EXIT = {"green": 0, "red": 1, "error": 2}
+
+
+def _act(n, kind, verdict=None, detail="", exit_code=None, **extra) -> dict:
+    """One action with the five keys every action has. *exit_code* defaults to
+    the verdict's; a skipped PR has neither."""
+    if exit_code is None and verdict is not None:
+        exit_code = _EXIT.get(str(verdict), 2)
+    return {"pr": n, "action": kind, "verdict": verdict, "exit_code": exit_code,
+            "detail": detail, **extra}
 
 
 def describe(action) -> str:
@@ -91,10 +107,15 @@ class Watcher:
 
     def once(self) -> list:
         """One pass. Returns what it did, one action per open PR."""
+        # Asked again each pass: a WSL too cold to answer the last pass's
+        # probe inside its cap may answer this one.
+        forget = getattr(getattr(self.premerge, "probe", None), "forget", None)
+        if callable(forget):
+            forget()
         try:
             prs = self.github.open_prs()
         except gh_mod.GitHubError as exc:
-            action = {"pr": 0, "action": "error", "detail": str(exc)}
+            action = _act(0, "error", "error", str(exc))
             self._say(describe(action))
             return [action]
         known = premerge_mod.load_sidecar(self.project)["prs"]
@@ -102,11 +123,11 @@ class Watcher:
         for pr in prs:
             n = int(pr.get("number") or 0)
             if self.skip_drafts and pr.get("isDraft"):
-                action = {"pr": n, "action": "skipped", "detail": "a draft"}
+                action = _act(n, "skipped", detail="a draft")
             elif gh_mod.from_fork(pr):
-                action = {"pr": n, "action": "skipped",
-                          "detail": f"from a fork; run it by hand with `hive ci premerge "
-                                    f"{n} --trust` once its diff is read"}
+                action = _act(n, "skipped",
+                              detail=f"from a fork; run it by hand with `hive ci premerge "
+                                     f"{n} --trust` once its diff is read")
             else:
                 last = known.get(str(n)) or {}
                 same = (str(pr.get("headRefOid") or "") == last.get("head_sha")
@@ -117,14 +138,20 @@ class Watcher:
             actions.append(action)
         return actions
 
-    def loop(self, passes=None) -> int:
-        """Pass after pass, *passes* times or for ever. Returns the passes made."""
+    def loop(self, passes=None, report=None) -> int:
+        """Pass after pass, *passes* times or for ever. *report*, when given,
+        is handed each pass's actions; a pass that failed is one error action.
+        Returns the passes made."""
         done = 0
         while passes is None or done < passes:
             try:
-                self.once()
+                actions = self.once()
             except Exception as exc:                    # noqa: BLE001
-                self._say(f"watch: a pass failed: {type(exc).__name__}: {exc}")
+                detail = f"a pass failed: {type(exc).__name__}: {exc}"
+                self._say(f"watch: {detail}")
+                actions = [_act(0, "error", "error", detail)]
+            if report is not None:
+                report(actions)
             done += 1
             if passes is None or done < passes:
                 self._sleep(self.interval_s)
@@ -147,8 +174,8 @@ class Watcher:
 
     def _test(self, n, why="") -> dict:
         res = self.premerge.run_pr(n, legs_spec=self.legs_spec)
-        action = {"pr": n, "action": "tested", "verdict": res.verdict,
-                  "exit_code": res.exit_code, "detail": why + res.reason}
+        action = _act(n, "tested", res.verdict, why + res.reason,
+                      exit_code=int(res.exit_code))
         if res.status_errors:
             action["status_errors"] = list(res.status_errors)
         return action
@@ -160,10 +187,10 @@ class Watcher:
                                       premerge_mod.OVERALL_STATE.get(verdict, "error"),
                                       gh_mod.CONTEXT, reason)
         if why:
-            return {"pr": n, "action": "error",
-                    "detail": f"the {verdict} verdict still could not be posted: {why}"}
+            return _act(n, "error", "error",
+                        f"the {verdict} verdict still could not be posted: {why}")
         premerge_mod.remember(self.project, n, {**last, "published": True})
-        return {"pr": n, "action": "republished", "verdict": verdict, "detail": reason}
+        return _act(n, "republished", verdict, reason)
 
     def _recheck(self, n, pr, last) -> dict:
         if last.get("published") is False and self.premerge.post_statuses:
@@ -176,10 +203,9 @@ class Watcher:
         base_ref = str(pr.get("baseRefName") or "")
         base_now, error = self.premerge.fetch_base(base_ref)
         if error:
-            return {"pr": n, "action": "error", "detail": error}
+            return _act(n, "error", "error", error)
         if base_now == (last.get("checked_base_sha") or last.get("base_sha")):
-            return {"pr": n, "action": "unchanged", "verdict": last.get("verdict"),
-                    "detail": ""}
+            return _act(n, "unchanged", last.get("verdict"))
         if last.get("verdict") == "error":
             return self._test(n)
         head = str(last.get("head_sha") or "")
@@ -192,8 +218,7 @@ class Watcher:
             return self._test(n)
         premerge_mod.remember(self.project, n, {**last, "checked_base_sha": base_now,
                                                 "checked_tree": tree})
-        return {"pr": n, "action": "base-moved", "verdict": last.get("verdict"),
-                "detail": f"{base_ref} at {base_now[:12]}"}
+        return _act(n, "base-moved", last.get("verdict"), f"{base_ref} at {base_now[:12]}")
 
     def _conflict(self, n, pr, base_ref, base_now, head, tree, conflicts) -> dict:
         res = self.premerge.record_conflict(
@@ -202,4 +227,4 @@ class Watcher:
         detail = res.reason
         if res.status_errors:
             detail += f"; the status could not be posted: {res.status_errors[0]}"
-        return {"pr": n, "action": "conflict", "verdict": res.verdict, "detail": detail}
+        return _act(n, "conflict", res.verdict, detail)

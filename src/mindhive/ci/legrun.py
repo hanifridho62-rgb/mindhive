@@ -44,7 +44,9 @@ summary naming no passed test -- a tier whose every test skipped proved
 nothing, and must not read as a pass.
 
 Every step appends to one log, kept as a runlog artifact; the leg's
-directory is removed afterwards unless `keep`. `LegRunner.run` never raises.
+directory -- and a WSL leg's tree, venv and home in Linux -- is removed
+afterwards unless `keep`, which names in the log the WSL paths it kept.
+`LegRunner.run` never raises.
 """
 import os
 import re
@@ -52,10 +54,9 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .. import runlog, verify
+from .. import paths, runlog, verify
 from . import legs as legs_mod
 from . import proc
-from .runner import _rmtree_force
 
 __all__ = ["FAILED_CAP", "LEG_TIMEOUT_S", "LegResult", "LegRunner", "MARK",
            "PG_CLUSTER_CHECK", "POSIX_LEG_SCRIPT", "SETUP_FAILED_EXIT", "STATES",
@@ -325,7 +326,7 @@ class LegRunner:
         res.duration_s = self._clock() - started
         self._conclude(res, _read(log))
         if not self.keep:
-            _rmtree_force(leg_dir)
+            paths.rmtree_force(leg_dir)
         return res
 
     # --- steps ----------------------------------------------------------------------
@@ -474,9 +475,12 @@ class LegRunner:
                 _append(log, str(err).rstrip() + "\n")
             self._judge_posix(res, rc, err, _read(log))
         finally:
-            self._run(self.wsl_prefix + ["rm", "-rf", "--", root, f"{root}-venv",
-                                         f"{root}-home"],
-                      env=self.wsl_env, timeout_s=STEP_TIMEOUT_S)
+            if self.keep:
+                _append(log, f"{MARK} kept {root} {root}-venv {root}-home\n")
+            else:
+                self._run(self.wsl_prefix + ["rm", "-rf", "--", root, f"{root}-venv",
+                                             f"{root}-home"],
+                          env=self.wsl_env, timeout_s=STEP_TIMEOUT_S)
 
     def _judge_posix(self, res, rc, err, text) -> None:
         failed = list(_SETUP_FAILED.finditer(text))

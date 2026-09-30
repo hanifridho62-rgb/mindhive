@@ -253,8 +253,11 @@ def test_a_green_run_posts_pending_then_each_leg_then_the_verdict_on_the_head(tm
     assert posted[5:] == [(HEAD, "success", "mindhive-ci", reason)]
     assert [leg.name for leg in res.legs] == ["windows-py3.12", "node"]   # catalog order
     assert any(line.startswith("node: success") for line in rig.said)
-    assert res.merge_state == "" and rig.gh.merges == []
+    assert (res.merge_state, res.merge_reason) == ("skipped", "") and rig.gh.merges == []
     assert f"verdict: GREEN (exit 0) -- {reason}" in res.report_text
+    # Nothing was asked to merge, so no merge line: "premerge:" in the title
+    # holds the same letters, hence a line match rather than a substring one.
+    assert not [line for line in res.report_text.splitlines() if line.startswith("merge:")]
 
 
 def test_the_run_is_recorded_once_and_remembered_for_watch(tmp_path):
@@ -267,7 +270,8 @@ def test_the_run_is_recorded_once_and_remembered_for_watch(tmp_path):
     assert (row["scope"], row["gate"], row["mode"], row["pr_id"]) == ("ci", "premerge", "github", 151)
     assert (row["commit_sha"], row["base_sha"], row["tested_sha"], row["tree"]) == (
         HEAD, BASE, TESTED, TREE)
-    assert row["merge_state"] == "skipped" and row["counts"] == {"passed": 10}
+    assert (row["merge_state"], row["merge_reason"]) == ("skipped", "")
+    assert row["counts"] == {"passed": 10}
     assert [leg["name"] for leg in row["legs"]] == ["windows-py3.12"]
     assert "verdict: GREEN" in row["excerpt"] and row["artifact"]
     kept = premerge.load_sidecar("test")["prs"]["151"]
@@ -367,7 +371,9 @@ def test_a_merge_is_refused_when_the_pr_is_not_the_one_tested(tmp_path, prs, why
     rig = Rig(tmp_path, gh=FakeGitHub(prs=prs), probe=only("windows-py3.12"))
     res = rig.pm.run_pr(151, merge=True)
     assert res.verdict == "green" and rig.gh.merges == []
-    assert (res.merge_state, res.exit_code) == (f"refused: {why}", premerge.EXIT_NOT_MERGED)
+    assert (res.merge_state, res.merge_reason, res.exit_code) == (
+        "refused", why, premerge.EXIT_NOT_MERGED)
+    assert f"merge: refused -- {why}" in res.report_text
 
 
 def test_a_base_that_moved_to_a_different_merge_is_tested_again(tmp_path):
@@ -409,8 +415,8 @@ def test_a_base_that_never_stops_moving_is_refused_after_the_last_round(tmp_path
               previews=Previews(tree_of=lambda base: "t" + base[1:]))
     res = rig.pm.run_pr(151, merge=True)
     assert res.rounds == premerge.MAX_ROUNDS and rig.gh.merges == []
-    assert res.merge_state == ("refused: the base kept moving; 3 rounds tested "
-                               "without landing")
+    assert (res.merge_state, res.merge_reason) == (
+        "refused", "the base kept moving; 3 rounds tested without landing")
     assert res.exit_code == premerge.EXIT_NOT_MERGED
 
 
@@ -419,8 +425,9 @@ def test_a_merge_github_did_not_make_exits_3_in_ghs_words(tmp_path):
         merge_answer=(1, "GraphQL: Base branch was modified. Review and try the merge again."),
         merged_answer=("OPEN", "")))
     res = rig.pm.run_pr(151, merge=True)
-    assert res.merge_state == ("failed: gh pr merge exit 1: GraphQL: Base branch was "
-                               "modified. Review and try the merge again.")
+    assert (res.merge_state, res.merge_reason) == (
+        "failed", "gh pr merge exit 1: GraphQL: Base branch was modified. Review and "
+                  "try the merge again.")
     assert res.exit_code == premerge.EXIT_NOT_MERGED and res.merge_commit == ""
 
 
@@ -600,7 +607,7 @@ def test_merge_is_not_attempted_unless_the_verdict_is_green(tmp_path, probe, sta
     rig = Rig(tmp_path, probe=only(*probe), legs_=Legs(states=states))
     res = rig.pm.run_pr(151, merge=True)
     assert (res.verdict, res.exit_code) == (verdict, code)
-    assert rig.gh.merges == [] and res.merge_state == ""
+    assert rig.gh.merges == [] and res.merge_state == "skipped"
     assert rig.gh.pr_calls == 1                       # never re-read for a merge
 
 
@@ -630,7 +637,8 @@ class ReadBackFails(FakeGitHub):
 def test_a_failed_read_back_is_a_failed_merge_not_a_merged_one(tmp_path):
     rig = Rig(tmp_path, probe=only("windows-py3.12"), gh=ReadBackFails())
     res = rig.pm.run_pr(151, merge=True)
-    assert res.merge_state.startswith("failed: gh pr merge exit 0")
+    assert res.merge_state == "failed"
+    assert res.merge_reason.startswith("gh pr merge exit 0")
     assert (res.exit_code, res.merge_commit) == (premerge.EXIT_NOT_MERGED, "")
     assert any("could not read the PR back after the merge" in n for n in res.notes)
 
@@ -643,7 +651,8 @@ class RereadFails(FakeGitHub):
 def test_gh_failing_to_re_read_the_pr_refuses_the_merge(tmp_path):
     rig = Rig(tmp_path, probe=only("windows-py3.12"), gh=RereadFails())
     res = rig.pm.run_pr(151, merge=True)
-    assert res.merge_state == "refused: could not read the PR again: gh pr view: HTTP 502"
+    assert (res.merge_state, res.merge_reason) == (
+        "refused", "could not read the PR again: gh pr view: HTTP 502")
     assert rig.gh.merges == [] and res.exit_code == premerge.EXIT_NOT_MERGED
 
 class FetchDiesLater(FakeGit):
@@ -656,7 +665,8 @@ class FetchDiesLater(FakeGit):
 def test_a_base_that_cannot_be_re_fetched_before_the_merge_refuses_it(tmp_path):
     rig = Rig(tmp_path, probe=only("windows-py3.12"), git=FetchDiesLater())
     res = rig.pm.run_pr(151, merge=True)
-    assert res.merge_state.startswith("refused: git fetch origin: fatal: unable to access")
+    assert res.merge_state == "refused"
+    assert res.merge_reason.startswith("git fetch origin: fatal: unable to access")
     assert rig.gh.merges == [] and res.exit_code == premerge.EXIT_NOT_MERGED
 
 def test_a_merge_commit_git_cannot_read_leaves_the_landed_tree_unknown(tmp_path):
@@ -679,7 +689,8 @@ def test_a_moved_base_whose_new_merge_cannot_be_computed_refuses_the_merge(tmp_p
               previews=Previews({(NEWBASE, HEAD): broken}))
     res = rig.pm.run_pr(151, merge=True)
     assert rig.gh.merges == []
-    assert res.merge_state.endswith("and the new merge failed: git merge-tree: boom")
+    assert res.merge_state == "refused"
+    assert res.merge_reason.endswith("and the new merge failed: git merge-tree: boom")
     assert res.exit_code == premerge.EXIT_NOT_MERGED
 
 
@@ -970,4 +981,35 @@ def test_ctrl_c_in_the_guarded_merge_says_whether_gh_pr_merge_had_begun(
         rig.pm.run_pr(151, merge=True)
     row = recorded()[0]
     assert (row["verdict"], row["reason"]) == ("error", premerge.INTERRUPTED)
-    assert row["merge_state"].split(":")[0] == state
+    assert row["merge_state"] == state
+    assert row["merge_reason"] == (premerge.MERGE_UNKNOWN if state == "unknown" else "")
+
+
+# --- what a run's record says, in words a script can match ---------------------------
+
+
+def test_a_merge_state_is_one_word_of_its_domain_and_the_why_is_kept_apart(tmp_path):
+    assert premerge.MERGE_STATES == ("merged", "refused", "failed", "unknown", "skipped")
+    one = only("windows-py3.12")
+    for name in "abcd":
+        (tmp_path / name).mkdir()
+    Rig(tmp_path / "a", probe=one).pm.run_pr(151)
+    Rig(tmp_path / "b", probe=one, gh=FakeGitHub(prs=[pr_view(draft=True)])).pm.run_pr(
+        151, merge=True)
+    Rig(tmp_path / "c", probe=one, gh=FakeGitHub(merge_answer=(1, "GraphQL: no"),
+                                                 merged_answer=("OPEN", ""))).pm.run_pr(
+        151, merge=True)
+    Rig(tmp_path / "d", probe=one).pm.run_pr(151, merge=True)
+    assert [(r["merge_state"], r["merge_reason"]) for r in recorded()] == [
+        ("skipped", ""), ("refused", "the PR is a draft"),
+        ("failed", "gh pr merge exit 1: GraphQL: no"), ("merged", "")]
+
+
+def test_the_json_a_run_prints_is_what_its_row_records(tmp_path):
+    res = Rig(tmp_path, probe=only("windows-py3.12", "node")).pm.run_pr(151)
+    row, printed = recorded()[0], res.as_dict()
+    assert set(printed) <= set(row), sorted(set(printed) - set(row))
+    assert {key: row[key] for key in printed} == printed
+    assert row["head_sha"] == row["commit_sha"] == HEAD
+    assert printed["counts"] == {"passed": 10} and printed["artifact"]
+    assert {"notes", "status_errors", "up_to_date", "merge_reason"} <= set(row)

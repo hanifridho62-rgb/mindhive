@@ -366,6 +366,17 @@ def test_a_wsl_leg_runs_the_script_in_a_login_shell_on_the_commit_and_its_store(
     assert res.argv == (py, "-m", "pytest", "-q")
 
 
+def test_keep_leaves_a_wsl_legs_tree_in_wsl_and_says_where(tmp_path):
+    fake = FakeRun(script=(WSL_OK, 0))
+    the_leg = leg("ubuntu-py3.12")
+    res = runner(tmp_path, fake, keep=True).run(
+        the_leg, avail(the_leg, python="python3.12", via="wsl"), COMMIT)
+    assert res.state == "success"
+    assert not any("rm" in a for a in fake.argvs())
+    log = Path(res.artifact).read_text(encoding="utf-8")
+    assert f"::mindhive-ci:: kept {WSL_ROOT} {WSL_ROOT}-venv {WSL_ROOT}-home" in log
+
+
 def test_a_wsl_setup_failure_names_its_step_and_the_tree_is_still_removed(tmp_path):
     text = ("::mindhive-ci:: step venv: python3.12 -m venv /tmp/x-venv\n"
             "Error: ensurepip is not available\n"

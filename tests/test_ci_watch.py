@@ -179,7 +179,7 @@ def test_a_base_that_cannot_be_fetched_is_an_error_not_a_verdict():
     remembered()
     pm = FakePremerge(FakeGitHub(), fetch_error="git fetch origin: Could not resolve host")
     w, said = watcher(pm)
-    assert w.once() == [{"pr": 151, "action": "error",
+    assert w.once() == [{"pr": 151, "action": "error", "verdict": "error", "exit_code": 2,
                          "detail": "git fetch origin: Could not resolve host"}]
     assert said == ["PR #151: could not check -- git fetch origin: Could not resolve host"]
 
@@ -195,7 +195,8 @@ def test_drafts_are_skipped_only_when_asked(skip, expected):
 def test_gh_that_cannot_list_the_prs_is_one_error_action():
     pm = FakePremerge(FakeGitHub(fail=[gh_mod.GitHubError("gh pr list: not logged in")]))
     w, _ = watcher(pm)
-    assert w.once() == [{"pr": 0, "action": "error", "detail": "gh pr list: not logged in"}]
+    assert w.once() == [{"pr": 0, "action": "error", "verdict": "error", "exit_code": 2,
+                         "detail": "gh pr list: not logged in"}]
 
 
 def test_the_loop_survives_a_failing_pass_and_sleeps_between_passes():
@@ -326,3 +327,44 @@ def test_a_tested_pr_whose_statuses_were_refused_says_so():
     assert action["status_errors"] == ["status mindhive-ci on 2222: HTTP 403"]
     assert said == ["PR #151: tested -- GREEN: green: 9 leg(s); "
                     "1 status(es) could not be posted"]
+
+
+# --- what a pass reports, in one shape ---------------------------------------------------
+
+
+def test_every_action_carries_the_same_five_keys():
+    remembered()
+    prs = [pr(149, head="8" * 40, draft=True), pr(150, head="9" * 40, fork=True), pr(151),
+           pr(152, head="5" * 40)]
+    w, _ = watcher(FakePremerge(FakeGitHub(prs)), skip_drafts=True)
+    actions = w.once()
+    assert [a["action"] for a in actions] == ["skipped", "skipped", "unchanged", "tested"]
+    for action in actions:
+        assert set(action) >= {"pr", "action", "verdict", "exit_code", "detail"}, action
+    assert [(a["verdict"], a["exit_code"]) for a in actions] == [
+        (None, None), (None, None), ("green", 0), ("green", 0)]
+
+
+def test_the_loop_reports_each_pass_and_a_failed_pass_as_one_error_action():
+    pm = FakePremerge(FakeGitHub(prs=[], fail=[RuntimeError("the network went away")]))
+    reported = []
+    w, _ = watcher(pm, sleep=lambda seconds: None)
+    assert w.loop(passes=2, report=reported.append) == 2
+    assert reported == [
+        [{"pr": 0, "action": "error", "verdict": "error", "exit_code": 2,
+          "detail": "a pass failed: RuntimeError: the network went away"}],
+        []]
+
+
+def test_each_pass_asks_this_machine_again_what_it_can_run():
+    forgot = []
+
+    class Probe:
+        def forget(self):
+            forgot.append("forgot")
+    pm = FakePremerge(FakeGitHub(prs=[]))
+    pm.probe = Probe()
+    w, _ = watcher(pm)
+    w.once()
+    w.once()
+    assert forgot == ["forgot", "forgot"]

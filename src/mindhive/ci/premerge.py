@@ -64,9 +64,10 @@ from . import legrun
 from . import legs as legs_mod
 from . import preview as preview_mod
 from . import proc
-from .runner import SCOPE, _rmtree_force
+from .runner import SCOPE
 
-__all__ = ["DEFAULT_JOBS", "EXIT_NOT_MERGED", "GATE", "INTERRUPTED", "MAX_ROUNDS", "OVERALL_STATE",
+__all__ = ["DEFAULT_JOBS", "EXIT_NOT_MERGED", "GATE", "INTERRUPTED", "MAX_ROUNDS",
+           "MERGE_STATES", "OVERALL_STATE",
            "Premerge", "PremergeResult", "REF_ROOT", "REMOTE", "SIDECAR", "decide",
            "load_sidecar", "remember", "render", "sidecar_path", "suite_counts",
            "sum_counts"]
@@ -97,10 +98,13 @@ GIT_TIMEOUT_S = 120.0
 OVERALL_STATE = {"green": "success", "red": "failure", "error": "error"}
 #: The reason a run stopped by hand (Ctrl+C) is recorded with.
 INTERRUPTED = "interrupted: the run was stopped by hand"
+#: What a run's `merge_state` may say -- one word, so a script can match it;
+#: the why is `merge_reason`. `skipped`: no merge was asked for, or the verdict
+#: was not green. `unknown`: the run stopped inside `gh pr merge`.
+MERGE_STATES = ("merged", "refused", "failed", "unknown", "skipped")
 #: A merge broken off inside `gh pr merge` -- by Ctrl+C or a crash -- may have
 #: landed: the PR's state on GitHub says, this run cannot.
-MERGE_UNKNOWN = ("unknown: the run stopped while gh pr merge ran; "
-                 "read the PR's state on GitHub")
+MERGE_UNKNOWN = "the run stopped while gh pr merge ran; read the PR's state on GitHub"
 _OID = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
 _NOT_STAMP = re.compile(r"[^0-9TZ]")
 
@@ -184,11 +188,14 @@ class PremergeResult:
     #: Whether GitHub took the overall `mindhive-ci` status: None when this
     #: run posted none (statuses off, a partial run, a branch).
     published: object = None
-    merge_state: str = ""
+    merge_state: str = "skipped"
+    merge_reason: str = ""
     merge_commit: str = ""
     landed_tree_matches: object = None
     notes: list = field(default_factory=list)
     report_text: str = ""
+    #: The report's runlog artifact, once the run is recorded.
+    artifact: str = ""
 
     @property
     def partial(self) -> bool:
@@ -196,6 +203,11 @@ class PremergeResult:
         return bool(self.selected) and len(self.selected) < len(legs_mod.CATALOG)
 
     def as_dict(self) -> dict:
+        """What `--json` prints. The recorded row is this dict as it stood
+        when the row was written, plus the ledger's own keys: `text`,
+        `excerpt`, `verified_by`, `scope`, `gate`, and `commit_sha` -- the
+        tested head under the name every verification row gives it."""
+        counts_leg, counts = suite_counts(self.legs)
         return {"pr_id": self.pr_id, "branch": self.branch, "base_ref": self.base_ref,
                 "mode": self.mode, "argv": list(self.argv),
                 "selected": list(self.selected), "partial": self.partial,
@@ -210,9 +222,11 @@ class PremergeResult:
                 "duration_s": round(self.duration_s, 3),
                 "status_errors": list(self.status_errors),
                 "published": self.published,
-                "merge_state": self.merge_state, "merge_commit": self.merge_commit,
+                "merge_state": self.merge_state, "merge_reason": self.merge_reason,
+                "merge_commit": self.merge_commit,
                 "landed_tree_matches": self.landed_tree_matches,
-                "notes": list(self.notes)}
+                "notes": list(self.notes), "counts": counts, "counts_leg": counts_leg,
+                "counts_total": sum_counts(self.legs), "artifact": self.artifact}
 
 
 def suite_counts(legs) -> tuple:
@@ -233,6 +247,12 @@ def sum_counts(legs) -> dict:
             if isinstance(n, int) and not isinstance(n, bool):
                 total[key] = total.get(key, 0) + n
     return total
+
+
+def _merge_state(res, state, reason="") -> None:
+    """Set how a merge went: *state* one word of `MERGE_STATES`, the why apart
+    in `merge_reason`."""
+    res.merge_state, res.merge_reason = state, reason
 
 
 def render(res) -> str:
@@ -262,13 +282,14 @@ def render(res) -> str:
         lines.append("not run on this machine:")
         lines.extend(f"  {u.get('name')}: {u.get('reason')}" for u in res.unavailable)
     lines.append(f"verdict: {res.verdict.upper()} (exit {res.exit_code}) -- {res.reason}")
-    if res.merge_state:
+    if res.merge_state != "skipped":
         tail = ""
         if res.landed_tree_matches is True:
             tail = "; the landed tree is the tested tree"
         elif res.landed_tree_matches is False:
             tail = "; the landed tree is NOT the tested tree"
         lines.append(f"merge: {res.merge_state}"
+                     + (f" -- {res.merge_reason}" if res.merge_reason else "")
                      + (f" as {_short(res.merge_commit)}" if res.merge_commit else "")
                      + tail)
     if res.status_errors:
@@ -419,8 +440,8 @@ class Premerge:
                 if self._guarded_merge(res, tag, number, allow_base_drift) != "retest":
                     break
             else:
-                res.merge_state = (f"refused: the base kept moving; {MAX_ROUNDS} rounds "
-                                   f"tested without landing")
+                _merge_state(res, "refused", f"the base kept moving; {MAX_ROUNDS} "
+                                             f"rounds tested without landing")
         except (KeyboardInterrupt, Exception) as exc:   # noqa: BLE001
             stopped = exc if isinstance(exc, KeyboardInterrupt) else None
             res.verdict, res.exit_code = "error", 2
@@ -636,7 +657,7 @@ class Premerge:
         finally:
             pool.shutdown(wait=True)
             if not self.keep:
-                _rmtree_force(self.work_root / run_tag)
+                paths.rmtree_force(self.work_root / run_tag)
         order = {leg.name: i for i, leg in enumerate(legs_mod.CATALOG)}
         return sorted(results, key=lambda r: order.get(r.name, len(order)))
 
@@ -648,22 +669,22 @@ class Premerge:
         try:
             pr = self.github.pr(number)
         except gh_mod.GitHubError as exc:
-            res.merge_state = f"refused: could not read the PR again: {exc}"
+            _merge_state(res, "refused", f"could not read the PR again: {exc}")
             return "refused"
         why = _merge_refusal(pr, res.head_sha, res.base_ref)
         if why:
-            res.merge_state = f"refused: {why}"
+            _merge_state(res, "refused", why)
             return "refused"
         base_now, error = self._fetch_base(tag, res.base_ref)
         if error:
-            res.merge_state = f"refused: {error}"
+            _merge_state(res, "refused", error)
             return "refused"
         if base_now != res.base_sha:
             moved = (f"the base moved to {_short(base_now)} after "
                      f"{_short(res.base_sha)} was tested")
             pv = self._preview(base_now, res.head_sha)
             if pv.error:
-                res.merge_state = f"refused: {moved}, and the new merge failed: {pv.error}"
+                _merge_state(res, "refused", f"{moved}, and the new merge failed: {pv.error}")
                 return "refused"
             if pv.conflicts or pv.tree != res.tree:
                 if pv.conflicts or not allow_base_drift:
@@ -674,7 +695,7 @@ class Premerge:
             else:
                 res.notes.append(f"{moved}; the merge tree is the one tested")
         # Until GitHub is read back, a Ctrl+C or a crash leaves this behind.
-        res.merge_state = MERGE_UNKNOWN
+        _merge_state(res, "unknown", MERGE_UNKNOWN)
         rc, text = self.github.merge(number, res.head_sha)
         try:
             state, oid = self.github.merged(number)
@@ -682,9 +703,10 @@ class Premerge:
             state, oid = "", ""
             res.notes.append(f"could not read the PR back after the merge: {exc}")
         if state != "MERGED":
-            res.merge_state = f"failed: gh pr merge exit {rc}: {gh_mod.clip(text, 300)}"
+            _merge_state(res, "failed", f"gh pr merge exit {rc}: {gh_mod.clip(text, 300)}")
             return "failed"
-        res.merge_state, res.merge_commit = "merged", oid
+        _merge_state(res, "merged")
+        res.merge_commit = oid
         res.landed_tree_matches = self._landed_tree_matches(tag, res, oid)
         if res.landed_tree_matches is False:
             res.notes.append(f"the merge commit {_short(oid)} carries a tree other than "
@@ -778,33 +800,16 @@ class Premerge:
                                          project=self.project) or ""
         except Exception:                               # noqa: BLE001
             artifact = ""
+        res.artifact = artifact
         subject = f"PR #{res.pr_id}" if res.pr_id else f"branch {res.branch}"
-        counts_leg, counts = suite_counts(res.legs)
-        payload = {
+        payload = res.as_dict()
+        payload.update({
             "text": (f"hive ci premerge: {subject} {res.verdict.upper()} "
                      f"(exit {int(res.exit_code)}): {res.reason}"),
-            "argv": list(res.argv),
-            "exit_code": int(res.exit_code),
-            "counts": counts, "counts_leg": counts_leg,
-            "counts_total": sum_counts(res.legs),
             "excerpt": res.report_text[:runlog.EXCERPT_CHARS],
             "verified_by": verify.VERIFIED_BY,
-            "scope": SCOPE, "gate": GATE, "mode": res.mode,
-            "pr_id": res.pr_id, "branch": res.branch, "base_ref": res.base_ref,
-            "base_sha": res.base_sha, "commit_sha": res.head_sha,
-            "tested_sha": res.tested_sha, "tree": res.tree,
-            "verdict": res.verdict, "reason": res.reason,
-            "conflicts": list(res.conflicts),
-            "legs": [leg.as_dict() for leg in res.legs],
-            "selected": list(res.selected), "partial": res.partial,
-            "unavailable": [dict(u) for u in res.unavailable],
-            "merge_state": res.merge_state or "skipped",
-            "merge_commit": res.merge_commit, "published": res.published,
-            "landed_tree_matches": res.landed_tree_matches,
-            "rounds": res.rounds, "duration_s": round(res.duration_s, 3),
-        }
-        if artifact:
-            payload["artifact"] = artifact
+            "scope": SCOPE, "gate": GATE, "commit_sha": res.head_sha,
+        })
         try:
             verify.validate_stored(payload)
             events.append_event("verification", payload,

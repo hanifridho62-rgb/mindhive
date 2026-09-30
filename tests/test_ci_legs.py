@@ -194,6 +194,12 @@ def test_select_takes_names_and_globs_in_catalog_order():
     assert legs.select(None) == legs.CATALOG == legs.select("")
 
 
+@pytest.mark.parametrize("spec", [",", " , ", ",,"])
+def test_a_selection_that_names_no_leg_is_refused(spec):
+    with pytest.raises(ValueError, match="names no leg"):
+        legs.select(spec)
+
+
 def test_select_names_what_matched_nothing():
     with pytest.raises(ValueError) as excinfo:
         legs.select("windows-py3.12,ubuntu-py9.9")
@@ -332,6 +338,17 @@ def test_a_wsl_that_cannot_answer_takes_every_ubuntu_leg_with_its_own_words():
         a = probe.check(leg)
         assert not a.ok and "no installed distributions" in a.reason
     assert probe.check(_leg("windows-py3.12")).ok           # canary: only WSL is down
+
+
+def test_a_probe_told_to_forget_asks_again():
+    fake = Fake(*machine(wsl=(1, "", "the WSL service is starting")))
+    probe = _probe(fake)
+    assert not probe.check(_leg("ubuntu-py3.12")).ok
+    fake.rules = machine()
+    assert not probe.check(_leg("ubuntu-py3.12")).ok        # remembered, not asked again
+    probe.forget()
+    assert probe.check(_leg("ubuntu-py3.12")).ok
+    assert sum("bash" in c["argv"] for c in fake.calls) == 2
 
 
 @pytest.mark.parametrize("tool", ["timeout", "wslpath"])
