@@ -21,13 +21,24 @@ history and grouped by what each release window introduced. They summarise;
   (spec `docs/superpowers/specs/2026-09-30-native-ci-premerge-design.md`):
   the `ci.yml` jobs run on the operator's machine while the account's Actions
   jobs are refused for payment. Each leg tests the merge a PR would make, in a
-  fresh repository and venv; the verdict is posted as `mindhive-ci` commit
-  statuses and recorded as a `verification` with `gate: "premerge"`;
+  fresh repository whose `HEAD` is that merge commit, its history read through
+  git alternates, and a fresh venv; the verdict is posted as `mindhive-ci`
+  commit statuses and recorded as a `verification` with `gate: "premerge"`;
   `--merge` merges a green PR guarded by a re-read, a re-checked base and a
-  pinned head. `hive ci status` judges a pre-merge run by its verdict and
-  names its legs. New modules `ci/proc.py`, `ci/legs.py`, `ci/preview.py`,
+  pinned head, and says how it went as one word of `merged`, `refused`,
+  `failed`, `unknown`, `skipped`, the why in `merge_reason`. A fork's PR runs
+  only with `--trust`; a `--legs` run never posts the overall status nor
+  merges; Ctrl+C stops every leg and exits 130. Every verb prints JSON under
+  `--json` whatever happens, a refusal included, and its `--help` names its
+  exit codes. `hive ci status` judges a pre-merge run by its verdict, names
+  its legs, filters by `--gate` and `--branch` and says when a run was
+  `recorded_at`. New modules `ci/proc.py`, `ci/legs.py`, `ci/preview.py`,
   `ci/github.py`, `ci/legrun.py`, `ci/premerge.py`, `ci/watch.py`,
-  `ci/premerge_cli.py`; new variable `MINDHIVE_CI_PG_DSN`.
+  `ci/premerge_cli.py`; new variables `MINDHIVE_CI_PG_DSN` and
+  `MINDHIVE_CI_PG_DSN_RO`.
+
+- **`ci.yml` checks out with `fetch-depth: 0`**: `tests/test_implementation_plan.py`
+  reads history, so the default one-commit checkout was red on master itself.
 
 - **Blueprint P11 — the traceability matrix and the audit that closes the
   blueprint** (RP §3, §4.7, §10.3; MEB §3.1, §153):

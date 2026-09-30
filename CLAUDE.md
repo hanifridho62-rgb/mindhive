@@ -115,6 +115,11 @@ when `mindhive-ci` is green on its head; a leg it could not run here is named
 in the verdict and is not a pass. Merge only on the owner's word, and then
 through `hive ci premerge <PR> --merge`, which re-checks before it merges.
 
+An agent driving it runs `hive ci legs --json` first to learn what this
+machine can run, passes `--json` to every `hive ci` verb and reads `verdict`
+rather than the exit code alone: exit 3 is a green run whose `--merge` did not
+merge, and under `--json` even a refusal prints one JSON object.
+
 ## Skill routing
 
 When the user's request matches an available skill, invoke it via the Skill

@@ -286,7 +286,12 @@ attaches to the **exit code**, which was observed — `counts` is a parse, and a
 unparseable summary records counts **absent rather than zero**, because "we
 could not tell" and "nothing passed" are different facts. Full output goes to
 `runlog`, not the ledger; the event keeps a bounded excerpt plus the artifact
-path),
+path. A `hive ci` row adds `scope: "ci"` and the `gate` that decided it; a
+pre-merge row (`gate: "premerge"`) is `PremergeResult.as_dict()` as it stood
+when written plus `commit_sha`, the tested head: `verdict` ∈ green, red,
+error; `merge_state` ∈ merged, refused, failed, unknown, skipped, the why in
+`merge_reason`; `counts` one full-suite leg's (`counts_leg`) and
+`counts_total` every leg's; `legs[]` each leg's state, counts and artifact),
 `work_injected` (`{outcome, round, surface, run_id?, lens?, title?, evidence[]?,
 fingerprint?, kind?, score?, terms?, reason?, dropped?, plan_id?, step_index?}` —
 one row per replenishment decision, written by `replenish.py`: `outcome` ∈ landed,

@@ -400,15 +400,22 @@ did, without a runner or a bill:
    read or moved;
 2. computes the merge with `git merge-tree --write-tree` (git ≥ 2.38) — a
    conflict is red at once, and no leg runs;
-3. runs each `ci.yml` leg in a fresh repository of the merge (one commit, no
-   hooks, CRLF for a windows leg and LF for an ubuntu one, as the runners
-   check out) with a fresh venv, `pip install -e .[extras]` and the job's own
-   pytest command — windows legs through `py -0p`'s interpreters, ubuntu legs
-   in WSL (a login shell, so uv's interpreters are found), a few at a time;
+3. runs each `ci.yml` leg in a fresh repository whose `HEAD` is that merge
+   commit, with its whole history — read from this repository's object store
+   through `.git/objects/info/alternates`, not copied — no hooks, and CRLF for
+   a windows leg and LF for an ubuntu one, as the runners check out; then a
+   fresh venv, `pip install -e .[extras]` and the job's own pytest command —
+   windows legs through `py -0p`'s interpreters, ubuntu legs in WSL (a login
+   shell, so uv's interpreters are found), a few at a time, under
+   `<tempdir>/mindhive-ci` unless `--work-root` names another place;
 4. posts `mindhive-ci/<leg>` and the overall `mindhive-ci` as commit statuses
    on the PR's head — a plain REST write, nothing billed;
 5. records one `verification` (`scope: "ci"`, `gate: "premerge"`) with every
    leg's counts, and keeps the report and each leg's log as runlog artifacts.
+
+The suite reads history — `tests/test_implementation_plan.py` names a commit —
+so a one-commit checkout is red on master itself. Every `ci.yml` checkout is
+therefore `fetch-depth: 0`, and each leg has the history the same way.
 
 A leg this machine cannot run is **named, never counted**: the verdict says
 `not run here: pg`. `hive ci legs` shows which legs can run and why the others
@@ -420,12 +427,31 @@ cluster of its own, named by `MINDHIVE_CI_PG_DSN` and `MINDHIVE_CI_PG_DSN_RO`
 — never the operator's own DSNs. A leg whose pytest passed no test is not a
 pass: a tier whose every test skipped proved nothing.
 
+A PR from a fork is refused unless `--trust`: its legs would run its code on
+this machine as you, so read its diff first. `--legs` runs some legs only:
+each leg's status is posted, the overall `mindhive-ci` is not, and a partial
+run never merges.
+
 `--merge` merges a green PR, guarded: the PR must still be open, not a draft,
 and at the tested head; a base that moved is previewed again and a different
 merge is tested again (up to three rounds) unless `--allow-base-drift`; the
 merge is `gh pr merge N --merge --match-head-commit <head>`, and only GitHub
 reading back `MERGED` counts. The landed commit's tree is compared with the
-tested tree.
+tested tree. How the merge went is `merge_state`, one word — `merged`,
+`refused`, `failed`, `unknown` (the run stopped inside `gh pr merge`, so the
+PR's state on GitHub says whether it landed) or `skipped` (no merge was asked
+for, or the verdict was not green) — and the why is `merge_reason`.
+
+Exit codes are for scripts and agents: `0` green; `1` red; `2` the check could
+not be made; `3` green, but `--merge` did not merge; `130` stopped by hand
+(Ctrl+C) — every leg it started is stopped, and a run that got as far as
+fetching is recorded as an error. A leg step whose command could not be
+started at all records exit `127`. Under `--json` stdout is JSON whatever
+happens: a refusal or a stop prints one object, `{"verdict": "error",
+"exit_code": N, "reason": "..."}`, beside the line on stderr, and each verb's
+`--help` ends with its exit codes. `hive ci status --gate premerge --pr N`
+reads the last run back with the time it was `recorded_at`; `--branch` picks a
+local branch's runs.
 
 To keep every open PR's verdict current, run the watch — by hand, or from a
 scheduled task you register yourself (MIND HIVE never registers one):
@@ -435,6 +461,12 @@ hive ci watch                  # loops; Ctrl+C to stop
 hive ci watch --once           # one pass, for a scheduled task
 schtasks /Create /TN "MindHive CI watch" /SC MINUTE /MO 30 /TR "<venv>\Scripts\hive.exe ci watch --once --root <repo> --project <namespace>"
 ```
+
+Each pass tests a PR whose head moved; re-checks, with one `git merge-tree`, a
+PR whose base moved; tests again, once per head, a red that errors alone made;
+and posts again a verdict GitHub refused to take. Every action it reports has
+`pr`, `action`, `verdict`, `exit_code` and `detail`: `--once --json` prints the
+pass as one array, and a looping `--json` watch one JSON line per pass.
 
 ## Installing the hooks on a new machine
 The hooks are portable: nothing in `hooks/` names a user, a checkout, or a venv.
