@@ -348,8 +348,51 @@ def test_fire_stops_retrying_at_max_attempts():
                                           "stdout": LIMIT_ENVELOPE},
         register=_no_timer, unregister=gone.append)
     assert payload["outcome"] == "still_limited"
+    assert "gave up" in payload["detail"]               # says why nothing is next
     assert autoresume.fold(events.read_all())["mark-1"]["status"] == "fired"
     assert gone == ["mark-1"]                           # gave up cleanly
+
+
+def test_fire_honours_a_schedule_issued_while_the_delivery_ran():
+    """The one-shot delivery runs for up to an hour; a `hive autoresume
+    schedule --at` issued meanwhile is the human's word on when the next
+    delivery is due, not the RETRY_HOURS backoff."""
+    _interrupted()
+    autoresume.schedule("mark-1", register=_no_timer, now=T0_EPOCH)
+    quiet = autoresume._iso(time.time() + 30 * 3600)
+
+    def runner(prompt, model=None, cwd=None, timeout_s=None):
+        autoresume.schedule("mark-1", at=quiet, register=_no_timer)
+        return {"exit": 0, "stdout": LIMIT_ENVELOPE}
+
+    payload = autoresume.fire("mark-1", runner=runner, register=_no_timer,
+                              now=T0_EPOCH + 5 * 3600)
+    assert payload["outcome"] == "still_limited"
+    assert "by hand" in payload["detail"]
+    rec = autoresume.fold(events.read_all())["mark-1"]
+    assert (rec["status"], rec["due"], rec["attempt"]) == \
+        ("scheduled", quiet, 1)
+
+
+def test_fire_does_not_re_arm_a_plan_resumed_while_the_delivery_ran():
+    """A human who ran `hive roadmap resume` while the delivery was out has
+    the plan: the still-limited delivery records why nothing is next instead
+    of failing on the schedule's own guard after its row landed."""
+    _interrupted()
+    autoresume.schedule("mark-1", register=_no_timer, now=T0_EPOCH)
+
+    def runner(prompt, model=None, cwd=None, timeout_s=None):
+        roadmap.record("resume", "mark-1")
+        return {"exit": 0, "stdout": LIMIT_ENVELOPE}
+
+    gone = []
+    payload = autoresume.fire(
+        "mark-1", runner=runner, unregister=gone.append,
+        register=lambda *a: pytest.fail("a resumed plan re-armed"))
+    assert payload["outcome"] == "still_limited"
+    assert "no longer interrupted (active)" in payload["detail"]
+    assert autoresume.fold(events.read_all())["mark-1"]["status"] == "fired"
+    assert gone == ["mark-1"]
 
 
 def test_fire_error_records_without_retry():

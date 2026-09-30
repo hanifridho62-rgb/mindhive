@@ -20,9 +20,11 @@ closes that gap end to end:
 - ``run`` — execute the loop engine on the goal dir with the fabrication's
   plan_id. From here the existing resilience does the rest: a usage cap
   checkpoints progress into THE fabrication roadmap (the fix_plan checklist
-  is the source of truth) and re-arms a loop-mode auto-resume, so the cycle
-  is loop -> sleep -> loop until the exit gate passes, or until
-  autoresume.MAX_ATTEMPTS wake-ups in a row check off nothing new.
+  is the source of truth) and -- for the caps a wake-up can outwait, not the
+  loop's own budget gate under on_cap = "stop" -- re-arms a loop-mode
+  auto-resume, so the cycle is loop -> sleep -> loop until the exit gate
+  passes, until autoresume.MAX_ATTEMPTS wake-ups in a row move nothing on
+  the checklist, or until the chain's loop.toml wake-up cap.
   Completion earns the roadmap its exit from every view.
 
 Lifecycle is three ``fabrication`` events (deterministic telemetry;

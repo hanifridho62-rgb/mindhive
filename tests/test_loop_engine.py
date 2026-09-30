@@ -322,8 +322,27 @@ def test_budget_cap_run_snapshots_an_interrupted_roadmap(tmp_path, monkeypatch):
     rms = [e for e in evs if e.type == "roadmap"]
     assert [e.payload["action"] for e in rms] == ["set", "interrupt"]
     assert rms[1].payload["cause"] == "budget_cap"
-    assert [e.payload["action"] for e in evs if e.type == "autoresume"] \
-        == ["scheduled"]
+    # The marker, but no delivery: `on_cap = "stop"` is the operator saying
+    # stop, and a relaunch one cooldown later -- on a fresh budget window the
+    # run never earned -- would turn that into a slow pause.
+    assert [e for e in evs if e.type == "autoresume"] == []
+
+
+def test_max_hours_run_snapshots_and_arms_a_loop_wake_up(tmp_path, monkeypatch):
+    """A run out of wall clock has the same unfinished plan as one out of
+    quota, and a fresh run gets a fresh clock: the marker is written and the
+    loop-mode delivery armed, as for api_cap."""
+    loop_dir = _setup(tmp_path, monkeypatch)
+    cfg = config.LoopConfig(max_iterations=5, max_hours=0.0)
+    result = engine.run_loop(project="test", loop_dir=loop_dir, cfg=cfg,
+                             driver=FakeDriver([]), now_fn=_fake_clock(),
+                             sleep_fn=lambda s: None, progress_fn=lambda i: True)
+    assert result["reason"] == "max_hours"
+    evs = events.read_all()
+    assert [e.payload["cause"] for e in evs if e.type == "roadmap"
+            and e.payload["action"] == "interrupt"] == ["max_hours"]
+    ars = [e.payload for e in evs if e.type == "autoresume"]
+    assert [(a["action"], a["mode"]) for a in ars] == [("scheduled", "loop")]
 
 
 def test_non_usage_endings_append_no_roadmap(tmp_path, monkeypatch):

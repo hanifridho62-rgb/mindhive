@@ -24,6 +24,15 @@ from .driver import preflight
 # session needs the baton either way.
 USAGE_INTERRUPT_REASONS = ("api_cap", "budget_cap", "max_hours")
 
+# Of those, the caps a wake-up can outwait, so the marker also earns an
+# automatic loop-mode delivery: Claude's usage window reopens on its own, and
+# a fresh run gets a fresh clock. The local budget gate is left out on purpose:
+# it only ends a run under `on_cap = "stop"`, where the operator said stop, and
+# a relaunch one cooldown later -- on a fresh budget window the run never
+# earned -- would turn that into a slow pause nobody asked for. Its marker
+# still rides STATE.md; a human decides what happens next.
+AUTORESUME_REASONS = ("api_cap", "max_hours")
+
 
 def _relay_state(project, run_id, cause, steps) -> dict:
     """The baton: what the next session needs that the steps alone do not carry.
@@ -74,6 +83,14 @@ def _snapshot_interrupted_plan(project, run_id, loop_dir, cause,
     try:
         from .. import roadmap as roadmap_mod
         plan_id = plan_id or run_id
+        # A plan a human retired while the run was going -- `hive roadmap
+        # complete` or `archive` -- is closed on purpose. Re-setting and
+        # interrupting it here would reopen it, and hand the wake-up a plan
+        # to relaunch; the run's own end is recorded either way.
+        current = roadmap_mod.get(events.read_all(project), plan_id)
+        if current is not None \
+                and current["status"] in roadmap_mod.RETIRED_STATUSES:
+            return
         tasks = task_mod.load_tasks(loop_dir)
         lines = tasks.prompt.strip().splitlines()
         prompt = lines[0].lstrip("# ").strip() if lines else ""
@@ -104,15 +121,17 @@ def _snapshot_interrupted_plan(project, run_id, loop_dir, cause,
                             project=project)
         events.append_event("roadmap", int_payload, tags=snap_tags,
                             project=project)
-        # Delivery leg (autoresume.py): schedule the marker to re-enter
-        # Claude once the usage window reopens — same best-effort stance as
-        # the snapshot itself. Loop mode: the wake-up relaunches THIS loop on
+        # Delivery leg (autoresume.py), for the caps a wake-up can outwait
+        # (AUTORESUME_REASONS): schedule the marker to re-enter Claude once
+        # the usage window reopens — same best-effort stance as the snapshot
+        # itself. Loop mode: the wake-up relaunches THIS loop on
         # its goal dir (breaker, budgets, exit gate intact), running from the
         # repo root (loop_dir is the goal dir inside it). A run that IS such a
         # wake-up leaves the re-arming to `autoresume.fire`, which counts the
         # attempt: arming here too restarted the count on every relaunch.
         from .. import autoresume as autoresume_mod
-        if autoresume_mod.waking_attempt() is None:
+        if cause in AUTORESUME_REASONS \
+                and autoresume_mod.waking_attempt() is None:
             autoresume_mod.schedule(plan_id, project=project,
                                     cwd=str(Path(loop_dir).parent),
                                     mode="loop", goal_dir=str(loop_dir))

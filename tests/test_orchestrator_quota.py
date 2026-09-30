@@ -77,7 +77,15 @@ def test_neither_import_order_breaks():
     import sys
     from pathlib import Path
 
+    # `parents[2]` of `src/mindhive/orchestrator/agenttask.py` is `src/` -- one
+    # level deeper than a top-level module, where the same index is the repo
+    # root. Checked before spawning: handed a directory with no package, the
+    # child falls back to the editable install (the MAIN checkout) with no
+    # error, and this test silently measures the wrong tree.
     root = Path(agenttask.__file__).resolve().parents[2]
+    assert (root / "mindhive" / "__init__.py").is_file(), (
+        f"{root} holds no mindhive package: the child would not import this "
+        "checkout")
     for first in ("mindhive.orchestrator.quota", "mindhive.orchestrator.breaker"):
         done = subprocess.run(
             [sys.executable, "-c", f"import {first}; print('ok')"],
