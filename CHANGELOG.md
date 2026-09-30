@@ -17,6 +17,18 @@ history and grouped by what each release window introduced. They summarise;
 
 ### Added
 
+- **Native pre-merge CI — `hive ci premerge`, `watch`, `conflicts`, `legs`**
+  (spec `docs/superpowers/specs/2026-09-30-native-ci-premerge-design.md`):
+  the `ci.yml` jobs run on the operator's machine while the account's Actions
+  jobs are refused for payment. Each leg tests the merge a PR would make, in a
+  fresh repository and venv; the verdict is posted as `mindhive-ci` commit
+  statuses and recorded as a `verification` with `gate: "premerge"`;
+  `--merge` merges a green PR guarded by a re-read, a re-checked base and a
+  pinned head. `hive ci status` judges a pre-merge run by its verdict and
+  names its legs. New modules `ci/proc.py`, `ci/legs.py`, `ci/preview.py`,
+  `ci/github.py`, `ci/legrun.py`, `ci/premerge.py`, `ci/watch.py`,
+  `ci/premerge_cli.py`; new variable `MINDHIVE_CI_PG_DSN`.
+
 - **Blueprint P11 — the traceability matrix and the audit that closes the
   blueprint** (RP §3, §4.7, §10.3; MEB §3.1, §153):
   - `IMPLEMENTATION_PLAN.md` at the root: the RTM for blueprint v1.0 and v1.1 with the commit that realised each row; the audit table `| Bab / Fitur PDF | Modul / Berkas Kode Sumber | Berkas Pengujian (Tests) | Status Verifikasi |` — one row per item, every status parsed from the junit of one full pytest run rather than typed; the MEB LOC forecast beside measured sizes; an ISO/IEC 25010 matrix of measured values; the three benches; the deviation register; and the real outcome of the one `hive mindnet ab --execute --record` run. `tests/test_implementation_plan.py` holds it to that: the commit it names must exist, every path it cites must exist, every status is one of seven words, the LOC rows equal `scripts/loc_report.py`'s.
