@@ -208,11 +208,15 @@ def _is_check(argv) -> bool:
     return len(argv) == 3 and argv[1] == "-c" and "ensurepip" in argv[2]
 
 
+def _is_chromium(argv) -> bool:
+    return len(argv) == 3 and argv[1] == "-c" and "chromium.launch()" in argv[2]
+
+
 def machine(pylist=PY_LIST, wsl=(0, WSL_OK, ""), playwright=(0, "", "")):
     return [(lambda a: a[:2] == ["py", "-0p"], (0, pylist, "")),
             (_is_check, lambda a: (0, _version_of(a[0]) + "\n", "")),
             (lambda a: "bash" in a and "-s" in a, wsl),
-            (lambda a: a[1:] == ["-c", "import playwright"], playwright)]
+            (_is_chromium, playwright)]
 
 
 def _probe(fake, platform="win32", node="C:\\node\\node.exe", environ=None,
@@ -294,18 +298,36 @@ def test_a_wsl_without_a_needed_tool_says_which():
     assert not a.ok and a.reason == "WSL lacks timeout"
 
 
-def test_node_needs_node_and_browser_needs_playwright():
-    probe = _probe(Fake(*machine(playwright=(1, "", "ModuleNotFoundError"))), node=None)
+def test_node_needs_node_and_browser_needs_a_chromium_that_launches():
+    missing = "playwright._impl._errors.Error: Executable doesn't exist at C:\\ms-playwright"
+    fake = Fake(*machine(playwright=(1, "", "Traceback (most recent call last):\n" + missing)))
+    probe = _probe(fake, node=None)
     assert probe.check(_leg("node")).reason == "`node` is not on PATH"
     b = probe.check(_leg("browser"))
-    assert not b.ok and "cannot import playwright" in b.reason
+    assert not b.ok and "cannot launch playwright's Chromium" in b.reason
+    assert missing in b.reason and "playwright install chromium" in b.reason
+    probe.check(_leg("browser"))
+    assert sum(_is_chromium(c["argv"]) for c in fake.calls) == 1   # asked once
 
 
-def test_pg_runs_only_against_the_throwaway_dsn():
-    real = {"PATH": "x", "MINDHIVE_PG_DSN_ADMIN": "postgresql://real/mirror"}
-    assert not _probe(Fake(*machine()), environ=real).check(_leg("pg")).ok
-    throwaway = {"PATH": "x", legs.PG_DSN_ENV: "postgresql://ci@localhost/throwaway"}
-    assert _probe(Fake(*machine()), environ=throwaway).check(_leg("pg")).ok
+PG_CI = {legs.PG_DSN_ENV: "postgresql://postgres@localhost:55432/mindhive",
+         legs.PG_RO_DSN_ENV: "postgresql://mindhive_reader@localhost:55432/mindhive"}
+
+
+def test_pg_runs_only_against_a_throwaway_cluster_named_twice():
+    def check(**env):
+        return _probe(Fake(*machine()), environ={"PATH": "x", **env}).check(_leg("pg"))
+    assert not check(MINDHIVE_PG_DSN_ADMIN="postgresql://real/mirror").ok
+    assert check(**PG_CI).ok
+    admin_only = check(**{legs.PG_DSN_ENV: PG_CI[legs.PG_DSN_ENV]})
+    assert not admin_only.ok
+    assert admin_only.reason.startswith(f"no {legs.PG_RO_DSN_ENV}: ")
+    same = check(**PG_CI, MINDHIVE_PG_DSN_ADMIN=PG_CI[legs.PG_DSN_ENV])
+    assert not same.ok
+    assert same.reason.startswith(f"{legs.PG_DSN_ENV} is the operator's own DSN")
+    same_ro = check(**PG_CI, MINDHIVE_PG_DSN_RO=PG_CI[legs.PG_RO_DSN_ENV])
+    assert not same_ro.ok
+    assert same_ro.reason.startswith(f"{legs.PG_RO_DSN_ENV} is the operator's own DSN")
 
 
 def test_without_the_launcher_the_running_interpreter_still_counts():

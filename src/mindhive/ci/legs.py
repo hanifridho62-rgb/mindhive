@@ -19,7 +19,9 @@ after its job is removed -- fails the suite instead of silently never running.
   through a LOGIN shell: uv puts 3.11 and 3.14 in `~/.local/bin`, which only
   the login profile adds to PATH (measured: a plain `bash -c` sees neither).
 * `node` needs `node` on PATH; `browser` needs the interpreter running `hive`
-  to import `playwright`; `pg` needs `MINDHIVE_CI_PG_DSN`.
+  to launch playwright's Chromium -- the browser tier skips every test without
+  one; `pg` needs `MINDHIVE_CI_PG_DSN` and `MINDHIVE_CI_PG_DSN_RO`, neither of
+  them one of the operator's own DSNs.
 
 A leg the machine cannot run is UNAVAILABLE with a reason, and unavailable is
 never success: `premerge` names it in the verdict instead of counting it.
@@ -34,7 +36,7 @@ from dataclasses import dataclass
 from . import proc
 
 __all__ = ["CATALOG", "HOST_LOCAL", "HOST_POSIX", "HOST_WINDOWS", "PG_DSN_ENV",
-           "TIERS", "TIER_BROWSER", "TIER_DEFAULT", "TIER_NODE", "TIER_PG",
+           "PG_RO_DSN_ENV", "TIERS", "TIER_BROWSER", "TIER_DEFAULT", "TIER_NODE", "TIER_PG",
            "Availability", "Leg", "Probe", "parse_py_list", "running_version",
            "select"]
 
@@ -47,6 +49,14 @@ TIERS = (TIER_DEFAULT, TIER_NODE, TIER_BROWSER, TIER_PG)
 #: `MINDHIVE_PG_DSN_ADMIN`: that is the real mirror, and a migration from an
 #: unmerged branch cannot be taken back.
 PG_DSN_ENV = "MINDHIVE_CI_PG_DSN"
+#: The same throwaway cluster's `mindhive_reader` login. The pg tier's read-only
+#: tests need it (ci.yml gives the role a password after `pg migrate`; here the
+#: operator does, once), and without it they skip: a pg leg that ran without it
+#: would pass having tested almost nothing.
+PG_RO_DSN_ENV = "MINDHIVE_CI_PG_DSN_RO"
+#: The operator's own DSNs. A CI DSN equal to one of them is refused: the real
+#: mirror must never be what an unmerged branch migrates.
+_OPERATOR_PG_ENV = ("MINDHIVE_PG_DSN_ADMIN", "MINDHIVE_PG_DSN_RO")
 #: A cold WSL start was measured at 7.8 s; the cap is generous on purpose.
 PROBE_TIMEOUT_S = 120.0
 #: What the POSIX probe prints before each fact, so a login profile's own
@@ -56,6 +66,13 @@ POSIX_TOOLS = ("tar", "git", "timeout")
 #: Run by each candidate interpreter: its version, and proof it can build a
 #: venv with pip (a Debian python without python3-venv has no `ensurepip`).
 _CHECK = "import sys, venv, ensurepip; print('%d.%d' % sys.version_info[:2])"
+#: Run by the interpreter running `hive`, for the browser leg: playwright must
+#: import AND launch its Chromium. The browser tier skips every test when the
+#: engine is missing, so a leg that only imported playwright would pass having
+#: tested nothing.
+_CHROMIUM = ("from playwright.sync_api import sync_playwright\n"
+             "with sync_playwright() as pw:\n"
+             "    pw.chromium.launch().close()\n")
 _PY_LINE = re.compile(r"^\s*-(?:V:)?(?P<tag>\S+)\s+(?:\*\s+)?(?P<path>\S.*?)\s*$")
 _VERSION = re.compile(r"(\d+\.\d+)")
 
@@ -111,8 +128,10 @@ CATALOG = (
     Leg(name="pg", job="pg-tests", ci_name="pg tier (Postgres 17)",
         runs_on="ubuntu-latest", host=HOST_LOCAL, python="3.12",
         tier=TIER_PG, extras="dev,pg",
-        note=f"only against the throwaway database {PG_DSN_ENV} names; never "
-             f"the operator's admin DSN, never ALTER ROLE"),
+        note=f"only against a throwaway Postgres 17 cluster of its own, reached "
+             f"through {PG_DSN_ENV} and {PG_RO_DSN_ENV}, never the operator's "
+             f"DSNs; the reader's password is set once by the operator, where "
+             f"ci.yml sets it with ALTER ROLE"),
 )
 
 
@@ -221,10 +240,12 @@ class Probe:
                 return Availability(leg, False,
                                     reason="an ubuntu leg needs Linux, or WSL on Windows")
         if not leg.python:
-            if not self._imports_playwright():
+            why = self._chromium_refusal()
+            if why:
                 return Availability(leg, False, reason=(
                     f"the interpreter running hive ({self.executable}) cannot "
-                    f"import playwright: pip install -e .[browser]"))
+                    f"launch playwright's Chromium ({why}): pip install -e "
+                    f".[browser], then playwright install chromium"))
             return Availability(leg, True, python=self.executable, via="native")
         path = self._natives().get(leg.python)
         if not path:
@@ -232,19 +253,39 @@ class Probe:
         return Availability(leg, True, python=path, via="native")
 
     def _needs(self, leg) -> str:
-        if leg.tier == TIER_PG and not str(self.environ.get(PG_DSN_ENV) or "").strip():
-            return (f"no {PG_DSN_ENV}: the pg tier needs a throwaway "
-                    f"Postgres 17 database")
+        if leg.tier == TIER_PG:
+            return self._pg_refusal()
         if leg.tier == TIER_NODE and not self._which("node",
                                                      path=self.environ.get("PATH")):
             return "`node` is not on PATH"
         return ""
 
-    def _imports_playwright(self) -> bool:
+    def _pg_refusal(self) -> str:
+        """Why the pg leg cannot run here, or ``""``: both CI DSNs set, and
+        neither of them one of the operator's own."""
+        given = [(name, str(self.environ.get(name) or "").strip())
+                 for name in (PG_DSN_ENV, PG_RO_DSN_ENV)]
+        missing = [name for name, value in given if not value]
+        if missing:
+            return (f"no {' or '.join(missing)}: the pg tier needs a throwaway "
+                    f"Postgres 17 cluster, reached as its admin ({PG_DSN_ENV}) "
+                    f"and as mindhive_reader ({PG_RO_DSN_ENV})")
+        own = {str(self.environ.get(name) or "").strip() for name in _OPERATOR_PG_ENV}
+        clash = [name for name, value in given if value in own]
+        if clash:
+            return (f"{' and '.join(clash)} is the operator's own DSN: the pg leg "
+                    f"migrates unmerged branches and needs a cluster of its own")
+        return ""
+
+    def _chromium_refusal(self) -> str:
+        """``""`` when the interpreter running `hive` can launch playwright's
+        Chromium, else the last line it printed trying."""
         if self._playwright is None:
-            rc, _, _ = self._run([self.executable, "-c", "import playwright"],
-                                 timeout_s=PROBE_TIMEOUT_S)
-            self._playwright = rc == 0
+            rc, out, err = self._run([self.executable, "-c", _CHROMIUM],
+                                     timeout_s=PROBE_TIMEOUT_S)
+            lines = (err or out or "").strip().splitlines()
+            self._playwright = "" if rc == 0 else (
+                lines[-1][:200] if lines else f"exit {rc}")
         return self._playwright
 
     # --- this machine's interpreters --------------------------------------------------

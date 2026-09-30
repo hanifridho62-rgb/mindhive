@@ -16,8 +16,8 @@ conversion happens on export, and the leg repository keeps the same setting,
 so `git status` in it is clean.
 
 **Then the job's own steps**: a venv from the leg's interpreter, `pip install
---upgrade pip`, `pip install -e .[extras]`, the pg tier's `pg migrate`, and
-the job's pytest command verbatim. The `browser` leg is the exception the
+--upgrade pip`, `pip install -e .[extras]`, the pg tier's cluster check and
+`pg migrate`, and the job's pytest command verbatim. The `browser` leg is the exception the
 catalog documents: it runs the interpreter running `hive` -- which must
 already import playwright -- with `PYTHONPATH` at the leg's `src`, so no
 Chromium is downloaded per run.
@@ -32,7 +32,9 @@ nothing from Windows arrives at all (`WSLENV=""`).
 **Classification is pytest's own**: exit 0 success, 1 failure, anything else
 error (2 interrupted, 3 internal error, 4 usage, 5 nothing collected, 124 the
 cap). A step before pytest that fails makes the leg an ERROR at that step,
-never a failure: the suite said nothing.
+never a failure: the suite said nothing. So does a pytest that exits 0 with a
+summary naming no passed test -- a tier whose every test skipped proved
+nothing, and must not read as a pass.
 
 Every step appends to one log, kept as a runlog artifact; the leg's
 directory is removed afterwards unless `keep`. `LegRunner.run` never raises.
@@ -50,8 +52,8 @@ from . import proc
 from .runner import _rmtree_force
 
 __all__ = ["FAILED_CAP", "LEG_TIMEOUT_S", "LegResult", "LegRunner", "MARK",
-           "POSIX_LEG_SCRIPT", "SETUP_FAILED_EXIT", "STATES", "autocrlf_for",
-           "classify", "extract", "leg_env", "venv_python"]
+           "PG_CLUSTER_CHECK", "POSIX_LEG_SCRIPT", "SETUP_FAILED_EXIT", "STATES",
+           "autocrlf_for", "classify", "extract", "leg_env", "venv_python"]
 
 GIT = "git"
 #: Every line the runner -- or the WSL script -- writes into a leg's log starts
@@ -79,6 +81,22 @@ _SETUP_FAILED = re.compile(r"^::mindhive-ci:: setup-failed (\S+)[ \t]*\r?$", re.
 _PYTEST_EXIT = re.compile(r"^::mindhive-ci:: pytest-exit (-?\d+)[ \t]*\r?$", re.M)
 _COUNT_ORDER = ("failed", "errors", "passed", "skipped", "xfailed", "xpassed",
                 "deselected")
+
+#: Run in the pg leg's venv before `pg migrate`. The cluster behind the DSN must
+#: hold no database but the one under test and the stock `postgres`: roles are
+#: cluster-wide, so a branch's migration on a cluster the real mirror shares
+#: would reach the mirror's roles, and that cannot be taken back.
+PG_CLUSTER_CHECK = """\
+import os, sys
+import psycopg
+with psycopg.connect(os.environ["MINDHIVE_PG_DSN_ADMIN"]) as conn:
+    rows = conn.execute(
+        "SELECT datname FROM pg_database WHERE NOT datistemplate"
+        " AND datname NOT IN (current_database(), 'postgres') ORDER BY 1").fetchall()
+if rows:
+    sys.exit("the cluster also holds " + ", ".join(r[0] for r in rows)
+             + ": the pg leg needs a Postgres cluster of its own")
+"""
 
 #: A WSL leg's whole job, fed to `bash -l -s -- ROOT PY EXTRAS CAP <pytest args>`
 #: on stdin. A LOGIN shell, because uv's interpreters live in `~/.local/bin`,
@@ -397,6 +415,10 @@ class LegRunner:
             env["HF_HUB_OFFLINE"] = "1"
         if leg.tier == legs_mod.TIER_PG:
             env["MINDHIVE_PG_DSN_ADMIN"] = str(self.environ.get(legs_mod.PG_DSN_ENV) or "")
+            env["MINDHIVE_PG_DSN_RO"] = str(self.environ.get(legs_mod.PG_RO_DSN_ENV) or "")
+            if not self._step(res, "cluster-check", [python, "-c", PG_CLUSTER_CHECK],
+                              log=log, cwd=repo, env=env):
+                return
             if not self._step(res, "migrate",
                               [python, "-m", "mindhive", "pg", "migrate"],
                               log=log, cwd=repo, env=env, timeout_s=SETUP_TIMEOUT_S):
@@ -468,6 +490,11 @@ class LegRunner:
             res.failed_tests = tuple(
                 line.strip() for line in part.splitlines()
                 if line.startswith(("FAILED ", "ERROR ")))[:FAILED_CAP]
+        if res.state == "success" and res.counts and not res.counts.get("passed"):
+            # A summary was read and it names no passed test. An unreadable one
+            # keeps pytest's exit code: absent counts are not zero counts.
+            res.state = "error"
+            res.reason = f"no test passed ({_count_text(res.counts) or 'nothing ran'})"
         if text.strip():
             try:
                 res.artifact = runlog.write_once(f"premerge-{self.run_id}-{res.name}",

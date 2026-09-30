@@ -284,7 +284,8 @@ list of spellings; anything else takes the default.
 | `MINDHIVE_AUTORESEARCH_DIR` | path inside WSL; default `~/autoresearch`; read once at import | `research.py` | where the autoresearch checkout the trainer runs lives |
 | `MINDHIVE_AUTORESUME_TIMER` | switch; unset = on. `off`, `0`, `none` turn it off | `autoresume.py::_timer_enabled` | whether `hive autoresume` registers a real Task Scheduler timer (the test suite turns it off) |
 | `MINDHIVE_BRIEF` | switch; default on. `0`, `off`, `false`, `no` turn it off | `mindnet/brief.py` | the per-task brief composed for a MindNetwork sub-agent |
-| `MINDHIVE_CI_PG_DSN` | libpq DSN; unset | `ci/legs.py`, `ci/legrun.py` | the THROWAWAY Postgres 17 database the `pg` leg of `hive ci premerge` migrates and tests; unset, the pg leg is named as not runnable here. Never set it to the real mirror: a migration from an unmerged branch cannot be taken back |
+| `MINDHIVE_CI_PG_DSN` | libpq DSN; unset | `ci/legs.py`, `ci/legrun.py` | the admin login of a THROWAWAY Postgres 17 cluster of its own (a separate instance, port or container, like ci.yml's service container; the database under test is named `mindhive`), which the `pg` leg of `hive ci premerge` migrates and tests. Unset, or `MINDHIVE_CI_PG_DSN_RO` unset, the pg leg is named as not runnable here; equal to one of the operator's own DSNs, it is refused; and the leg stops before `pg migrate` when the cluster holds any other database. Never the real mirror's cluster: a migration from an unmerged branch cannot be taken back |
+| `MINDHIVE_CI_PG_DSN_RO` | libpq DSN; unset | `ci/legs.py`, `ci/legrun.py` | the same throwaway cluster's `mindhive_reader` login, its password set once by the operator (ci.yml's `ALTER ROLE` step does it on Actions). The pg tier's read-only tests need it; without it they would skip, so the pg leg is not run here |
 | `MINDHIVE_DASHBOARD_TOKEN` | string; unset → the token persisted in `dashboard.token` under the store root, minted once with `secrets.token_urlsafe(16)` | `dashboard.py::load_or_create_token`; `bench.py` reads it and never creates one | overrides the dashboard's URL token |
 | `MINDHIVE_EVENT_BACKEND` | `file` (default), `pg` or `dual` | `events.py::_maybe_read_from_pg`, `dashboard_memo.py`, `adaptivetail.py` | `pg`: `read_all` reads the Postgres mirror, falling back to the files. `pg` or `dual`: the dashboard's memo fingerprints are disabled and the `MEMORY.md` rollover line adds the `hive pg tool search_events_by_type` pointer. Appends never touch Postgres under any value, and `dual` performs no dual-read comparison. Nothing in `src/` sets it (docs/DATA_MODEL.md §5, invariant 6) |
 | `MINDHIVE_HEADLESS` | `1` when set; set by the code, not the operator | set by `claude_cli.py` and `workspace.py` on every headless `claude` child and removed by `rotation/supervisor.py` for its interactive successor; read by every `hooks/*.sh` / `hooks/*.ps1` shim | a hook fired inside a headless child exits at once (no recursion) |
@@ -294,8 +295,8 @@ list of spellings; anything else takes the default.
 | `MINDHIVE_LOOP_DASHBOARD` | switch; default on. `0`, `false`, `off`, `no` turn it off | `commands/orchestration.py` (`hive loop`) | whether a real `hive loop` run opens the dashboard; `--no-dashboard` does the same per run |
 | `MINDHIVE_MINDSWARM` | switch; default on. `0`, `false`, `off`, `no` turn it off | `dashboard.py`, per request | hides the Workspace's MindSwarm nav row; read from the environment the dashboard was started with |
 | `MINDHIVE_ORCHESTRATION_SECRET` | string; unset | `advice.py::is_authorized_sop_author` | when set, only a process whose `MINDHIVE_PROCESS_TOKEN` equals it may write an SOP; unset, the session-prefix rule decides |
-| `MINDHIVE_PG_DSN_ADMIN` | libpq DSN; unset | `pgmirror.py`, `autosync.py`, `ci/runner.py`, `storage/cli.py`, `ci/legrun.py` (set inside the pg leg to `MINDHIVE_CI_PG_DSN`'s value, never read) | the owner credential for `hive pg migrate`/`rebuild`/`refresh`/`embed`; the default of `hive db migrate --dsn`; when set, `hive autosync` refreshes the mirror and `hive ci run` runs the pg tier |
-| `MINDHIVE_PG_DSN_RO` | libpq DSN; unset | `pgstore.py` | the reader credential (`mindhive_reader`, read-only at the role level) behind `hive pg tool` and the MCP server |
+| `MINDHIVE_PG_DSN_ADMIN` | libpq DSN; unset | `pgmirror.py`, `autosync.py`, `ci/runner.py`, `storage/cli.py`, `ci/legrun.py` (set inside the pg leg to `MINDHIVE_CI_PG_DSN`'s value, never read), `ci/legs.py` (compared, so the CI DSN is never this one) | the owner credential for `hive pg migrate`/`rebuild`/`refresh`/`embed`; the default of `hive db migrate --dsn`; when set, `hive autosync` refreshes the mirror and `hive ci run` runs the pg tier |
+| `MINDHIVE_PG_DSN_RO` | libpq DSN; unset | `pgstore.py`, `ci/legrun.py` (set inside the pg leg to `MINDHIVE_CI_PG_DSN_RO`'s value, never read), `ci/legs.py` (compared, so the CI DSN is never this one) | the reader credential (`mindhive_reader`, read-only at the role level) behind `hive pg tool` and the MCP server |
 | `MINDHIVE_PG_MAX_BYTES` | integer bytes; default 32768, ceiling 131072; zero, negative or unparseable → default | `pgshape.py` | the response cap on one AI-tool envelope |
 | `MINDHIVE_PLUGIN_AUTOSYNC` | switch; default off. `1`, `true`, `yes`, `on` turn it on | `plugin_cache.py`, through `hive plugins cache-check --hook` | on drift at session start, sync through `claude plugin update` (can hold session start up to 45 s) |
 | `MINDHIVE_PROCESS_TOKEN` | string; unset | `advice.py::is_authorized_sop_author` | the write token checked against `MINDHIVE_ORCHESTRATION_SECRET` (`hmac.compare_digest`); withheld from every agent the package spawns |
@@ -413,9 +414,11 @@ A leg this machine cannot run is **named, never counted**: the verdict says
 `not run here: pg`. `hive ci legs` shows which legs can run and why the others
 cannot. Two legs depart from their `ci.yml` job, and say so in `hive ci legs
 --json`: the `browser` leg runs the interpreter running `hive` (which must
-import playwright) against the leg's own `src`, so no Chromium is downloaded
-per run, and the `pg` leg runs only against the throwaway database named by
-`MINDHIVE_CI_PG_DSN` — never the operator's `MINDHIVE_PG_DSN_ADMIN`.
+launch playwright's Chromium) against the leg's own `src`, so no Chromium is
+downloaded per run, and the `pg` leg runs only against a throwaway Postgres
+cluster of its own, named by `MINDHIVE_CI_PG_DSN` and `MINDHIVE_CI_PG_DSN_RO`
+— never the operator's own DSNs. A leg whose pytest passed no test is not a
+pass: a tier whose every test skipped proved nothing.
 
 `--merge` merges a green PR, guarded: the PR must still be open, not a draft,
 and at the tested head; a base that moved is previewed again and a different

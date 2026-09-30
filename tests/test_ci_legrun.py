@@ -55,9 +55,11 @@ class FakeRun:
     """Answers a leg's children; writes what they would print into the log."""
 
     def __init__(self, pytest=(0, "...\n3 passed in 0.10s\n"), fail=None,
-                 script=("", 0), raises=None):
+                 script=("", 0), raises=None,
+                 fail_text="ERROR: No matching distribution found for pytest>=8\n"):
         self.pytest = pytest
         self.fail = fail
+        self.fail_text = fail_text
         self.script = script
         self.raises = raises
         self.calls = []
@@ -76,7 +78,7 @@ class FakeRun:
         if self.raises and self.raises in line:
             raise RuntimeError("the runner itself broke")
         if self.fail and self.fail in line:
-            say("ERROR: No matching distribution found for pytest>=8\n")
+            say(self.fail_text)
             return 1, "", ""
         if "archive" in argv:
             make_tar(argv[argv.index("-o") + 1])
@@ -206,6 +208,18 @@ def test_a_setup_step_that_fails_is_an_error_at_that_step_and_no_suite_runs(tmp_
     assert res.summary() == "install: " + res.reason
 
 
+def test_a_suite_that_passed_no_test_proved_nothing(tmp_path):
+    the_leg = leg("windows-py3.12")
+    res = runner(tmp_path, FakeRun(pytest=(0, "ssss\n4 skipped in 0.10s\n"))).run(
+        the_leg, avail(the_leg), COMMIT)
+    assert (res.state, res.step, res.exit_code) == ("error", "pytest", 0)
+    assert res.counts == {"skipped": 4}
+    assert res.summary() == "pytest: no test passed (4 skipped)"
+    unread = runner(tmp_path, FakeRun(pytest=(0, "the summary went missing\n"))).run(
+        the_leg, avail(the_leg), COMMIT)
+    assert (unread.state, unread.counts) == ("success", {})   # absent is not zero
+
+
 def test_a_suite_past_its_cap_is_an_error_that_says_so(tmp_path):
     the_leg = leg("windows-py3.12")
     res = runner(tmp_path, FakeRun(pytest=(124, "....\n"))).run(
@@ -229,22 +243,50 @@ def test_the_browser_leg_runs_the_hive_interpreter_against_the_legs_own_src(tmp_
     assert ran["env"]["PATH"].split(os.pathsep)[0] == str(Path(host).parent)
 
 
-def test_the_pg_leg_migrates_the_throwaway_database_and_never_the_real_one(tmp_path):
+CI_ADMIN = "postgresql://ci@localhost:55432/mindhive"
+CI_READER = "postgresql://mindhive_reader@localhost:55432/mindhive"
+PG_ENV = {**ENV, legs.PG_DSN_ENV: CI_ADMIN, legs.PG_RO_DSN_ENV: CI_READER}
+
+
+def _is_cluster_check(argv) -> bool:
+    return argv[1:2] == ["-c"] and argv[2:3] == [legrun.PG_CLUSTER_CHECK]
+
+
+def test_the_pg_leg_migrates_the_throwaway_cluster_and_never_the_real_one(tmp_path):
     fake = FakeRun()
-    environ = {**ENV, legs.PG_DSN_ENV: "postgresql://ci@localhost/throwaway"}
     the_leg = leg("pg")
-    res = runner(tmp_path, fake, environ=environ).run(the_leg, avail(the_leg), COMMIT)
+    res = runner(tmp_path, fake, environ=PG_ENV).run(the_leg, avail(the_leg), COMMIT)
     assert res.state == "success"
     py = str(tmp_path / "work" / "pg" / "venv" / "Scripts" / "python.exe")
-    assert fake.call(lambda a: a[:5] == [py, "-m", "pip", "install", "-e"])["argv"][-1] == (
-        ".[dev,pg]")
-    migrate = fake.call(lambda a: a == [py, "-m", "mindhive", "pg", "migrate"])
-    assert migrate["env"]["MINDHIVE_PG_DSN_ADMIN"] == "postgresql://ci@localhost/throwaway"
-    ran = fake.call(_is_pytest)
-    assert ran["argv"] == [py, "-m", "pytest", "-m", "pg", "-q"]
-    assert ran["env"]["MINDHIVE_PG_DSN_ADMIN"] == "postgresql://ci@localhost/throwaway"
+    install = fake.index(lambda a: a[:5] == [py, "-m", "pip", "install", "-e"])
+    assert fake.calls[install]["argv"][-1] == ".[dev,pg]"
+    check = fake.index(_is_cluster_check)
+    migrate = fake.index(lambda a: a == [py, "-m", "mindhive", "pg", "migrate"])
+    assert install < check < migrate < fake.index(_is_pytest)
+    assert fake.calls[check]["argv"][0] == py
+    for step in (check, migrate, fake.index(_is_pytest)):
+        env = fake.calls[step]["env"]
+        assert (env["MINDHIVE_PG_DSN_ADMIN"], env["MINDHIVE_PG_DSN_RO"]) == (
+            CI_ADMIN, CI_READER)
+    assert fake.call(_is_pytest)["argv"] == [py, "-m", "pytest", "-m", "pg", "-q"]
     assert not any(REAL_DSN in (c["env"] or {}).values() for c in fake.calls)
-    assert fake.index(lambda a: a[-2:] == ["pg", "migrate"]) < fake.index(_is_pytest)
+
+
+def test_a_cluster_the_leg_does_not_own_stops_it_before_the_migration(tmp_path):
+    why = "the cluster also holds mindhive_live: the pg leg needs a Postgres cluster of its own"
+    fake = FakeRun(fail="pg_database", fail_text=why + "\n")
+    the_leg = leg("pg")
+    res = runner(tmp_path, fake, environ=PG_ENV).run(the_leg, avail(the_leg), COMMIT)
+    assert (res.state, res.step, res.reason) == ("error", "cluster-check", why)
+    assert not any(a[-2:] == ["pg", "migrate"] for a in fake.argvs())
+    assert not any(_is_pytest(a) for a in fake.argvs())
+
+
+def test_the_cluster_check_is_python_that_asks_postgres_for_every_other_database():
+    compile(legrun.PG_CLUSTER_CHECK, "<cluster-check>", "exec")
+    assert "FROM pg_database WHERE NOT datistemplate" in legrun.PG_CLUSTER_CHECK
+    assert "current_database(), 'postgres'" in legrun.PG_CLUSTER_CHECK
+    assert 'os.environ["MINDHIVE_PG_DSN_ADMIN"]' in legrun.PG_CLUSTER_CHECK
 
 
 def test_an_ubuntu_leg_on_linux_keeps_lf_and_uses_the_venvs_bin(tmp_path):
