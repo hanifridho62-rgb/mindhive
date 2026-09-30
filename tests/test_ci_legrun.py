@@ -40,7 +40,8 @@ def make_tar(path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with tarfile.open(path, "w") as tar:
         for name, text in (("pyproject.toml", "[project]\nname = 'toy'\n"),
-                           ("src/toy/__init__.py", "")):
+                           ("src/toy/__init__.py", ""),
+                           ("hooks/a.sh", "#!/bin/sh\n"), ("hooks/b.sh", "#!/bin/sh\n")):
             data = text.encode("utf-8")
             info = tarfile.TarInfo(name)
             info.size = len(data)
@@ -56,8 +57,10 @@ class FakeRun:
 
     def __init__(self, pytest=(0, "...\n3 passed in 0.10s\n"), fail=None,
                  script=("", 0), raises=None,
-                 fail_text="ERROR: No matching distribution found for pytest>=8\n"):
+                 fail_text="ERROR: No matching distribution found for pytest>=8\n",
+                 tree=""):
         self.pytest = pytest
+        self.tree = tree
         self.fail = fail
         self.fail_text = fail_text
         self.script = script
@@ -80,6 +83,8 @@ class FakeRun:
         if self.fail and self.fail in line:
             say(self.fail_text)
             return 1, "", ""
+        if "ls-tree" in argv:
+            return 0, self.tree, ""
         if "archive" in argv:
             make_tar(argv[argv.index("-o") + 1])
             return 0, "", ""
@@ -174,7 +179,7 @@ def test_a_windows_leg_runs_its_jobs_steps_in_a_fresh_repo_and_venv(tmp_path):
     committed = fake.call(lambda a: "commit" in a)["argv"]
     assert "user.name=mindhive-ci" in committed and "--no-verify" in committed
     for c in fake.calls:
-        if c["argv"][:2] == [py, "-m"] or c["argv"][0] == "git" and "archive" not in c["argv"]:
+        if c["argv"][:2] == [py, "-m"] or c["argv"][0] == "git" and not {"archive", "ls-tree"} & set(c["argv"]):
             assert c["cwd"] == str(repo), c["argv"]
     ran = fake.call(lambda a: a == [py, "-m", "pytest", "-q"])
     assert ran["env"]["PATH"].split(os.pathsep)[0] == str(venv / "Scripts")
@@ -183,6 +188,49 @@ def test_a_windows_leg_runs_its_jobs_steps_in_a_fresh_repo_and_venv(tmp_path):
     assert res.argv == (py, "-m", "pytest", "-q")
     assert not work.exists()                                  # removed after the run
     assert "3 passed" in Path(res.artifact).read_text(encoding="utf-8")
+
+
+def _tree(*entries) -> str:
+    """What `git ls-tree -r -z` prints for *entries*, each a (mode, path)."""
+    return "".join(f"{mode} blob {'a' * 40}\t{path}\0" for mode, path in entries)
+
+
+def test_a_native_leg_puts_back_the_executable_bits_git_add_drops(tmp_path):
+    # `git add` on Windows records every file 100644: a test that checks a
+    # shim's bit passes on a runner and fails on the leg, unless the bits the
+    # tested tree holds are put back before the commit.
+    fake = FakeRun(tree=_tree(("100755", "hooks/a.sh"), ("100644", "pyproject.toml"),
+                              ("100755", "not/exported.sh"), ("120000", "hooks/link")))
+    the_leg = leg("windows-py3.12")
+    res = runner(tmp_path, fake).run(the_leg, avail(the_leg), COMMIT)
+    assert res.state == "success", (res.step, res.reason)
+    listed = fake.call(lambda a: "ls-tree" in a)
+    assert listed["argv"] == ["git", "ls-tree", "-r", "-z", COMMIT]
+    assert listed["cwd"] == str(tmp_path / "origin")
+    chmods = [c["argv"] for c in fake.calls if "update-index" in c["argv"]]
+    assert chmods == [["git", "update-index", "--chmod=+x", "--", "hooks/a.sh"]]
+    assert fake.call(lambda a: "update-index" in a)["cwd"] == str(
+        tmp_path / "work" / "windows-py3.12" / "repo")
+    assert (fake.index(lambda a: a[1:] == ["add", "-A", "-f"])
+            < fake.index(lambda a: "update-index" in a)
+            < fake.index(lambda a: "commit" in a))
+
+
+def test_the_executable_bits_go_back_a_bounded_batch_at_a_time(tmp_path, monkeypatch):
+    monkeypatch.setattr(legrun, "CHMOD_BATCH", 1)
+    fake = FakeRun(tree=_tree(("100755", "hooks/a.sh"), ("100755", "hooks/b.sh")))
+    the_leg = leg("windows-py3.12")
+    assert runner(tmp_path, fake).run(the_leg, avail(the_leg), COMMIT).state == "success"
+    assert [c["argv"][4:] for c in fake.calls if "update-index" in c["argv"]] == [
+        ["hooks/a.sh"], ["hooks/b.sh"]]
+
+
+def test_a_tree_git_cannot_list_is_an_error_before_anything_is_exported(tmp_path):
+    fake = FakeRun(fail="ls-tree")
+    the_leg = leg("windows-py3.12")
+    res = runner(tmp_path, fake).run(the_leg, avail(the_leg), COMMIT)
+    assert (res.state, res.step, res.exit_code) == ("error", "exec-bits", 1)
+    assert not any("archive" in a for a in fake.argvs())
 
 
 def test_a_red_suite_is_a_failure_with_its_failed_tests_named(tmp_path):
@@ -451,12 +499,14 @@ def test_a_real_leg_exports_commits_and_runs_the_suite_in_a_fresh_repo(
     origin = tmp_path / "origin"
     (origin / "tests").mkdir(parents=True)
     for rel, text in (("pyproject.toml", '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n'),
-                      ("data.txt", "one\ntwo\n"), ("tests/test_toy.py", TOY_TEST)):
+                      ("data.txt", "one\ntwo\n"), ("tests/test_toy.py", TOY_TEST),
+                      ("run.sh", "#!/bin/sh\necho ok\n")):
         (origin / rel).write_text(text, encoding="utf-8", newline="\n")
     ident = ["-c", "user.name=t", "-c", "user.email=t@example.invalid",
              "-c", "commit.gpgsign=false", "-c", "core.autocrlf=false"]
     _git(origin, "init", "-q", "-b", "master")
     _git(origin, *ident, "add", "-A")
+    _git(origin, "update-index", "--chmod=+x", "run.sh")
     _git(origin, *ident, "commit", "-q", "-m", "toy")
     commit = _git(origin, "rev-parse", "HEAD")
     toy = legs.Leg(name="toy", job="test", ci_name="toy", runs_on=runs_on,
@@ -478,3 +528,7 @@ def test_a_real_leg_exports_commits_and_runs_the_suite_in_a_fresh_repo(
     # repository's autocrlf agree, so no tracked file reads as modified.
     assert _git(repo, "status", "--porcelain", "--untracked-files=no") == ""
     assert _git(repo, "log", "-1", "--format=%an") == "mindhive-ci"
+    # The tested tree's executable bit survives wherever `git add` ran, and
+    # only its: a file the tree holds 100644 stays so.
+    assert _git(repo, "ls-files", "-s", "run.sh").split()[0] == "100755"
+    assert _git(repo, "ls-files", "-s", "data.txt").split()[0] == "100644"

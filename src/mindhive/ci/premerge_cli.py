@@ -192,7 +192,7 @@ def _common(p) -> None:
     p.add_argument("--keep", action="store_true",
                    help="keep each leg's directory for inspection")
     p.add_argument("--work-root", default=None,
-                   help="where the legs run (default <repo>/.worktrees/premerge)")
+                   help="where the legs run (default <tempdir>/mindhive-ci)")
     p.add_argument("--root", default=None,
                    help="the repository (default: the one this runs in)")
     p.add_argument("--project", type=cliparse.project_arg, default=None,

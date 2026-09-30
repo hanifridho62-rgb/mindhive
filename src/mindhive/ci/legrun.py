@@ -9,6 +9,12 @@ history, no hooks, no other branch -- and it shares nothing with the
 operator's repository, so a test that runs `git` in its root sees the tree
 under test and nothing else.
 
+**Executable bits are the tested tree's.** NTFS has none, so `git add` on
+Windows records every file 100644; a native leg reads the tree's 100755
+entries with `git ls-tree` and puts them back with `git update-index
+--chmod=+x` before its commit, as a runner's checkout has them. A WSL leg's
+tar carries the modes, and Linux keeps them.
+
 **Line endings follow the runner.** A windows job's checkout is CRLF (git for
 Windows ships `core.autocrlf=true`, as the runner image does) and an ubuntu
 job's is LF. `git archive` honours `core.autocrlf` (measured), so the
@@ -72,6 +78,9 @@ FAILED_CAP = 20
 CI_NAME = "mindhive-ci"
 CI_EMAIL = "mindhive-ci@localhost.invalid"
 COMMIT_MESSAGE = "mindhive-ci leg tree"
+#: Paths per `git update-index --chmod=+x`: a Windows command line holds about
+#: 32k characters, and a tree may hold many executables.
+CHMOD_BATCH = 100
 _DROP_PREFIXES = ("PYTHON", "PYTEST_", "MINDHIVE_", "MINDNETWORK_", "CLAUDE",
                   "ANTHROPIC_", "GIT_", "VIRTUAL_ENV", "CONDA_", "UV_")
 _DROP_WORDS = ("TOKEN", "SECRET", "PASSWORD", "PASSWD", "API_KEY", "APIKEY",
@@ -368,9 +377,35 @@ class LegRunner:
         if res.state == "error":
             res.reason = _last_line(err) or f"pytest exit {rc}"
 
-    def _init_repo(self, res, repo, crlf, leg_dir, env, log) -> bool:
+    def _executables(self, res, commit, *, log, env):
+        """The paths *commit* holds as executable (mode 100755), or None -- with
+        *res* an error at `exec-bits` -- when git cannot list them: a leg that
+        quietly lost its executable bits would test another tree."""
+        argv = [GIT, "ls-tree", "-r", "-z", commit]
+        _append(log, f"{MARK} step exec-bits: {' '.join(argv)}\n")
+        rc, out, err = self._run(argv, cwd=self.repo_root, env=env,
+                                 timeout_s=STEP_TIMEOUT_S)
+        if rc != 0:
+            if err:
+                _append(log, str(err).rstrip() + "\n")
+            res.state, res.step, res.exit_code = "error", "exec-bits", int(rc)
+            res.reason = _last_line(err) or f"exit {rc}"
+            return None
+        found = []
+        for entry in str(out or "").split("\0"):
+            meta, _, path = entry.partition("\t")
+            if path and meta.split(" ", 1)[0] == "100755":
+                found.append(path)
+        return found
+
+    def _init_repo(self, res, repo, crlf, leg_dir, env, log, executables=()) -> bool:
         hooks = leg_dir / "no-hooks"
         hooks.mkdir(exist_ok=True)
+        # Only what was exported: an `export-ignore` path is in the tree and
+        # not in the leg, and update-index refuses a path the index lacks.
+        marked = [path for path in executables if (repo / path).is_file()]
+        chmods = [[GIT, "update-index", "--chmod=+x", "--", *marked[i:i + CHMOD_BATCH]]
+                  for i in range(0, len(marked), CHMOD_BATCH)]
         steps = (
             [GIT, "-c", "init.defaultBranch=master", "init", "-q"],
             [GIT, "config", "core.autocrlf", crlf],
@@ -378,6 +413,7 @@ class LegRunner:
             # -f: every file here was TRACKED; a .gitignore in the tree must
             # not drop one that was force-added upstream.
             [GIT, "add", "-A", "-f"],
+            *chmods,
             [GIT, "-c", f"user.name={CI_NAME}", "-c", f"user.email={CI_EMAIL}",
              "-c", "commit.gpgsign=false", "-c", f"core.hooksPath={hooks}",
              "commit", "-q", "--no-verify", "-m", COMMIT_MESSAGE],
@@ -392,6 +428,9 @@ class LegRunner:
         repo, tar = leg_dir / "repo", leg_dir / "tree.tar"
         (leg_dir / "home").mkdir(exist_ok=True)
         env = leg_env(self.environ, leg_dir)
+        executables = self._executables(res, commit, log=log, env=env)
+        if executables is None:
+            return
         if not self._step(res, "archive",
                           [GIT, "-c", f"core.autocrlf={crlf}", "archive",
                            "--format=tar", "-o", str(tar), commit],
@@ -401,7 +440,7 @@ class LegRunner:
         extract(tar, repo)
         tar.unlink()
         res.step = ""
-        if not self._init_repo(res, repo, crlf, leg_dir, env, log):
+        if not self._init_repo(res, repo, crlf, leg_dir, env, log, executables):
             return
         if leg.clean_venv:
             venv = leg_dir / "venv"

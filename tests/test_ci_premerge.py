@@ -10,6 +10,8 @@ and what it tells GitHub -- the ledger it writes is the real one, in the
 test's own store.
 """
 import itertools
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -498,9 +500,14 @@ def test_the_default_leg_runner_runs_under_the_work_root_with_the_probes_wsl(tmp
     assert (runner.work_root, runner.run_id, runner.timeout_s, runner.keep) == (
         tmp_path / "work" / "pr151-x-r1", "pr151-x-r1", 77.0, True)
     assert (runner.wsl_prefix, runner.wsl_env) == (["wsl.exe", "--exec"], {"WSLENV": ""})
-    assert premerge.Premerge(tmp_path / "repo", github=FakeGitHub(),
-                             probe=FakeProbe()).work_root == (
-        tmp_path / "repo" / ".worktrees" / "premerge")
+    # By default the legs run outside the repository: under it, each would sit
+    # inside the operator's checkout -- a `.claude/worktrees/...` path when the
+    # checkout is a linked worktree, which tests that resolve the memory folder
+    # from the path read differently -- and deeper than Windows' MAX_PATH wants.
+    default = premerge.Premerge(tmp_path / "repo", github=FakeGitHub(),
+                                probe=FakeProbe()).work_root
+    assert default == Path(tempfile.gettempdir()) / "mindhive-ci"
+    assert tmp_path / "repo" not in default.parents
 
 
 # --- a premerge row is a verdict on a PR's merge, not a run of this checkout ------------

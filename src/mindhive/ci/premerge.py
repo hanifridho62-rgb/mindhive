@@ -52,6 +52,7 @@ import concurrent.futures
 import json
 import os
 import re
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -80,7 +81,12 @@ MAX_ROUNDS = 3
 DEFAULT_JOBS = 3
 EXIT_NOT_MERGED = 3
 SIDECAR = "ci_premerge.json"
-WORK_DIRNAME = ".worktrees"
+#: Where the legs run unless told: `<tempdir>/mindhive-ci`, outside the
+#: repository. Under it, a leg would sit inside the operator's checkout -- a
+#: `.claude/worktrees/...` path when that is a linked worktree, which tests
+#: that resolve a memory folder from the path read differently -- and deeper
+#: than Windows' MAX_PATH wants.
+WORK_DIRNAME = "mindhive-ci"
 FETCH_TIMEOUT_S = 600.0
 GIT_TIMEOUT_S = 120.0
 #: The overall commit status each verdict posts.
@@ -319,7 +325,7 @@ class Premerge:
         self._clock = clock
         self._now_iso = now_iso
         self.work_root = (Path(work_root) if work_root
-                          else self.repo_root / WORK_DIRNAME / "premerge")
+                          else Path(tempfile.gettempdir()) / WORK_DIRNAME)
         self.jobs = max(1, int(jobs))
         self.timeout_s = float(timeout_s)
         self.post_statuses = bool(post_statuses)
