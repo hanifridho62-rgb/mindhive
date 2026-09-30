@@ -40,6 +40,11 @@ history and grouped by what each release window introduced. They summarise;
 - **`ci.yml` checks out with `fetch-depth: 0`**: `tests/test_implementation_plan.py`
   reads history, so the default one-commit checkout was red on master itself.
 
+- **A windows leg finds `sh` as GitHub's runner does**: when the operator's
+  PATH has no POSIX `sh` (a PowerShell or scheduled-task launch), the leg's
+  pytest gets Git for Windows' own `bin` last on PATH, and a leg that finds
+  none says so in its log, since every test needing `sh` would skip.
+
 - **Blueprint P11 — the traceability matrix and the audit that closes the
   blueprint** (RP §3, §4.7, §10.3; MEB §3.1, §153):
   - `IMPLEMENTATION_PLAN.md` at the root: the RTM for blueprint v1.0 and v1.1 with the commit that realised each row; the audit table `| Bab / Fitur PDF | Modul / Berkas Kode Sumber | Berkas Pengujian (Tests) | Status Verifikasi |` — one row per item, every status parsed from the junit of one full pytest run rather than typed; the MEB LOC forecast beside measured sizes; an ISO/IEC 25010 matrix of measured values; the three benches; the deviation register; and the real outcome of the one `hive mindnet ab --execute --record` run. `tests/test_implementation_plan.py` holds it to that: the commit it names must exist, every path it cites must exist, every status is one of seven words, the LOC rows equal `scripts/loc_report.py`'s.

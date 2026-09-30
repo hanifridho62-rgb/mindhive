@@ -417,6 +417,13 @@ The suite reads history — `tests/test_implementation_plan.py` names a commit �
 so a one-commit checkout is red on master itself. Every `ci.yml` checkout is
 therefore `fetch-depth: 0`, and each leg has the history the same way.
 
+A windows leg's suite finds a POSIX `sh` where GitHub's Windows runner has
+one, on PATH: the hook-shim and leg-script tests need it, and the runner's
+green master run skipped none of them. When this machine's PATH has no `sh` —
+`hive ci premerge` started from PowerShell or a scheduled task — the leg's
+PATH gets Git for Windows' own `bin` last, so it shadows nothing; a leg that
+finds none says so in its log, because every test needing `sh` would skip.
+
 A leg this machine cannot run is **named, never counted**: the verdict says
 `not run here: pg`. `hive ci legs` shows which legs can run and why the others
 cannot. Three legs depart from their `ci.yml` job, and say so in `hive ci

@@ -98,12 +98,13 @@ class FakeRun:
         return next(i for i, c in enumerate(self.calls) if pred(c["argv"]))
 
 
-def runner(tmp_path, fake, *, windows=True, environ=ENV, keep=False):
+def runner(tmp_path, fake, *, windows=True, environ=ENV, keep=False, which=None):
+    extra = {} if which is None else {"which": which}
     return legrun.LegRunner(tmp_path / "origin", tmp_path / "work", run_id="pr1-t",
                             run=fake, environ=environ, project="test", timeout_s=5.0,
                             wsl_prefix=["wsl.exe", "--exec"],
                             wsl_env={"WSLENV": "", "WSL_UTF8": "1"},
-                            keep=keep, windows=windows)
+                            keep=keep, windows=windows, **extra)
 
 
 def leg(name):
@@ -324,6 +325,85 @@ def test_an_ubuntu_leg_on_linux_keeps_lf_and_uses_the_venvs_bin(tmp_path):
     assert fake.call(lambda a: a[1:3] == ["config", "core.autocrlf"])["argv"][3] == "false"
     py = str(tmp_path / "work" / "ubuntu-py3.12" / "venv" / "bin" / "python")
     assert fake.call(_is_pytest)["argv"] == [py, "-m", "pytest", "-q"]
+
+
+# --- a POSIX sh, where GitHub's Windows runner has one ---------------------------------
+
+
+def _git_for_windows(root, sh_in="bin"):
+    """A Git for Windows install laid out as it ships: `cmd/git.exe`, the one an
+    operator's PATH usually names, and `sh.exe` in `bin` (or `usr/bin`)."""
+    for rel in ("cmd/git.exe", "mingw64/bin/git.exe") + ((f"{sh_in}/sh.exe",) if sh_in else ()):
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_bytes(b"")
+    return root
+
+
+def _which_exe(name, path=None):
+    """`shutil.which` as Windows answers it, on any OS: `<dir>/<name>.exe`."""
+    for d in str(path or "").split(os.pathsep):
+        if d and Path(d, name + ".exe").is_file():
+            return str(Path(d, name + ".exe"))
+    return None
+
+
+def test_git_sh_dir_is_the_directory_that_ships_sh_beside_git(tmp_path):
+    git = _git_for_windows(tmp_path / "Git")
+    assert legrun.git_sh_dir(git / "cmd" / "git.exe") == git / "bin"
+    assert legrun.git_sh_dir(git / "mingw64" / "bin" / "git.exe") == git / "bin"
+    usr = _git_for_windows(tmp_path / "MinGit", sh_in="usr/bin")
+    assert legrun.git_sh_dir(usr / "cmd" / "git.exe") == usr / "usr" / "bin"
+    bare = _git_for_windows(tmp_path / "NoSh", sh_in=None)
+    assert legrun.git_sh_dir(bare / "cmd" / "git.exe") is None
+    assert legrun.git_sh_dir(None) is None and legrun.git_sh_dir("") is None
+
+
+def test_a_windows_leg_finds_the_sh_githubs_windows_runner_has(tmp_path):
+    """GitHub's Windows runner has Git for Windows' `bin` on PATH: its green
+    master run of 2026-09-07 skipped no test for want of `sh`. A leg started
+    from a shell whose PATH names only `Git/cmd` skipped 258 of them here --
+    green, and smaller than the job it stands for."""
+    git = _git_for_windows(tmp_path / "Git")
+    environ = {**ENV, "PATH": str(git / "cmd")}
+    fake = FakeRun()
+    the_leg = leg("windows-py3.12")
+    res = runner(tmp_path, fake, environ=environ, which=_which_exe).run(
+        the_leg, avail(the_leg), COMMIT)
+    dirs = fake.call(_is_pytest)["env"]["PATH"].split(os.pathsep)
+    assert dirs[1:] == [str(git / "cmd"), str(git / "bin")]     # appended: shadows nothing
+    assert f"{legrun.MARK} sh {git / 'bin'}" in Path(res.artifact).read_text(encoding="utf-8")
+
+
+def test_a_windows_leg_whose_path_has_sh_already_is_left_as_it_is(tmp_path):
+    git = _git_for_windows(tmp_path / "Git")
+    environ = {**ENV, "PATH": os.pathsep.join([str(git / "cmd"), str(git / "bin")])}
+    fake = FakeRun()
+    the_leg = leg("windows-py3.12")
+    runner(tmp_path, fake, environ=environ, which=_which_exe).run(
+        the_leg, avail(the_leg), COMMIT)
+    assert fake.call(_is_pytest)["env"]["PATH"].split(os.pathsep)[1:] == [
+        str(git / "cmd"), str(git / "bin")]
+
+
+def test_a_windows_leg_that_finds_no_sh_says_so_in_its_log(tmp_path):
+    git = _git_for_windows(tmp_path / "Git", sh_in=None)
+    environ = {**ENV, "PATH": str(git / "cmd")}
+    fake = FakeRun()
+    the_leg = leg("windows-py3.12")
+    res = runner(tmp_path, fake, environ=environ, which=_which_exe).run(
+        the_leg, avail(the_leg), COMMIT)
+    assert fake.call(_is_pytest)["env"]["PATH"].split(os.pathsep)[1:] == [str(git / "cmd")]
+    assert f"{legrun.MARK} no POSIX sh" in Path(res.artifact).read_text(encoding="utf-8")
+
+
+def test_a_leg_on_linux_is_never_handed_a_windows_sh(tmp_path):
+    git = _git_for_windows(tmp_path / "Git")
+    environ = {**ENV, "PATH": str(git / "cmd")}
+    fake = FakeRun()
+    the_leg = leg("ubuntu-py3.12")
+    runner(tmp_path, fake, windows=False, environ=environ, which=_which_exe).run(
+        the_leg, avail(the_leg, python="/usr/bin/python3.12"), COMMIT)
+    assert str(git / "bin") not in fake.call(_is_pytest)["env"]["PATH"].split(os.pathsep)
 
 
 def test_a_runner_that_breaks_is_an_error_never_a_raise(tmp_path):

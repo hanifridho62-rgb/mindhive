@@ -34,7 +34,11 @@ a leg test something other than what CI tests -- interpreter and pytest
 overrides, every `MINDHIVE_*`, git's own variables -- and anything shaped like
 a credential, then sets `MINDHIVE_HOME` inside the leg and puts the venv first
 on PATH. A WSL leg does the same inside Linux (`POSIX_LEG_SCRIPT`), where
-nothing from Windows arrives at all (`WSLENV=""`).
+nothing from Windows arrives at all (`WSLENV=""`). A windows leg's pytest
+finds a POSIX `sh` where GitHub's Windows runner has one, on PATH: when the
+operator's PATH has none -- a leg started from PowerShell or a scheduled task
+-- Git for Windows' own `bin` goes last on it (`git_sh_dir`), and a leg that
+finds none says so in its log, because every test needing `sh` skips.
 
 **Classification is pytest's own**: exit 0 success, 1 failure, anything else
 error (2 interrupted, 3 internal error, 4 usage, 5 nothing collected, 124 the
@@ -50,6 +54,7 @@ afterwards unless `keep`, which names in the log the WSL paths it kept.
 """
 import os
 import re
+import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -60,7 +65,7 @@ from . import proc
 
 __all__ = ["FAILED_CAP", "LEG_TIMEOUT_S", "LegResult", "LegRunner", "MARK",
            "PG_CLUSTER_CHECK", "POSIX_LEG_SCRIPT", "SETUP_FAILED_EXIT", "STATES",
-           "autocrlf_for", "classify", "leg_env", "venv_python"]
+           "autocrlf_for", "classify", "git_sh_dir", "leg_env", "venv_python"]
 
 GIT = "git"
 #: Every line the runner -- or the WSL script -- writes into a leg's log starts
@@ -191,6 +196,25 @@ def venv_python(venv, windows=None) -> Path:
     return Path(venv) / ("Scripts/python.exe" if windows else "bin/python")
 
 
+#: Where Git for Windows keeps a POSIX `sh`, under its install root: `bin`,
+#: the directory GitHub's Windows runner has on PATH, then `usr/bin`.
+GIT_SH_DIRS = ("bin", "usr/bin")
+
+
+def git_sh_dir(git_exe):
+    """The directory of the `sh.exe` that ships with the Git for Windows whose
+    `git.exe` is *git_exe* -- `<root>/cmd`, `<root>/bin` or `<root>/mingw64/bin`
+    -- or None when there is none."""
+    if not git_exe:
+        return None
+    exe = Path(git_exe)
+    for root in (exe.parent.parent, exe.parent.parent.parent):
+        for rel in GIT_SH_DIRS:
+            if (root / rel / "sh.exe").is_file():
+                return root / rel
+    return None
+
+
 def leg_env(environ, leg_dir, bin_dir=None) -> dict:
     """The environment a leg's children get: built from *environ*, never
     inherited whole. *environ* itself is not changed."""
@@ -292,7 +316,7 @@ class LegRunner:
     def __init__(self, repo_root, work_root, *, run_id, run=proc.run, environ=None,
                  project=None, timeout_s=LEG_TIMEOUT_S,
                  wsl_prefix=("wsl.exe", "--exec"), wsl_env=None, keep=False,
-                 clock=time.monotonic, windows=None):
+                 clock=time.monotonic, windows=None, which=None):
         self.repo_root = Path(repo_root)
         self.work_root = Path(work_root)
         self.run_id = str(run_id)
@@ -305,6 +329,7 @@ class LegRunner:
         self.keep = bool(keep)
         self._clock = clock
         self.windows = (os.name == "nt") if windows is None else bool(windows)
+        self._which = shutil.which if which is None else which
 
     def run(self, leg, availability, commit) -> LegResult:
         """Run *leg* against *commit* with what *availability* found. Never raises."""
@@ -446,8 +471,28 @@ class LegRunner:
                               [python, "-m", "mindhive", "pg", "migrate"],
                               log=log, cwd=repo, env=env, timeout_s=SETUP_TIMEOUT_S):
                 return
+        env = self._with_posix_sh(env, log)
         self._pytest(res, [python, "-m", "pytest", *leg.pytest_args],
                      log=log, cwd=repo, env=env)
+
+    def _with_posix_sh(self, env, log) -> dict:
+        """*env* with a POSIX `sh` on PATH for a windows leg's pytest, as GitHub's
+        Windows runner has one: Git for Windows' own `bin`, appended so it shadows
+        nothing, only when the PATH has no `sh` already."""
+        if not self.windows:
+            return env
+        key = next((k for k in env if str(k).upper() == "PATH"), "PATH")
+        path = str(env.get(key) or "")
+        if self._which("sh", path=path):
+            return env
+        found = git_sh_dir(self._which("git", path=path))
+        if found is None:
+            _append(log, f"{MARK} no POSIX sh on PATH: every test that needs one "
+                         f"skips here, where GitHub's runner runs it\n")
+            return env
+        env[key] = path + (os.pathsep if path else "") + str(found)
+        _append(log, f"{MARK} sh {found}\n")
+        return env
 
     # --- a leg in WSL -----------------------------------------------------------------
 
