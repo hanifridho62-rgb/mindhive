@@ -400,6 +400,25 @@ def test_the_leg_script_stops_at_the_first_step_it_cannot_do(tmp_path):
     assert "no such dir" in err            # the argument with spaces arrived whole
 
 
+@pytest.mark.skipif(_bash() is None, reason="no POSIX sh on this machine")
+def test_the_leg_script_unsets_what_leg_env_drops_whatever_its_case():
+    """A WSL leg cleans its own environment inside Linux. It must drop exactly
+    what `leg_env` drops on Windows -- the same lists, matched the same way --
+    or a lower-case `gh_token` in a login profile reaches the tests."""
+    script = legrun.POSIX_LEG_SCRIPT.replace('mhci_leg "$@" </dev/null',
+                                             "mhci_scrub; compgen -e")
+    assert script != legrun.POSIX_LEG_SCRIPT
+    env = {**ENV, "PATH": os.environ.get("PATH", ""), "KEEP_ME": "1",
+           "SYSTEMROOT": os.environ.get("SYSTEMROOT", "C:/Windows")}
+    proc = subprocess.run([_bash(), "-s"], input=script.encode("utf-8"), env=env,
+                          capture_output=True, timeout=60)
+    names = set(proc.stdout.decode("utf-8", "replace").split())
+    assert proc.returncode == 0, proc.stderr
+    assert "KEEP_ME" in names                            # canary: the scrub is selective
+    assert not names & set(GONE), names & set(GONE)
+    assert not names & {n for n in names if n.upper() == "GH_TOKEN"}
+
+
 TOY_TEST = '''\
 import os
 import subprocess

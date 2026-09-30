@@ -105,9 +105,18 @@ if rows:
 #: so without that a step that reads stdin -- pip, a test's child -- would eat
 #: the rest of the script. Windows paths (`/mnt/...`) come off PATH first, so a
 #: Windows `python`, `git` or `pytest` can never answer for Linux.
-POSIX_LEG_SCRIPT = r"""
+_POSIX_LEG_TEMPLATE = r"""
 mhci_mark() { printf '%s %s\n' '::mindhive-ci::' "$*"; }
 mhci_fail() { mhci_mark "setup-failed $1"; exit 97; }
+mhci_scrub() {
+    shopt -s nocasematch
+    for name in $(compgen -e); do
+        case "$name" in
+            @SCRUB@) unset "$name" ;;
+        esac
+    done
+    shopt -u nocasematch
+}
 mhci_leg() {
     ROOT=$1 PY=$2 EXTRAS=$3 CAP=$4
     shift 4
@@ -118,12 +127,7 @@ mhci_leg() {
         case "$d" in /mnt/*) ;; *) PATH="${PATH:+$PATH:}$d" ;; esac
     done
     export PATH
-    for name in $(compgen -e); do
-        case "$name" in
-            PYTHON*|PYTEST_*|MINDHIVE_*|MINDNETWORK_*|GIT_*|CLAUDE*|ANTHROPIC_*|VIRTUAL_ENV|CONDA_*|UV_*|*TOKEN*|*SECRET*|*PASSWORD*|*PASSWD*|*API_KEY*|*APIKEY*|*ACCESS_KEY*|*PRIVATE_KEY*|*CREDENTIAL*)
-                unset "$name" ;;
-        esac
-    done
+    mhci_scrub
     export MINDHIVE_HOME="$ROOT-home" PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1
     mkdir -p "$MINDHIVE_HOME" || mhci_fail home
     mhci_mark "step git-init"
@@ -131,9 +135,9 @@ mhci_leg() {
         && git config core.autocrlf false \
         && git config core.safecrlf false \
         && git add -A -f \
-        && git -c user.name=mindhive-ci -c user.email=mindhive-ci@localhost.invalid \
+        && git -c user.name=@CI_NAME@ -c user.email=@CI_EMAIL@ \
                -c commit.gpgsign=false -c core.hooksPath=/dev/null \
-               commit -q --no-verify -m "mindhive-ci leg tree" \
+               commit -q --no-verify -m "@COMMIT_MESSAGE@" \
         || mhci_fail git-init
     VENV="$ROOT-venv"
     mhci_mark "step venv: $PY -m venv $VENV"
@@ -156,6 +160,13 @@ mhci_leg() {
 }
 mhci_leg "$@" </dev/null
 """
+#: What the WSL script unsets: `leg_env`'s own lists, so the two cannot drift,
+#: matched without regard to case, as `leg_env` matches them.
+_SCRUB_PATTERN = "|".join([p + "*" for p in _DROP_PREFIXES]
+                          + ["*" + w + "*" for w in _DROP_WORDS])
+POSIX_LEG_SCRIPT = (_POSIX_LEG_TEMPLATE.replace("@SCRUB@", _SCRUB_PATTERN)
+                    .replace("@CI_NAME@", CI_NAME).replace("@CI_EMAIL@", CI_EMAIL)
+                    .replace("@COMMIT_MESSAGE@", COMMIT_MESSAGE))
 
 
 def classify(rc) -> str:
