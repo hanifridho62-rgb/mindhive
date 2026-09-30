@@ -289,8 +289,18 @@ def cmd_harvest(args) -> int | None:
             projector.project(proj)
         print(json.dumps(res))
     elif args.transcripts and args.project:
-        print(json.dumps(harvest_mod.harvest(args.transcripts, args.project,
-                                             skip_captured=not args.include_captured)))
+        # Under the lock `--catch-up` holds. This was the one door to the writer
+        # that took none, so an operator running it beside the dashboard's loop
+        # was a second harvester over one cursor window (harvest.harvest_lock).
+        with harvest_mod.harvest_lock() as held:
+            if not held:
+                print(json.dumps({"processed_files": 0, "new_events": 0,
+                                  "skipped_captured": 0, "unclosed_skill_calls": 0,
+                                  "locked": True}))
+                return None
+            print(json.dumps(harvest_mod.harvest(
+                args.transcripts, args.project,
+                skip_captured=not args.include_captured)))
     else:
         print("error: give --transcripts and --project, or use --catch-up", file=sys.stderr)
         return 2
