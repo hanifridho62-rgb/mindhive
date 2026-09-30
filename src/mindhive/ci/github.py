@@ -13,6 +13,9 @@ which is this repository's convention; the head pinned, so GitHub itself
 refuses the merge when the head moved after it was tested; nothing that
 rewrites the branch, deletes it, bypasses a rule or merges later.
 
+A PR from a fork is `from_fork`: its code is not the owner's, and running its
+legs runs that code here, so `premerge` asks for `--trust` first.
+
 Reads raise `GitHubError` in gh's own words. `post_status` never raises: a PR
 that could not be annotated still has a verdict, and the caller records why.
 """
@@ -21,7 +24,7 @@ import json
 from . import proc
 
 __all__ = ["CONTEXT", "DESCRIPTION_MAX", "GH", "GitHub", "GitHubError",
-           "PR_FIELDS", "STATES", "clip"]
+           "PR_FIELDS", "STATES", "clip", "from_fork"]
 
 GH = "gh"
 #: The overall context; each leg posts `mindhive-ci/<leg>`.
@@ -29,7 +32,8 @@ CONTEXT = "mindhive-ci"
 STATES = ("pending", "success", "failure", "error")
 #: GitHub refuses a status description past 140 characters.
 DESCRIPTION_MAX = 140
-PR_FIELDS = "number,state,isDraft,headRefName,headRefOid,baseRefName,title,url"
+PR_FIELDS = ("number,state,isDraft,isCrossRepository,headRefName,headRefOid,"
+             "headRepositoryOwner,baseRefName,title,url")
 TIMEOUT_S = 120.0
 MERGE_TIMEOUT_S = 300.0
 
@@ -42,6 +46,12 @@ def clip(text, limit=DESCRIPTION_MAX) -> str:
     """*text* on one line, at most *limit* characters, ASCII ellipsis."""
     text = " ".join(str(text or "").split())
     return text if len(text) <= limit else text[:limit - 3].rstrip() + "..."
+
+
+def from_fork(pr) -> bool:
+    """Whether *pr*'s head lives in another repository. A PR gh did not place
+    counts as one: its legs would run someone else's code on this machine."""
+    return pr.get("isCrossRepository") is not False
 
 
 def _json(out, what):

@@ -18,6 +18,10 @@ A pass reads the open PRs and, for each, what `premerge` last tested
   merges cleanly is tested in full: no leg ever ran on it. A PR whose last
   check could not be made is tried again when the base moves.
 
+A PR from a fork is skipped: its legs would run its code here, and only
+`hive ci premerge N --trust`, once its diff is read, runs it. A PR whose last
+run tested fewer legs than this watch asks for is tested again.
+
 It never merges: that is `hive ci premerge N --merge`, asked for by name.
 `--once` makes one pass, for a scheduled task. Without it the watch loops,
 sleeping `--interval` seconds between passes; a pass that fails is reported
@@ -27,6 +31,7 @@ import time
 
 from .. import events
 from . import github as gh_mod
+from . import legs as legs_mod
 from . import premerge as premerge_mod
 from . import preview as preview_mod
 
@@ -65,6 +70,7 @@ class Watcher:
         self.github = github if github is not None else premerge.github
         self.project = premerge.project if project is None else project
         self.legs_spec = legs_spec
+        self._wanted = {leg.name for leg in legs_mod.select(legs_spec)}
         self.skip_drafts = bool(skip_drafts)
         self.interval_s = float(interval_s)
         self._sleep = sleep
@@ -87,10 +93,15 @@ class Watcher:
             n = int(pr.get("number") or 0)
             if self.skip_drafts and pr.get("isDraft"):
                 action = {"pr": n, "action": "skipped", "detail": "a draft"}
+            elif gh_mod.from_fork(pr):
+                action = {"pr": n, "action": "skipped",
+                          "detail": f"from a fork; run it by hand with `hive ci premerge "
+                                    f"{n} --trust` once its diff is read"}
             else:
                 last = known.get(str(n)) or {}
                 same = (str(pr.get("headRefOid") or "") == last.get("head_sha")
-                        and str(pr.get("baseRefName") or "") == last.get("base_ref"))
+                        and str(pr.get("baseRefName") or "") == last.get("base_ref")
+                        and self._covers(last))
                 action = self._recheck(n, pr, last) if same else self._test(n)
             self._say(describe(action))
             actions.append(action)
@@ -108,6 +119,12 @@ class Watcher:
             if passes is None or done < passes:
                 self._sleep(self.interval_s)
         return done
+
+    def _covers(self, last) -> bool:
+        """Whether the run *last* remembers tested every leg this watch asks
+        for. An entry kept before runs named their legs tested them all."""
+        selected = last.get("selected")
+        return selected is None or self._wanted <= set(selected)
 
     def _test(self, n) -> dict:
         res = self.premerge.run_pr(n, legs_spec=self.legs_spec)

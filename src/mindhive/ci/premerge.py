@@ -38,6 +38,12 @@ untested tree, which the report then says. Then `gh pr merge N --merge
 only GitHub answering MERGED makes the merge state `merged`. The landed merge
 commit's tree is compared with the tested tree, and a difference is reported.
 
+**A PR from a fork runs only with `--trust`**: its legs execute the fork's
+code on this machine as the operator, so it is read first; `watch` never
+trusts. **A partial run** (`--legs`) posts each leg's status but never the
+overall `mindhive-ci`, and is never merged: a verdict on some legs is not a
+verdict on the PR.
+
 Exit codes: 0 green; 1 red (a conflict, or a leg that did not pass); 2 the
 check could not be made (fetch, preview, no full-suite leg runnable); 3 green,
 but `--merge` did not merge -- the report says why.
@@ -119,13 +125,16 @@ def decide(preview, legs, unavailable=()) -> tuple:
     return "green", 0, reason
 
 
-def _merge_refusal(pr, tested_head) -> str:
+def _merge_refusal(pr, tested_head, tested_base) -> str:
     """Why a green PR must not be merged now, or ``""``."""
     state = str(pr.get("state") or "")
     if state != "OPEN":
         return f"the PR is {state or 'in no state gh reported'}"
     if pr.get("isDraft"):
         return "the PR is a draft"
+    base = str(pr.get("baseRefName") or "")
+    if base != tested_base:
+        return f"the PR now targets {base or 'no base'}, not the tested {tested_base}"
     head = str(pr.get("headRefOid") or "")
     if head != tested_head:
         return f"the head moved to {_short(head)} after {_short(tested_head)} was tested"
@@ -141,6 +150,7 @@ class PremergeResult:
     base_ref: str = ""
     mode: str = "github"
     argv: list = field(default_factory=list)
+    selected: list = field(default_factory=list)
     base_sha: str = ""
     head_sha: str = ""
     tested_sha: str = ""
@@ -161,9 +171,16 @@ class PremergeResult:
     notes: list = field(default_factory=list)
     report_text: str = ""
 
+    @property
+    def partial(self) -> bool:
+        """Some legs by choice (`--legs`), not the whole catalog."""
+        return bool(self.selected) and len(self.selected) < len(legs_mod.CATALOG)
+
     def as_dict(self) -> dict:
         return {"pr_id": self.pr_id, "branch": self.branch, "base_ref": self.base_ref,
-                "mode": self.mode, "argv": list(self.argv), "base_sha": self.base_sha,
+                "mode": self.mode, "argv": list(self.argv),
+                "selected": list(self.selected), "partial": self.partial,
+                "base_sha": self.base_sha,
                 "head_sha": self.head_sha, "tested_sha": self.tested_sha,
                 "tree": self.tree, "conflicts": list(self.conflicts),
                 "up_to_date": self.up_to_date,
@@ -311,21 +328,26 @@ class Premerge:
 
     # --- the two entry points -------------------------------------------------------------
 
-    def run_pr(self, number, *, legs_spec=None, merge=False,
-               allow_base_drift=False) -> PremergeResult:
-        """Test PR *number*; with *merge*, merge it when green. Never raises."""
+    def run_pr(self, number, *, legs_spec=None, merge=False, allow_base_drift=False,
+               trust=False) -> PremergeResult:
+        """Test PR *number*; with *merge*, merge it when green. A PR from a fork
+        runs only with *trust*. Never raises."""
         started = self._clock()
         number = int(number)
         argv = ["hive", "ci", GATE, str(number)]
         if legs_spec:
             argv += ["--legs", str(legs_spec)]
         for flag, on in (("--merge", merge), ("--allow-base-drift", allow_base_drift),
-                         ("--no-status", not self.post_statuses)):
+                         ("--trust", trust), ("--no-status", not self.post_statuses)):
             if on:
                 argv.append(flag)
         res = PremergeResult(pr_id=number, mode="github", argv=argv)
         try:
             chosen = legs_mod.select(legs_spec)
+            res.selected = [leg.name for leg in chosen]
+            if merge and res.partial:
+                raise ValueError("--merge tests every leg: a partial run (--legs) is "
+                                 "never merged")
             pr = self.github.pr(number)
         except (ValueError, gh_mod.GitHubError) as exc:
             res.reason = str(exc)
@@ -336,6 +358,17 @@ class Premerge:
         if state != "OPEN":
             res.reason = f"PR #{number} is {state or 'in no state gh reported'}, not OPEN"
             return self._finish(res, started, None)
+        if gh_mod.from_fork(pr) and not trust:
+            owner = pr.get("headRepositoryOwner")
+            login = str(owner.get("login") or "") if isinstance(owner, dict) else ""
+            res.reason = (f"PR #{number} comes from a fork ({login or 'another repository'}):"
+                          f" its code would run here as you; read its diff, then run "
+                          f"`hive ci premerge {number} --trust`")
+            return self._finish(res, started, None)
+        if res.partial and self.post_statuses:
+            res.notes.append(f"a partial run ({len(res.selected)} of "
+                             f"{len(legs_mod.CATALOG)} legs): each leg's status is "
+                             f"posted, the overall {gh_mod.CONTEXT} is left alone")
         tag = self._tag(f"pr{number}")
         try:
             for _ in range(MAX_ROUNDS):
@@ -351,7 +384,7 @@ class Premerge:
         except Exception as exc:                        # noqa: BLE001
             res.verdict, res.exit_code = "error", 2
             res.reason = f"premerge broke: {type(exc).__name__}: {exc}"
-            if self.post_statuses and res.head_sha:
+            if self.post_statuses and res.head_sha and not res.partial:
                 self._status(res, "error", gh_mod.CONTEXT, res.reason)
         finally:
             self._drop(tag)
@@ -372,6 +405,7 @@ class Premerge:
         except ValueError as exc:
             res.reason = str(exc)
             return self._finish(res, started, None)
+        res.selected = [leg.name for leg in chosen]
         tag = self._tag("branch")
         try:
             base_sha, error = self._fetch_base(tag, base)
@@ -455,17 +489,19 @@ class Premerge:
                 else:
                     res.unavailable.append({"name": leg.name, "reason": avail.reason})
         post = statuses and bool(res.head_sha)
+        overall = post and not res.partial
         if runnable:
             self._say(f"testing {_short(pv.tested_sha)} on {len(runnable)} leg(s)")
-            if post:
+            if overall:
                 self._status(res, "pending", gh_mod.CONTEXT,
                              f"testing the merge into {res.base_ref} on "
                              f"{len(runnable)} leg(s)")
+            if post:
                 for leg, _ in runnable:
                     self._status(res, "pending", f"{gh_mod.CONTEXT}/{leg.name}", "queued")
         res.legs = self._run_legs(run_tag, runnable, pv.tested_sha, res, post)
         res.verdict, res.exit_code, res.reason = decide(pv, res.legs, res.unavailable)
-        if post:
+        if overall:
             self._status(res, OVERALL_STATE[res.verdict], gh_mod.CONTEXT, res.reason)
 
     def _runner_for(self, run_tag):
@@ -519,7 +555,7 @@ class Premerge:
         except gh_mod.GitHubError as exc:
             res.merge_state = f"refused: could not read the PR again: {exc}"
             return "refused"
-        why = _merge_refusal(pr, res.head_sha)
+        why = _merge_refusal(pr, res.head_sha, res.base_ref)
         if why:
             res.merge_state = f"refused: {why}"
             return "refused"
@@ -658,6 +694,7 @@ class Premerge:
             "verdict": res.verdict, "reason": res.reason,
             "conflicts": list(res.conflicts),
             "legs": [leg.as_dict() for leg in res.legs],
+            "selected": list(res.selected), "partial": res.partial,
             "unavailable": [dict(u) for u in res.unavailable],
             "merge_state": res.merge_state or "skipped",
             "merge_commit": res.merge_commit,
@@ -682,7 +719,8 @@ class Premerge:
                  "tested_sha": res.tested_sha, "verdict": res.verdict,
                  "exit_code": int(res.exit_code), "ts": self._now_iso(),
                  "conflicts": list(res.conflicts),
-                 "legs": {leg.name: leg.state for leg in res.legs}}
+                 "legs": {leg.name: leg.state for leg in res.legs},
+                 "selected": list(res.selected)}
         ok = (remember(self.project, res.pr_id, entry) if res.pr_id
               else remember(self.project, res.branch, entry, bucket="branches"))
         if not ok:

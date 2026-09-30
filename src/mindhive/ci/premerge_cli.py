@@ -51,6 +51,8 @@ def cmd_ci_premerge(args) -> int:
         refusal = "give exactly one of a PR number or --branch"
     elif branch and args.merge:
         refusal = "--merge needs a PR number: a local branch is never merged"
+    elif args.merge and args.legs:
+        refusal = "--merge tests every leg: drop --legs"
     elif args.allow_base_drift and not args.merge:
         refusal = "--allow-base-drift only means something with --merge"
     if refusal:
@@ -59,7 +61,7 @@ def cmd_ci_premerge(args) -> int:
     runner = _premerge(args, statuses=bool(args.pr))
     if args.pr:
         res = runner.run_pr(args.pr, legs_spec=args.legs, merge=args.merge,
-                            allow_base_drift=args.allow_base_drift)
+                            allow_base_drift=args.allow_base_drift, trust=args.trust)
     else:
         res = runner.run_branch(branch, base=args.base, legs_spec=args.legs)
     if args.json:
@@ -71,7 +73,12 @@ def cmd_ci_premerge(args) -> int:
 
 def cmd_ci_watch(args) -> int:
     """Keep every open PR's verdict current. Never merges."""
-    from . import watch
+    from . import legs, watch
+    try:
+        legs.select(args.legs)
+    except ValueError as exc:
+        print(f"hive ci watch: {exc}", file=sys.stderr)
+        return 2
     watcher = watch.Watcher(_premerge(args, statuses=True), legs_spec=args.legs,
                             skip_drafts=args.skip_drafts, interval_s=args.interval,
                             say=_progress)
@@ -208,6 +215,9 @@ def register(group) -> None:
     pm.add_argument("--allow-base-drift", action="store_true",
                     help="with --merge: merge even when the base moved to a merge "
                          "tree this run did not test")
+    pm.add_argument("--trust", action="store_true",
+                    help="run a PR from a fork: its code runs on this machine as you, "
+                         "so read its diff first")
     pm.add_argument("--json", action="store_true", help="print the result as JSON")
     pm.set_defaults(func=cmd_ci_premerge)
 

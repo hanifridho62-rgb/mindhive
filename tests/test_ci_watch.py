@@ -13,8 +13,9 @@ BASE, HEAD, NEWBASE, NEWERBASE = "1" * 40, "2" * 40, "3" * 40, "6" * 40
 TREE, TREE2 = "a" * 40, "b" * 40
 
 
-def pr(number=151, head=HEAD, draft=False, base="master"):
+def pr(number=151, head=HEAD, draft=False, base="master", fork=False):
     return {"number": number, "state": "OPEN", "isDraft": draft,
+            "isCrossRepository": fork,
             "headRefName": f"claude/f{number}", "headRefOid": head, "baseRefName": base}
 
 
@@ -193,3 +194,22 @@ def test_the_loop_survives_a_failing_pass_and_sleeps_between_passes():
     assert w.loop(passes=2) == 2
     assert said == ["watch: a pass failed: RuntimeError: the network went away"]
     assert slept == [42.0]
+
+
+def test_a_pr_from_a_fork_is_never_run_by_the_watch():
+    pm = FakePremerge(FakeGitHub([pr(149, head="8" * 40, fork=True), pr(151)]))
+    w, said = watcher(pm)
+    actions = w.once()
+    assert [a["action"] for a in actions] == ["skipped", "tested"]   # canary: 151 runs
+    assert pm.runs == [(151, None, False)]
+    assert "`hive ci premerge 149 --trust`" in actions[0]["detail"]
+    assert said[0].startswith("PR #149: skipped (from a fork")
+
+
+def test_a_run_of_fewer_legs_than_the_watch_asks_for_is_tested_again():
+    remembered(selected=["windows-py3.12"])
+    pm = FakePremerge(FakeGitHub())
+    narrow, _ = watcher(pm, legs_spec="windows-py3.12")
+    assert narrow.once()[0]["action"] == "unchanged" and pm.runs == []
+    wide, _ = watcher(pm)
+    assert wide.once()[0]["action"] == "tested" and pm.runs == [(151, None, False)]

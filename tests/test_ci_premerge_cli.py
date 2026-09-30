@@ -76,6 +76,7 @@ def test_the_flag_defaults_are_the_modules_own():
     (("151", "--branch", "x"), "exactly one of a PR number or --branch"),
     (("--branch", "x", "--merge"), "--merge needs a PR number"),
     (("151", "--allow-base-drift"), "--allow-base-drift only means something with --merge"),
+    (("151", "--merge", "--legs", "node"), "--merge tests every leg: drop --legs"),
 ])
 def test_premerge_refuses_a_request_it_cannot_honour(monkeypatch, capsys, argv, why):
     rec = Recorder()
@@ -87,15 +88,15 @@ def test_premerge_refuses_a_request_it_cannot_honour(monkeypatch, capsys, argv, 
 def test_premerge_exits_with_the_runs_code_and_prints_its_report(monkeypatch, capsys, tmp_path):
     rec = Recorder()
     monkeypatch.setattr(premerge, "Premerge", rec)
-    code = run("premerge", "151", "--legs", "windows-*", "--merge", "--jobs", "2",
+    code = run("premerge", "151", "--merge", "--jobs", "2",
                "--timeout", "60", "--keep", "--root", str(tmp_path), "--project", "test")
     assert code == 3 and capsys.readouterr().out.strip() == "THE REPORT"
     root, kw = rec.made[0]
     assert str(root) == str(tmp_path)
     assert (kw["project"], kw["jobs"], kw["timeout_s"], kw["post_statuses"], kw["keep"]) == (
         "test", 2, 60.0, True, True)
-    assert rec.calls == [("pr", 151, {"legs_spec": "windows-*", "merge": True,
-                                      "allow_base_drift": False})]
+    assert rec.calls == [("pr", 151, {"legs_spec": None, "merge": True,
+                                      "allow_base_drift": False, "trust": False})]
 
 
 def test_premerge_json_and_branch_mode_never_post(monkeypatch, capsys, tmp_path):
@@ -108,6 +109,9 @@ def test_premerge_json_and_branch_mode_never_post(monkeypatch, capsys, tmp_path)
     assert rec.calls == [("branch", "claude/x", {"base": "dev", "legs_spec": None})]
     run("premerge", "151", "--no-status", "--root", str(tmp_path))
     assert rec.made[1][1]["post_statuses"] is False
+    run("premerge", "151", "--trust", "--root", str(tmp_path))
+    assert rec.calls[-1] == ("pr", 151, {"legs_spec": None, "merge": False,
+                                         "allow_base_drift": False, "trust": True})
 
 
 class FakeProbe:
@@ -179,6 +183,15 @@ def test_watch_once_exits_by_the_verdicts_it_saw(monkeypatch, tmp_path, actions,
     assert run("watch", "--once", "--skip-drafts", "--interval", "9",
                "--root", str(tmp_path)) == code
     assert (built[0]["skip_drafts"], built[0]["interval_s"]) == (True, 9.0)
+
+
+def test_watch_refuses_legs_it_does_not_know_before_anything_runs(monkeypatch, capsys,
+                                                                 tmp_path):
+    rec = Recorder()
+    monkeypatch.setattr(premerge, "Premerge", rec)
+    assert run("watch", "--once", "--legs", "nope", "--root", str(tmp_path)) == 2
+    assert "hive ci watch: no leg matches nope" in capsys.readouterr().err
+    assert rec.made == []
 
 
 def test_status_judges_a_premerge_run_by_its_verdict_and_names_its_legs(capsys):

@@ -23,8 +23,10 @@ TREE, TREE2, TESTED, TESTED2 = "a" * 40, "b" * 40, "c" * 40, "d" * 40
 NOW = "2026-09-30T04:05:06Z"
 
 
-def pr_view(state="OPEN", draft=False, head=HEAD, base="master"):
+def pr_view(state="OPEN", draft=False, head=HEAD, base="master", fork=False):
     return {"number": 151, "state": state, "isDraft": draft,
+            "isCrossRepository": fork,
+            "headRepositoryOwner": {"login": "stranger" if fork else "owner"},
             "headRefName": "claude/feature", "headRefOid": head,
             "baseRefName": base, "title": "a feature", "url": "https://x/151"}
 
@@ -119,6 +121,12 @@ class FakeProbe:
 
     def wsl_env(self):
         return {"WSLENV": ""}
+
+
+def only(*names):
+    """A machine that can run *names* and no other leg."""
+    return FakeProbe({leg.name: "not on this machine" for leg in legs.CATALOG
+                      if leg.name not in names})
 
 
 class Legs:
@@ -217,9 +225,11 @@ def test_the_verdict_table():
 
 
 def test_a_green_run_posts_pending_then_each_leg_then_the_verdict_on_the_head(tmp_path):
-    rig = Rig(tmp_path)
-    res = rig.pm.run_pr(151, legs_spec="windows-py3.12,node")
-    assert (res.verdict, res.exit_code, res.reason) == ("green", 0, "green: 2 leg(s) passed")
+    rig = Rig(tmp_path, probe=only("windows-py3.12", "node"))
+    res = rig.pm.run_pr(151)
+    reason = "green: 2 leg(s) passed; not run here: " + ", ".join(
+        leg.name for leg in legs.CATALOG if leg.name not in ("windows-py3.12", "node"))
+    assert (res.verdict, res.exit_code, res.reason) == ("green", 0, reason)
     assert (res.base_sha, res.head_sha, res.tested_sha, res.tree) == (BASE, HEAD, TESTED, TREE)
     assert rig.previews.asked == [(BASE, HEAD)]
     assert [(name, commit) for _, name, commit in rig.legs.runs] in (
@@ -233,11 +243,11 @@ def test_a_green_run_posts_pending_then_each_leg_then_the_verdict_on_the_head(tm
                            (HEAD, "pending", "mindhive-ci/node", "queued")]
     assert set(posted[3:5]) == {(HEAD, "success", "mindhive-ci/windows-py3.12", "10 passed in 1m01s"),
                                 (HEAD, "success", "mindhive-ci/node", "10 passed in 1m01s")}
-    assert posted[5:] == [(HEAD, "success", "mindhive-ci", "green: 2 leg(s) passed")]
+    assert posted[5:] == [(HEAD, "success", "mindhive-ci", reason)]
     assert [leg.name for leg in res.legs] == ["windows-py3.12", "node"]   # catalog order
     assert any(line.startswith("node: success") for line in rig.said)
     assert res.merge_state == "" and rig.gh.merges == []
-    assert "verdict: GREEN (exit 0) -- green: 2 leg(s) passed" in res.report_text
+    assert f"verdict: GREEN (exit 0) -- {reason}" in res.report_text
 
 
 def test_the_run_is_recorded_once_and_remembered_for_watch(tmp_path):
@@ -307,7 +317,7 @@ def test_the_runs_refs_are_dropped_whatever_happened(tmp_path, case):
                     BASE, HEAD, conflicts=("a.py",), tree=TREE)}),
                 "preview-raises": Previews(raises=True)}[case]
     rig = Rig(tmp_path, previews=previews)
-    res = rig.pm.run_pr(151, legs_spec="windows-py3.12")
+    res = rig.pm.run_pr(151)
     assert rig.git.run_refs() == []
     assert any(argv[1] == "update-ref" for argv in rig.git.calls)
     if case == "preview-raises":
@@ -330,8 +340,8 @@ def test_a_leg_runner_that_raises_is_a_red_leg_not_a_crash(tmp_path):
 
 
 def test_the_merge_is_the_pinned_merge_commit_and_is_read_back(tmp_path):
-    rig = Rig(tmp_path)
-    res = rig.pm.run_pr(151, legs_spec="windows-py3.12", merge=True)
+    rig = Rig(tmp_path, probe=only("windows-py3.12"))
+    res = rig.pm.run_pr(151, merge=True)
     assert rig.gh.merges == [(151, HEAD)]
     assert (res.merge_state, res.merge_commit, res.exit_code) == ("merged", MERGED, 0)
     assert res.landed_tree_matches is True
@@ -344,21 +354,22 @@ def test_the_merge_is_the_pinned_merge_commit_and_is_read_back(tmp_path):
      "the head moved to 444444444444 after 222222222222 was tested"),
     ([pr_view(draft=True)], "the PR is a draft"),
     ([pr_view(), pr_view(state="CLOSED")], "the PR is CLOSED"),
+    ([pr_view(), pr_view(base="release")], "the PR now targets release, not the tested master"),
 ])
 def test_a_merge_is_refused_when_the_pr_is_not_the_one_tested(tmp_path, prs, why):
-    rig = Rig(tmp_path, gh=FakeGitHub(prs=prs))
-    res = rig.pm.run_pr(151, legs_spec="windows-py3.12", merge=True)
+    rig = Rig(tmp_path, gh=FakeGitHub(prs=prs), probe=only("windows-py3.12"))
+    res = rig.pm.run_pr(151, merge=True)
     assert res.verdict == "green" and rig.gh.merges == []
     assert (res.merge_state, res.exit_code) == (f"refused: {why}", premerge.EXIT_NOT_MERGED)
 
 
 def test_a_base_that_moved_to_a_different_merge_is_tested_again(tmp_path):
     git = FakeGit(trees={MERGED: TREE2})
-    rig = Rig(tmp_path, git=git,
+    rig = Rig(tmp_path, git=git, probe=only("windows-py3.12"),
               legs_=Legs(on_run=lambda: git.remote.update({"refs/heads/master": NEWBASE})),
               previews=Previews({(NEWBASE, HEAD): preview_mod.Preview(
                   NEWBASE, HEAD, clean=True, tree=TREE2, tested_sha=TESTED2)}))
-    res = rig.pm.run_pr(151, legs_spec="windows-py3.12", merge=True)
+    res = rig.pm.run_pr(151, merge=True)
     assert res.rounds == 2
     assert [commit for _, _, commit in rig.legs.runs] == [TESTED, TESTED2]
     assert rig.gh.merges == [(151, HEAD)]
@@ -371,11 +382,11 @@ def test_a_base_that_moved_to_a_different_merge_is_tested_again(tmp_path):
 
 def test_allow_base_drift_merges_an_untested_tree_and_says_so(tmp_path):
     git = FakeGit(trees={MERGED: TREE2})
-    rig = Rig(tmp_path, git=git,
+    rig = Rig(tmp_path, git=git, probe=only("windows-py3.12"),
               legs_=Legs(on_run=lambda: git.remote.update({"refs/heads/master": NEWBASE})),
               previews=Previews({(NEWBASE, HEAD): preview_mod.Preview(
                   NEWBASE, HEAD, clean=True, tree=TREE2, tested_sha=TESTED2)}))
-    res = rig.pm.run_pr(151, legs_spec="windows-py3.12", merge=True, allow_base_drift=True)
+    res = rig.pm.run_pr(151, merge=True, allow_base_drift=True)
     assert res.rounds == 1 and rig.gh.merges == [(151, HEAD)]
     assert res.merge_state == "merged" and res.landed_tree_matches is False
     assert any("--allow-base-drift merged a tree this run did not test" in n for n in res.notes)
@@ -385,11 +396,11 @@ def test_allow_base_drift_merges_an_untested_tree_and_says_so(tmp_path):
 def test_a_base_that_never_stops_moving_is_refused_after_the_last_round(tmp_path):
     git = FakeGit()
     moves = itertools.count(100)
-    rig = Rig(tmp_path, git=git,
+    rig = Rig(tmp_path, git=git, probe=only("windows-py3.12"),
               legs_=Legs(on_run=lambda: git.remote.update(
                   {"refs/heads/master": f"{next(moves):040x}"})),
               previews=Previews(tree_of=lambda base: "t" + base[1:]))
-    res = rig.pm.run_pr(151, legs_spec="windows-py3.12", merge=True)
+    res = rig.pm.run_pr(151, merge=True)
     assert res.rounds == premerge.MAX_ROUNDS and rig.gh.merges == []
     assert res.merge_state == ("refused: the base kept moving; 3 rounds tested "
                                "without landing")
@@ -397,18 +408,18 @@ def test_a_base_that_never_stops_moving_is_refused_after_the_last_round(tmp_path
 
 
 def test_a_merge_github_did_not_make_exits_3_in_ghs_words(tmp_path):
-    rig = Rig(tmp_path, gh=FakeGitHub(
+    rig = Rig(tmp_path, probe=only("windows-py3.12"), gh=FakeGitHub(
         merge_answer=(1, "GraphQL: Base branch was modified. Review and try the merge again."),
         merged_answer=("OPEN", "")))
-    res = rig.pm.run_pr(151, legs_spec="windows-py3.12", merge=True)
+    res = rig.pm.run_pr(151, merge=True)
     assert res.merge_state == ("failed: gh pr merge exit 1: GraphQL: Base branch was "
                                "modified. Review and try the merge again.")
     assert res.exit_code == premerge.EXIT_NOT_MERGED and res.merge_commit == ""
 
 
 def test_a_landed_tree_other_than_the_tested_one_is_reported(tmp_path):
-    rig = Rig(tmp_path, git=FakeGit(trees={MERGED: TREE2}))
-    res = rig.pm.run_pr(151, legs_spec="windows-py3.12", merge=True)
+    rig = Rig(tmp_path, git=FakeGit(trees={MERGED: TREE2}), probe=only("windows-py3.12"))
+    res = rig.pm.run_pr(151, merge=True)
     assert res.merge_state == "merged" and res.landed_tree_matches is False
     assert "the landed tree is NOT the tested tree" in res.report_text
 
@@ -518,3 +529,48 @@ def test_no_reader_of_this_checkouts_runs_takes_a_premerge_row_for_one(tmp_path)
 def test_every_module_that_spells_the_premerge_gate_spells_it_alike():
     from mindhive import oversee, verify
     assert premerge.GATE == verify.PREMERGE_GATE == oversee._PREMERGE_GATE
+
+
+# --- forks and partial runs ---------------------------------------------------------------
+
+
+def test_a_pr_from_a_fork_is_not_run_unless_trusted(tmp_path):
+    rig = Rig(tmp_path, gh=FakeGitHub(prs=[pr_view(fork=True)]))
+    res = rig.pm.run_pr(151, legs_spec="windows-py3.12")
+    assert (res.verdict, res.exit_code) == ("error", 2)
+    assert res.reason.startswith("PR #151 comes from a fork (stranger): its code would "
+                                 "run here as you")
+    assert res.reason.endswith("`hive ci premerge 151 --trust`")
+    assert rig.git.calls == [] and rig.legs.runs == [] and rig.gh.statuses == []
+    assert recorded() == []
+    trusted = Rig(tmp_path, gh=FakeGitHub(prs=[pr_view(fork=True)]))
+    res = trusted.pm.run_pr(151, legs_spec="windows-py3.12", trust=True)
+    assert res.verdict == "green" and res.argv[-1] == "--trust"   # canary: trust runs it
+
+
+def test_a_pr_gh_did_not_place_counts_as_a_fork(tmp_path):
+    unplaced = pr_view()
+    del unplaced["isCrossRepository"]
+    rig = Rig(tmp_path, gh=FakeGitHub(prs=[unplaced]))
+    res = rig.pm.run_pr(151)
+    assert res.exit_code == 2 and "comes from a fork (owner)" in res.reason
+    assert rig.legs.runs == []
+
+
+def test_a_partial_run_posts_its_legs_but_never_the_verdict_and_never_merges(tmp_path):
+    rig = Rig(tmp_path)
+    refused = rig.pm.run_pr(151, legs_spec="windows-py3.12", merge=True)
+    assert (refused.exit_code, refused.reason) == (
+        2, "--merge tests every leg: a partial run (--legs) is never merged")
+    assert rig.gh.pr_calls == 0 and rig.git.calls == [] and recorded() == []
+    res = rig.pm.run_pr(151, legs_spec="windows-py3.12")
+    assert res.verdict == "green" and res.partial and res.selected == ["windows-py3.12"]
+    contexts = [ctx for _, _, ctx, _ in rig.gh.statuses]
+    assert contexts and set(contexts) == {"mindhive-ci/windows-py3.12"}
+    assert any(note.startswith("a partial run (1 of ") for note in res.notes)
+    row = recorded()[0]
+    assert (row["partial"], row["selected"]) == (True, ["windows-py3.12"])
+    assert premerge.load_sidecar("test")["prs"]["151"]["selected"] == ["windows-py3.12"]
+    full = Rig(tmp_path, probe=only("windows-py3.12")).pm.run_pr(151)
+    assert not full.partial and full.selected == [leg.name for leg in legs.CATALOG]
+    assert full.as_dict()["partial"] is False
