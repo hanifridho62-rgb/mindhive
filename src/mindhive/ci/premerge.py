@@ -66,7 +66,7 @@ from . import preview as preview_mod
 from . import proc
 from .runner import SCOPE, _rmtree_force
 
-__all__ = ["DEFAULT_JOBS", "EXIT_NOT_MERGED", "GATE", "MAX_ROUNDS", "OVERALL_STATE",
+__all__ = ["DEFAULT_JOBS", "EXIT_NOT_MERGED", "GATE", "INTERRUPTED", "MAX_ROUNDS", "OVERALL_STATE",
            "Premerge", "PremergeResult", "REF_ROOT", "REMOTE", "SIDECAR", "decide",
            "load_sidecar", "remember", "render", "sidecar_path", "suite_counts",
            "sum_counts"]
@@ -95,6 +95,12 @@ FETCH_TIMEOUT_S = 600.0
 GIT_TIMEOUT_S = 120.0
 #: The overall commit status each verdict posts.
 OVERALL_STATE = {"green": "success", "red": "failure", "error": "error"}
+#: The reason a run stopped by hand (Ctrl+C) is recorded with.
+INTERRUPTED = "interrupted: the run was stopped by hand"
+#: A merge broken off inside `gh pr merge` -- by Ctrl+C or a crash -- may have
+#: landed: the PR's state on GitHub says, this run cannot.
+MERGE_UNKNOWN = ("unknown: the run stopped while gh pr merge ran; "
+                 "read the PR's state on GitHub")
 _OID = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
 _NOT_STAMP = re.compile(r"[^0-9TZ]")
 
@@ -361,7 +367,10 @@ class Premerge:
     def run_pr(self, number, *, legs_spec=None, merge=False, allow_base_drift=False,
                trust=False) -> PremergeResult:
         """Test PR *number*; with *merge*, merge it when green. A PR from a fork
-        runs only with *trust*. Never raises."""
+        runs only with *trust*. Never raises, but for Ctrl+C: every leg is
+        stopped, the run is recorded as an error -- and not remembered, so
+        `hive ci watch` tests the head again -- and the KeyboardInterrupt goes
+        on up."""
         started = self._clock()
         number = int(number)
         argv = ["hive", "ci", GATE, str(number)]
@@ -400,6 +409,7 @@ class Premerge:
                              f"{len(legs_mod.CATALOG)} legs): each leg's status is "
                              f"posted, the overall {gh_mod.CONTEXT} is left alone")
         tag = self._tag(f"pr{number}")
+        stopped = None
         try:
             for _ in range(MAX_ROUNDS):
                 res.rounds += 1
@@ -411,19 +421,25 @@ class Premerge:
             else:
                 res.merge_state = (f"refused: the base kept moving; {MAX_ROUNDS} rounds "
                                    f"tested without landing")
-        except Exception as exc:                        # noqa: BLE001
+        except (KeyboardInterrupt, Exception) as exc:   # noqa: BLE001
+            stopped = exc if isinstance(exc, KeyboardInterrupt) else None
             res.verdict, res.exit_code = "error", 2
-            res.reason = f"premerge broke: {type(exc).__name__}: {exc}"
+            res.reason = (INTERRUPTED if stopped else
+                          f"premerge broke: {type(exc).__name__}: {exc}")
             if self.post_statuses and res.head_sha and not res.partial:
                 res.published = self._status(res, "error", gh_mod.CONTEXT, res.reason)
         finally:
             self._drop(tag)
+        if stopped is not None:
+            self._finish(res, started, tag, sidecar=False)
+            raise stopped
         if merge and res.verdict == "green" and res.merge_state != "merged":
             res.exit_code = EXIT_NOT_MERGED
         return self._finish(res, started, tag)
 
     def run_branch(self, branch, *, base="master", legs_spec=None) -> PremergeResult:
-        """Test the merge of a local *branch* into *base*: no statuses, no merge."""
+        """Test the merge of a local *branch* into *base*: no statuses, no
+        merge. Ctrl+C as for `run_pr`."""
         started = self._clock()
         argv = ["hive", "ci", GATE, "--branch", str(branch), "--base", str(base)]
         if legs_spec:
@@ -437,6 +453,7 @@ class Premerge:
             return self._finish(res, started, None)
         res.selected = [leg.name for leg in chosen]
         tag = self._tag("branch")
+        stopped = None
         try:
             base_sha, error = self._fetch_base(tag, base)
             if error:
@@ -450,11 +467,16 @@ class Premerge:
             else:
                 res.rounds = 1
                 self._test(res, f"{tag}-r1", chosen, statuses=False)
-        except Exception as exc:                        # noqa: BLE001
+        except (KeyboardInterrupt, Exception) as exc:   # noqa: BLE001
+            stopped = exc if isinstance(exc, KeyboardInterrupt) else None
             res.verdict, res.exit_code = "error", 2
-            res.reason = f"premerge broke: {type(exc).__name__}: {exc}"
+            res.reason = (INTERRUPTED if stopped else
+                          f"premerge broke: {type(exc).__name__}: {exc}")
         finally:
             self._drop(tag)
+        if stopped is not None:
+            self._finish(res, started, tag, sidecar=False)
+            raise stopped
         return self._finish(res, started, tag)
 
     # --- what `watch` and `conflicts` use ---------------------------------------------------
@@ -571,31 +593,48 @@ class Premerge:
 
     def _run_legs(self, run_tag, runnable, commit, res, post) -> list:
         """Run *runnable* a few at a time. Statuses and progress are posted
-        from this thread as each leg finishes, never from a worker."""
+        from this thread as each leg finishes, never from a worker. Ctrl+C --
+        or anything else that breaks the wait -- stops every leg's children at
+        once (`proc.stop_all`), marks each leg not yet reported as interrupted,
+        and goes on up."""
         if not runnable:
             return []
         runner = self._runner_for(run_tag)
-        results = []
+        results, reported = [], set()
+        pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(self.jobs, len(runnable)))
         try:
-            with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=min(self.jobs, len(runnable))) as pool:
-                futures = {pool.submit(runner.run, leg, avail, commit): leg
-                           for leg, avail in runnable}
-                for future in concurrent.futures.as_completed(futures):
-                    leg = futures[future]
-                    try:
-                        out = future.result()
-                    except Exception as exc:            # noqa: BLE001
-                        out = legrun.LegResult(name=leg.name, job=leg.job,
-                                               ci_name=leg.ci_name, tier=leg.tier,
-                                               state="error", step="runner",
-                                               reason=f"{type(exc).__name__}: {exc}")
-                    results.append(out)
-                    self._say(f"{out.name}: {out.state} -- {out.summary()}")
-                    if post:
-                        self._status(res, out.state, f"{gh_mod.CONTEXT}/{out.name}",
-                                     out.summary())
+            futures = {pool.submit(runner.run, leg, avail, commit): leg
+                       for leg, avail in runnable}
+            for future in concurrent.futures.as_completed(futures):
+                leg = futures[future]
+                try:
+                    out = future.result()
+                except Exception as exc:            # noqa: BLE001
+                    out = legrun.LegResult(name=leg.name, job=leg.job,
+                                           ci_name=leg.ci_name, tier=leg.tier,
+                                           state="error", step="runner",
+                                           reason=f"{type(exc).__name__}: {exc}")
+                results.append(out)
+                self._say(f"{out.name}: {out.state} -- {out.summary()}")
+                if post:
+                    self._status(res, out.state, f"{gh_mod.CONTEXT}/{out.name}",
+                                 out.summary())
+                reported.add(out.name)
+        except BaseException:
+            proc.stop_all()
+            try:
+                pool.shutdown(wait=True, cancel_futures=True)
+            finally:
+                proc.clear_stop()
+            if post:
+                for leg, _ in runnable:
+                    if leg.name not in reported:
+                        self._status(res, "error", f"{gh_mod.CONTEXT}/{leg.name}",
+                                     "interrupted")
+            raise
         finally:
+            pool.shutdown(wait=True)
             if not self.keep:
                 _rmtree_force(self.work_root / run_tag)
         order = {leg.name: i for i, leg in enumerate(legs_mod.CATALOG)}
@@ -634,6 +673,8 @@ class Premerge:
                                  f"did not test")
             else:
                 res.notes.append(f"{moved}; the merge tree is the one tested")
+        # Until GitHub is read back, a Ctrl+C or a crash leaves this behind.
+        res.merge_state = MERGE_UNKNOWN
         rc, text = self.github.merge(number, res.head_sha)
         try:
             state, oid = self.github.merged(number)
@@ -715,15 +756,17 @@ class Premerge:
 
     # --- the record ---------------------------------------------------------------------------
 
-    def _finish(self, res, started, tag, **remembered) -> PremergeResult:
-        """Report, and -- for a run that reached git -- record and remember
-        (*remembered* added to the sidecar entry)."""
+    def _finish(self, res, started, tag, *, sidecar=True, **remembered) -> PremergeResult:
+        """Report, and -- for a run that reached git -- record and, unless
+        *sidecar* is False (a run stopped by hand, which the watch must test
+        again), remember (*remembered* added to the sidecar entry)."""
         res.duration_s = max(0.0, self._clock() - started)
         res.reason = res.reason or "the check could not be made"
         res.report_text = render(res)
         if tag:
             self._record(res, tag)
-            self._remember(res, **remembered)
+            if sidecar:
+                self._remember(res, **remembered)
             res.report_text = render(res)
         return res
 

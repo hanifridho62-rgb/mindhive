@@ -314,3 +314,42 @@ def test_watch_once_json_prints_what_the_pass_did(monkeypatch, tmp_path, capsys)
     monkeypatch.setattr(watch, "Watcher", FW)
     assert run("watch", "--once", "--json", "--root", str(tmp_path)) == 0
     assert json.loads(capsys.readouterr().out) == done
+
+
+@pytest.mark.parametrize("argv", [("premerge", "151"),
+                                  ("premerge", "--branch", "claude/x")])
+def test_ctrl_c_during_premerge_is_exit_130_and_a_line_not_a_traceback(
+        monkeypatch, capsys, tmp_path, argv):
+    class Stopped:
+        def __init__(self, root, **kw):
+            pass
+
+        def run_pr(self, number, **kw):
+            raise KeyboardInterrupt
+
+        def run_branch(self, branch, **kw):
+            raise KeyboardInterrupt
+    monkeypatch.setattr(premerge, "Premerge", Stopped)
+    try:
+        code = run(*argv, "--root", str(tmp_path))
+    except KeyboardInterrupt:
+        pytest.fail("Ctrl+C escaped `hive ci premerge`")
+    assert code == 130
+    assert "interrupted" in capsys.readouterr().err
+
+
+
+def test_ctrl_c_during_watch_once_is_exit_130_and_a_line_not_a_traceback(
+        monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(premerge, "Premerge", Recorder())
+
+    class FW(_FW):
+        def once(self):
+            raise KeyboardInterrupt
+    monkeypatch.setattr(watch, "Watcher", FW)
+    try:
+        code = run("watch", "--once", "--root", str(tmp_path))
+    except KeyboardInterrupt:
+        pytest.fail("Ctrl+C escaped `hive ci watch --once`")
+    assert code == 130
+    assert "interrupted" in capsys.readouterr().err

@@ -10,7 +10,10 @@ given; and no child -- captured or logged, inheriting or handed an environment
 import json
 import os
 import sys
+import threading
 import time
+
+import pytest
 
 from mindhive import advice
 from mindhive.ci import proc
@@ -42,9 +45,12 @@ def test_without_stdin_the_child_reads_an_empty_one_not_the_console():
 
 
 def test_a_missing_program_is_a_code_and_a_reason_never_a_raise(tmp_path):
-    rc, out, err = proc.run([str(tmp_path / "no-such-program")])
-    assert rc == 1 and out == ""
-    assert "no-such-program" in err
+    # 127, the shell's "could not run it": 1 would read as a child that ran
+    # and failed -- a pytest that never started as a red suite.
+    for log in (None, tmp_path / "leg.log"):
+        rc, out, err = proc.run([str(tmp_path / "no-such-program")], log=log)
+        assert rc == proc.NOT_STARTED == 127 and out == ""
+        assert "no-such-program" in err
 
 
 def test_a_captured_child_past_its_cap_answers_124_promptly():
@@ -113,3 +119,52 @@ def test_no_child_sees_the_sop_secret_or_the_token(monkeypatch, tmp_path):
     seen = json.loads(log.read_text(encoding="utf-8"))
     assert "MINDHIVE_HOME" in seen and SECRET not in seen and TOKEN not in seen
     assert FAKE in handed.values()                # the caller's own copy is untouched
+
+
+def _bounded(call, limit_s=45):
+    """Run *call* in a thread and answer what it returned -- or fail, rather
+    than hang the suite, when it is still running after *limit_s*."""
+    box = {}
+    worker = threading.Thread(target=lambda: box.update(out=call()), daemon=True)
+    worker.start()
+    worker.join(limit_s)
+    assert not worker.is_alive(), f"still running after {limit_s}s"
+    return box["out"]
+
+
+@pytest.mark.parametrize("logged", [False, True])
+def test_a_child_that_never_reads_its_stdin_is_still_capped(tmp_path, logged):
+    """Feeding stdin through a pipe blocks once the pipe is full, and a child
+    that never reads keeps it full: the cap must hold through that too."""
+    started = time.monotonic()
+    rc, _, err = _bounded(lambda: proc.run(
+        [sys.executable, "-c", "import time; time.sleep(40)"],
+        stdin=b"x" * (8 * 1024 * 1024), timeout_s=2,
+        log=tmp_path / "leg.log" if logged else None))
+    assert rc == proc.TIMEOUT_EXIT and "2s cap" in err
+    assert time.monotonic() - started < 30
+
+
+def test_stop_all_takes_every_long_child_and_starts_no_new_one(tmp_path):
+    log = tmp_path / "leg.log"
+    box = {}
+    worker = threading.Thread(target=lambda: box.update(out=proc.run(
+        [sys.executable, "-c", "import time; print('up', flush=True); time.sleep(40)"],
+        log=log, timeout_s=60)), daemon=True)
+    worker.start()
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and "up" not in (
+            log.read_text(encoding="utf-8") if log.exists() else ""):
+        time.sleep(0.05)
+    started = time.monotonic()
+    try:
+        proc.stop_all()
+        worker.join(30)
+        assert not worker.is_alive() and time.monotonic() - started < 30
+        assert box["out"][0] != 0
+        rc, _, err = proc.run([sys.executable, "-c", "print(1)"], log=tmp_path / "b.log")
+        assert rc == proc.NOT_STARTED and "being stopped" in err
+        assert proc.run([sys.executable, "-c", "print(1)"])[0] == 0   # a short probe runs
+    finally:
+        proc.clear_stop()
+    assert proc.run([sys.executable, "-c", "print(1)"], log=tmp_path / "c.log")[0] == 0

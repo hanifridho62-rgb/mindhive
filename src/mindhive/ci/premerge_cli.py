@@ -10,9 +10,12 @@ pays for argparse and nothing else -- the `ci.cli` convention.
 Exit codes are for scripts and scheduled tasks:
 
 * `premerge`: 0 green; 1 red; 2 the check could not be made; 3 green, but
-  `--merge` did not merge.
+  `--merge` did not merge; 130 stopped by hand (Ctrl+C) -- every leg it
+  started is stopped, and a run that got as far as fetching is recorded as an
+  error.
 * `watch --once`: 0 every PR it looked at is green; 1 one is red; 2 one
-  could not be checked.
+  could not be checked; 130 stopped by hand. Without `--once` the watch runs
+  until Ctrl+C, which exits 0.
 * `conflicts`: 0 none; 1 a PR conflicts with its base or with another PR; 2
   the check could not be made.
 * `legs`: 0 at least one full-suite leg can run here; 2 none can.
@@ -28,6 +31,8 @@ __all__ = ["cmd_ci_conflicts", "cmd_ci_legs", "cmd_ci_premerge", "cmd_ci_watch",
 #: `premerge.DEFAULT_JOBS`, `legrun.LEG_TIMEOUT_S` and `watch.DEFAULT_INTERVAL_S`,
 #: spelled here so registering imports nothing; a test holds them equal.
 JOBS, TIMEOUT_S, INTERVAL_S = 3, 5400.0, 300.0
+#: A verb stopped by hand exits as a shell reports SIGINT: 128 + 2.
+INTERRUPTED_EXIT = 130
 
 
 def _progress(text) -> None:
@@ -59,11 +64,17 @@ def cmd_ci_premerge(args) -> int:
         print(f"hive ci premerge: {refusal}", file=sys.stderr)
         return 2
     runner = _premerge(args, statuses=bool(args.pr))
-    if args.pr:
-        res = runner.run_pr(args.pr, legs_spec=args.legs, merge=args.merge,
-                            allow_base_drift=args.allow_base_drift, trust=args.trust)
-    else:
-        res = runner.run_branch(branch, base=args.base, legs_spec=args.legs)
+    try:
+        if args.pr:
+            res = runner.run_pr(args.pr, legs_spec=args.legs, merge=args.merge,
+                                allow_base_drift=args.allow_base_drift,
+                                trust=args.trust)
+        else:
+            res = runner.run_branch(branch, base=args.base, legs_spec=args.legs)
+    except KeyboardInterrupt:
+        print("hive ci premerge: interrupted; every leg it started was stopped",
+              file=sys.stderr)
+        return INTERRUPTED_EXIT
     if args.json:
         print(json.dumps(res.as_dict(), ensure_ascii=False, sort_keys=True))
     else:
@@ -88,7 +99,12 @@ def cmd_ci_watch(args) -> int:
         except KeyboardInterrupt:
             pass
         return 0
-    actions = watcher.once()
+    try:
+        actions = watcher.once()
+    except KeyboardInterrupt:
+        print("hive ci watch: interrupted; every leg it started was stopped",
+              file=sys.stderr)
+        return INTERRUPTED_EXIT
     if args.json:
         print(json.dumps(actions, ensure_ascii=False, sort_keys=True))
     verdicts = {a.get("verdict") for a in actions}

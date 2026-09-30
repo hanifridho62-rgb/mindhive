@@ -904,3 +904,70 @@ def test_writers_of_the_sidecar_take_turns_and_lose_no_entry(monkeypatch):
     for t in writers:
         t.join()
     assert sorted(premerge.load_sidecar("test")["prs"]) == [str(n) for n in range(8)]
+
+
+# --- Ctrl+C -------------------------------------------------------------------------------
+
+
+def test_ctrl_c_stops_every_leg_marks_them_interrupted_and_records_the_run(
+        tmp_path, monkeypatch):
+    stops = []
+    monkeypatch.setattr(premerge.proc, "stop_all", lambda: stops.append("stop"))
+    rig = Rig(tmp_path, probe=only("windows-py3.12", "node"))
+
+    def interrupt(text):
+        if " -- " in text and not text.startswith("testing"):
+            raise KeyboardInterrupt
+    rig.pm._say = interrupt
+    with pytest.raises(KeyboardInterrupt):
+        rig.pm.run_pr(151)
+    assert stops == ["stop"]
+    why = "interrupted: the run was stopped by hand"
+    assert {c: (s, d) for _, s, c, d in rig.gh.statuses if s != "pending"} == {
+        "mindhive-ci/windows-py3.12": ("error", "interrupted"),
+        "mindhive-ci/node": ("error", "interrupted"),
+        "mindhive-ci": ("error", why)}
+    row = recorded()[0]
+    assert (row["verdict"], row["exit_code"], row["reason"]) == ("error", 2, why)
+    assert "151" not in premerge.load_sidecar("test")["prs"]   # the watch tests it again
+    assert rig.git.run_refs() == []
+
+
+
+def test_ctrl_c_during_a_branch_run_is_recorded_as_an_error_and_goes_on_up(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(premerge.proc, "stop_all", lambda: None)
+    git = FakeGit(local={"master": BASE, "claude/feature": HEAD})
+    rig = Rig(tmp_path, git=git, gh=NoGitHub(), probe=only("windows-py3.12"))
+
+    def interrupt(text):
+        if " -- " in text and not text.startswith("testing"):
+            raise KeyboardInterrupt
+    rig.pm._say = interrupt
+    with pytest.raises(KeyboardInterrupt):
+        rig.pm.run_branch("claude/feature")
+    row = recorded()[0]
+    assert (row["verdict"], row["exit_code"], row["reason"], row["mode"]) == (
+        "error", 2, premerge.INTERRUPTED, "offline")
+    assert "claude/feature" not in premerge.load_sidecar("test")["branches"]
+    assert git.run_refs() == []
+
+
+@pytest.mark.parametrize("where,state", [("pr", "skipped"), ("merge", "unknown")])
+def test_ctrl_c_in_the_guarded_merge_says_whether_gh_pr_merge_had_begun(
+        tmp_path, monkeypatch, where, state):
+    monkeypatch.setattr(premerge.proc, "stop_all", lambda: None)
+    rig = Rig(tmp_path, probe=only("windows-py3.12"))
+    real, calls = getattr(rig.gh, where), []
+
+    def stop(*args):
+        calls.append(args)
+        if where == "merge" or len(calls) > 1:
+            raise KeyboardInterrupt
+        return real(*args)
+    setattr(rig.gh, where, stop)
+    with pytest.raises(KeyboardInterrupt):
+        rig.pm.run_pr(151, merge=True)
+    row = recorded()[0]
+    assert (row["verdict"], row["reason"]) == ("error", premerge.INTERRUPTED)
+    assert row["merge_state"].split(":")[0] == state
