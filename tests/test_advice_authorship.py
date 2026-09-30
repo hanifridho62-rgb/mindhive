@@ -658,6 +658,10 @@ SPAWNERS = {
     # under TOOL_SPAWNERS until the PR #136 merge-safety review read the gate
     # env (P2).
     "ci/runner.py": "agent",
+    # The pre-merge CI's one door (spec 2026-09-30): every child it starts is
+    # the branch under test or a tool acting on it, and what it prints is
+    # recorded, so `proc.run` scrubs token AND secret for every call.
+    "ci/proc.py": "agent",
     "rotation/supervisor.py": "operator",
 }
 
@@ -1497,6 +1501,10 @@ SPAWN_SITES = {
     # #136 merge-safety review (P2): `_gate_env` now withholds the token and,
     # for this child alone, the secret too (`scrub_agent_env(withhold_secret=True)`).
     "ci/runner.py": (1, 1),
+    # Two sites, one scrub (spec 2026-09-30): `subprocess.run` for the captured
+    # probes and `subprocess.Popen` for the logged, tree-held long steps; the
+    # single `scrub_agent_env(..., withhold_secret=True)` guards both.
+    "ci/proc.py": (2, 1),
     "claude_cli.py": (1, 1),
     "clusters.py": (1, 0), "commands/context_ops.py": (1, 0), "context.py": (1, 0),
     "dashboard.py": (1, 0), "loop/driver.py": (1, 1),
