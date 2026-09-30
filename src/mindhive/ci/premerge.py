@@ -60,7 +60,8 @@ from .runner import SCOPE, _rmtree_force
 
 __all__ = ["DEFAULT_JOBS", "EXIT_NOT_MERGED", "GATE", "MAX_ROUNDS", "OVERALL_STATE",
            "Premerge", "PremergeResult", "REF_ROOT", "REMOTE", "SIDECAR", "decide",
-           "load_sidecar", "remember", "render", "sidecar_path", "sum_counts"]
+           "load_sidecar", "remember", "render", "sidecar_path", "suite_counts",
+           "sum_counts"]
 
 GIT = "git"
 REMOTE = "origin"
@@ -175,6 +176,16 @@ class PremergeResult:
                 "merge_state": self.merge_state, "merge_commit": self.merge_commit,
                 "landed_tree_matches": self.landed_tree_matches,
                 "notes": list(self.notes)}
+
+
+def suite_counts(legs) -> tuple:
+    """``(leg name, counts)`` of one full-suite leg -- the first in catalog
+    order that has counts -- or ``("", {})``. A row's `counts` is one suite's,
+    as every other writer's is; the sum over the legs is `counts_total`."""
+    for leg in legs:
+        if leg.tier == legs_mod.TIER_DEFAULT and leg.counts:
+            return leg.name, dict(leg.counts)
+    return "", {}
 
 
 def sum_counts(legs) -> dict:
@@ -630,12 +641,14 @@ class Premerge:
         except Exception:                               # noqa: BLE001
             artifact = ""
         subject = f"PR #{res.pr_id}" if res.pr_id else f"branch {res.branch}"
+        counts_leg, counts = suite_counts(res.legs)
         payload = {
             "text": (f"hive ci premerge: {subject} {res.verdict.upper()} "
                      f"(exit {int(res.exit_code)}): {res.reason}"),
             "argv": list(res.argv),
             "exit_code": int(res.exit_code),
-            "counts": sum_counts(res.legs),
+            "counts": counts, "counts_leg": counts_leg,
+            "counts_total": sum_counts(res.legs),
             "excerpt": res.report_text[:runlog.EXCERPT_CHARS],
             "verified_by": verify.VERIFIED_BY,
             "scope": SCOPE, "gate": GATE, "mode": res.mode,

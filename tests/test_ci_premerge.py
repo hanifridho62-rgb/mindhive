@@ -490,3 +490,31 @@ def test_the_default_leg_runner_runs_under_the_work_root_with_the_probes_wsl(tmp
     assert premerge.Premerge(tmp_path / "repo", github=FakeGitHub(),
                              probe=FakeProbe()).work_root == (
         tmp_path / "repo" / ".worktrees" / "premerge")
+
+
+# --- a premerge row is a verdict on a PR's merge, not a run of this checkout ------------
+
+
+def test_a_row_counts_one_suite_and_keeps_the_sum_apart(tmp_path):
+    Rig(tmp_path).pm.run_pr(151, legs_spec="windows-py3.12,ubuntu-py3.12,node")
+    row = recorded()[0]
+    assert (row["counts"], row["counts_leg"]) == ({"passed": 10}, "windows-py3.12")
+    assert row["counts_total"] == {"passed": 30}
+
+
+def test_no_reader_of_this_checkouts_runs_takes_a_premerge_row_for_one(tmp_path):
+    from mindhive import premise, replenish, verify
+    Rig(tmp_path).pm.run_pr(151, legs_spec="windows-py3.12,ubuntu-py3.12")
+    evs = events.read_all("test")
+    row = next(e for e in evs if e.type == "verification")
+    assert row.payload["exit_code"] == 0                 # canary: a green run
+    assert verify.last_run(evs) is None
+    claim = {"kind": premise.KIND_TEST_COUNT, "value": 10}
+    assert premise.check([claim], evs)[0]["outcome"] == premise.UNKNOWN
+    assert replenish._passing_verification_ts(evs) == ""
+    assert replenish.iteration_outcome(row) == ""
+
+
+def test_every_module_that_spells_the_premerge_gate_spells_it_alike():
+    from mindhive import oversee, verify
+    assert premerge.GATE == verify.PREMERGE_GATE == oversee._PREMERGE_GATE

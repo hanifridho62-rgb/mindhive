@@ -2,6 +2,8 @@
 import types
 from datetime import datetime
 
+import pytest
+
 from mindhive import events, oversee
 from mindhive import __main__ as cli
 
@@ -583,14 +585,14 @@ def test_a_session_with_no_open_questions_has_an_empty_blockers_list():
 # --- a red CI run turns the session's card red (blueprint P1g) --------------------------
 
 
-def _ci(session, code, pr=7, gate="gate2_suite", scope="ci"):
+def _ci(session, code, pr=7, gate="gate2_suite", scope="ci", **extra):
     from mindhive import verify
     events.append_event("verification", {
         "text": f"hive ci: PR #{pr}", "argv": ["python", "-m", "pytest"],
         "exit_code": code, "counts": {"passed": 1}, "excerpt": "",
         "verified_by": verify.VERIFIED_BY, "scope": scope, "gate": gate,
         "pr_id": pr, "branch": "b", "commit_sha": "", "mode": "offline",
-        "merge_state": "skipped"}, tags=["verify"], session_id=session)
+        "merge_state": "skipped", **extra}, tags=["verify"], session_id=session)
 
 
 def test_a_red_ci_run_marks_the_session_failed():
@@ -630,6 +632,20 @@ def test_a_verification_that_is_not_a_ci_run_never_reds_the_card():
     card = oversee.interactive_sessions()[0]
     assert card["status"] == "running"
     assert card["ci"] is None
+
+
+@pytest.mark.parametrize("code,verdict,status", [(3, "green", "running"),
+                                                  (1, "red", "failed"),
+                                                  (2, "error", "failed")])
+def test_a_premerge_run_is_judged_by_its_verdict_not_its_exit_code(code, verdict, status):
+    """`hive ci premerge --merge` exits 3 for a green run whose merge did not
+    happen. `hive ci status` reads that as green, and so must the card."""
+    events.append_event("user_prompt", {"text": "land it"}, session_id="s-ci")
+    _ci("s-ci", code, gate="premerge", verdict=verdict)
+    card = oversee.interactive_sessions()[0]
+    assert card["status"] == status
+    assert card["ci"]["verdict"] == verdict
+    assert bool(card["blockers"]) == (status == "failed")
 
 
 def test_every_card_carries_the_ci_key_even_with_no_ci_run():

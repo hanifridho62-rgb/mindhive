@@ -240,7 +240,8 @@ def _print_ci(row) -> None:
           f"merge: {row.get('merge_state') or 'unknown'}")
     counts = row.get("counts") or {}
     if counts:
-        print("counts: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
+        whose = f" ({row['counts_leg']})" if row.get("counts_leg") else ""
+        print(f"counts{whose}: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
     legs = [leg for leg in row.get("legs") or [] if isinstance(leg, dict)]
     if legs:
         tally = {}
