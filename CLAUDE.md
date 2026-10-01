@@ -108,6 +108,18 @@ the work done. If the user's ask implies shipping via PR, don't report success
 until CI (or the local test run standing in for it) is actually green — not
 "looks right."
 
+While GitHub Actions is billing-blocked, the CI of record for a PR is
+`hive ci premerge <PR>`: it runs `ci.yml`'s legs locally against the PR's
+merge and posts the verdict as `mindhive-ci` commit statuses. A PR is green
+when `mindhive-ci` is green on its head; a leg it could not run here is named
+in the verdict and is not a pass. Merge only on the owner's word, and then
+through `hive ci premerge <PR> --merge`, which re-checks before it merges.
+
+An agent driving it runs `hive ci legs --json` first to learn what this
+machine can run, passes `--json` to every `hive ci` verb and reads `verdict`
+rather than the exit code alone: exit 3 is a green run whose `--merge` did not
+merge, and under `--json` even a refusal prints one JSON object.
+
 ## Skill routing
 
 When the user's request matches an available skill, invoke it via the Skill

@@ -33,8 +33,6 @@ nothing here can record a run it did not observe.
 """
 import json
 import os
-import shutil
-import stat
 import subprocess
 import sys
 import time
@@ -93,38 +91,9 @@ GATE_TIMEOUT_S = 900.0
 SUITE_TIMEOUT_S = 3600.0
 PROBE_TIMEOUT_S = 120.0
 
-#: `onexc` replaced `onerror` in 3.12 and `onerror` is deprecated for removal.
-#: Both hand the callback the same three positional arguments, so one function
-#: serves either spelling and this build keeps working on 3.11.
-_RMTREE_HANDLER_KW = "onexc" if sys.version_info >= (3, 12) else "onerror"
-
 
 class CIRunnerError(RuntimeError):
     """The runner could not even set up -- no worktree, so no gates."""
-
-
-def _force_remove_readonly(func, path, _exc=None) -> None:
-    """Clear the read-only bit and retry, the MEB CI-01 mechanism -- made total
-    over the path that is NOT there, which the MEB spelling is not: on this
-    interpreter `rmtree` of a MISSING root calls the handler with `os.lstat`,
-    so `os.chmod` would be handed a path that does not exist and raise out of
-    the cleanup, on the COMMON case: a tree that never ran pytest has no
-    `.pytest_cache`."""
-    if not os.path.lexists(path):
-        return
-    os.chmod(path, stat.S_IWRITE)
-    func(path)
-
-
-def _rmtree_force(path) -> None:
-    """`rmtree` that survives read-only files, and a root that is not there."""
-    path = Path(path)
-    if not path.exists():
-        return
-    try:
-        shutil.rmtree(path, **{_RMTREE_HANDLER_KW: _force_remove_readonly})
-    except OSError:                                     # noqa: BLE001
-        pass          # cleanup is best-effort; `git worktree prune` is next
 
 
 def _default_runner(argv, cwd=None, env=None, timeout_s=None) -> tuple:
@@ -438,10 +407,11 @@ class NativeCIRunner:
         if keep:
             return False
         wt_path = Path(wt_path)
-        _rmtree_force(wt_path / ".pytest_cache")
+        # Best-effort: `git worktree prune` is next.
+        paths.rmtree_force(wt_path / ".pytest_cache")
         if wt_path.exists():
             for pyc in wt_path.rglob("__pycache__"):
-                _rmtree_force(pyc)
+                paths.rmtree_force(pyc)
         for attempt in range(CLEANUP_ATTEMPTS):
             rc, _, _ = self._run(
                 [GIT, "worktree", "remove", "--force", str(wt_path)],

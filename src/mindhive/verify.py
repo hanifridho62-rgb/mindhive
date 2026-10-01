@@ -62,6 +62,12 @@ from . import runlog
 
 VERIFIED_BY = "python"
 
+#: The `gate` of a `hive ci premerge` row (`ci.premerge.GATE`; a test holds the
+#: two equal). Such a row is a verdict on a PR's MERGE, run in fresh
+#: repositories -- not a run of this checkout's suite -- and its exit code has a
+#: fourth value (3: green, but `--merge` did not merge).
+PREMERGE_GATE = "premerge"
+
 # What a run killed at its cap answers. The code `claude_cli.run_headless`
 # answers for a child that outlived its timeout, so a killed suite and a killed
 # child read alike wherever both are reported.
@@ -391,15 +397,27 @@ def run_and_record(argv=None, project=None, root=None, echo: bool = True,
             "artifact": artifact, "excerpt": excerpt, "tail": tail}
 
 
+def is_pr_verdict(payload) -> bool:
+    """True for a `hive ci premerge` row. A reader asking whether the suite
+    passed HERE, or how many tests it counted, must not take one for its
+    answer: the row judges a PR's merge, run somewhere else."""
+    return isinstance(payload, dict) and payload.get("gate") == PREMERGE_GATE
+
+
 def last_run(evs) -> dict | None:
     """The most recent recorded run's payload, or None when the store has
     none. None is the honest answer for an empty store — `premise` renders it
-    as "no recorded run to check against", never as a contradiction."""
+    as "no recorded run to check against", never as a contradiction.
+
+    A `hive ci premerge` row is passed over (`is_pr_verdict`): it is a verdict
+    on a PR's merge, and its counts are one leg's of another tree."""
     latest = None
     for e in (evs or []):
         if getattr(e, "type", None) != "verification":
             continue
         if not isinstance(getattr(e, "payload", None), dict):
+            continue
+        if is_pr_verdict(e.payload):
             continue
         latest = e.payload
     return latest

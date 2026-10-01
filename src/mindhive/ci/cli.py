@@ -47,7 +47,7 @@ from pathlib import Path
 from .. import cliparse, paths
 
 __all__ = ["PRE_PUSH_HOOK", "cmd_ci_breaker_reset", "cmd_ci_breaker_status",
-           "cmd_ci_hook_install", "cmd_ci_run", "cmd_ci_status", "register"]
+           "cmd_ci_hook_install", "cmd_ci_run", "cmd_ci_status", "register", "root_of"]
 
 #: The `pre-push` hook `hook-install` writes. POSIX `sh`, because that is what
 #: git runs it with on every platform including Windows (Git for Windows ships
@@ -163,8 +163,9 @@ def cmd_ci_breaker_reset(args) -> int:
 # --- `run`: the four gates ---------------------------------------------------------------
 
 
-def _root_of(args):
-    """The repository the verb acts on. `--root` when given, else this one."""
+def root_of(args):
+    """The repository the verb acts on. `--root` when given, else this one.
+    The pre-merge verbs (`premerge_cli`) resolve theirs the same way."""
     given = getattr(args, "root", None)
     if given:
         return Path(given)
@@ -189,7 +190,7 @@ def _current_branch(root) -> str:
 def cmd_ci_run(args) -> int:
     """Run the four gates for a branch. 0 green, 1 red, 2 it could not start."""
     from . import runner as rn
-    root = _root_of(args)
+    root = root_of(args)
     branch = (getattr(args, "branch", None) or "").strip() or _current_branch(root)
     if not branch:
         print("hive ci run: no --branch given, and git could not name the "
@@ -209,7 +210,9 @@ def cmd_ci_run(args) -> int:
 
 
 def _ci_rows(args) -> list:
-    """Every recorded CI verification, oldest first, optionally one PR's.
+    """Every recorded CI verification as ``(recorded_at, row)``, oldest first:
+    only one PR's, one gate's, one branch's when `--pr`, `--gate`, `--branch`
+    say so.
 
     Scope is checked, not assumed: a `hive selftest` run is a `verification`
     too, and reporting one as the last CI run would tell the operator a gate
@@ -217,6 +220,7 @@ def _ci_rows(args) -> list:
     from .. import events as ev_mod
     from . import runner as rn
     pr = getattr(args, "pr", None)
+    gate, branch = getattr(args, "gate", None), getattr(args, "branch", None)
     rows = []
     for e in ev_mod.read_all(getattr(args, "project", None)):
         payload = getattr(e, "payload", None)
@@ -226,40 +230,78 @@ def _ci_rows(args) -> list:
             continue
         if pr and int(payload.get("pr_id") or 0) != int(pr):
             continue
-        rows.append(payload)
+        if (gate and payload.get("gate") != gate
+                or branch and payload.get("branch") != branch):
+            continue
+        rows.append((e.ts, payload))
     return rows
 
 
-def _print_ci(row) -> None:
+def _print_ci(row, recorded_at="") -> None:
     print(f"PR #{row.get('pr_id', 0)} on {row.get('branch') or '(no branch)'}")
+    if recorded_at:
+        print(f"recorded: {recorded_at}")
     print(f"{row.get('gate') or 'unknown gate'}: exit {row.get('exit_code')}")
-    print(f"mode: {row.get('mode') or 'unknown'}, "
-          f"merge: {row.get('merge_state') or 'unknown'}")
+    if row.get("verdict"):
+        print(f"verdict: {row['verdict']}"
+              + (f" -- {row['reason']}" if row.get("reason") else ""))
+    merge = str(row.get("merge_state") or "unknown")
+    if row.get("merge_reason"):
+        merge += f" -- {row['merge_reason']}"
+    print(f"mode: {row.get('mode') or 'unknown'}, merge: {merge}")
     counts = row.get("counts") or {}
     if counts:
-        print("counts: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
+        whose = f" ({row['counts_leg']})" if row.get("counts_leg") else ""
+        print(f"counts{whose}: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
+    legs = [leg for leg in row.get("legs") or [] if isinstance(leg, dict)]
+    if legs:
+        tally = {}
+        for leg in legs:
+            state = str(leg.get("state") or "unknown")
+            tally[state] = tally.get(state, 0) + 1
+        missing = [str(u.get("name")) for u in row.get("unavailable") or []
+                   if isinstance(u, dict)]
+        print("legs: " + ", ".join(f"{n} {s}" for s, n in sorted(tally.items()))
+              + ("; not run: " + ", ".join(missing) if missing else ""))
     if row.get("commit_sha"):
         print(f"commit: {row['commit_sha'][:12]}")
     if row.get("artifact"):
         print(f"artifact: {row['artifact']}")
 
 
+def _green(row) -> bool:
+    """A pre-merge run is judged by its verdict: its exit 3 is a green run whose
+    `--merge` did not happen, and calling that red would misreport the tests."""
+    if row.get("gate") == "premerge":
+        return row.get("verdict") == "green"
+    return int(row.get("exit_code") or 0) == 0
+
+
 def cmd_ci_status(args) -> int:
-    """The last recorded CI run. 0 it was green, 1 red, 2 there is none."""
+    """The last recorded CI run. 0 it was green, 1 red or an error, 2 there is
+    none -- under `--json` that is said in JSON too, with the filters asked."""
     rows = _ci_rows(args)
     page = max(1, int(getattr(args, "page", 1) or 1))
     pr = getattr(args, "pr", None)
+    gate, branch = getattr(args, "gate", None), getattr(args, "branch", None)
     if len(rows) < page:
-        print("hive ci status: no CI run recorded"
-              + (f" for PR #{pr}" if pr else "")
-              + (f" at page {page}" if page > 1 else ""))
+        if getattr(args, "json", False):
+            print(json.dumps({"found": False, "pr": pr, "gate": gate, "branch": branch,
+                              "page": page}, ensure_ascii=False, sort_keys=True))
+        else:
+            print("hive ci status: no CI run recorded"
+                  + (f" for PR #{pr}" if pr else "")
+                  + (f" by gate {gate}" if gate else "")
+                  + (f" on branch {branch}" if branch else "")
+                  + (f" at page {page}" if page > 1 else ""))
         return 2
-    row = rows[-page]
+    recorded_at, row = rows[-page]
     if getattr(args, "json", False):
-        print(json.dumps(row, ensure_ascii=False, sort_keys=True))
+        print(json.dumps({**row, "recorded_at": recorded_at},
+                         ensure_ascii=False, sort_keys=True))
     else:
-        _print_ci(row)
-    return 0 if int(row.get("exit_code") or 0) == 0 else 1
+        _print_ci(row, recorded_at)
+    return 0 if _green(row) else 1
 
 
 # --- `hook-install`: put the gate where pushes pass ---------------------------------------
@@ -285,7 +327,7 @@ def _hooks_dir(root):
 
 def cmd_ci_hook_install(args) -> int:
     """Write `pre-push`. 0 written, 1 one is already there, 2 not a repo."""
-    root = _root_of(args)
+    root = root_of(args)
     hooks = _hooks_dir(root)
     if hooks is None:
         print(f"hive ci hook-install: {root} is not inside a git repository",
@@ -334,9 +376,13 @@ def register(subparsers) -> None:
     run.set_defaults(func=cmd_ci_run)
 
     report = group.add_parser(
-        "status", help="the last recorded CI run (exit 1 red, 2 none)")
+        "status", help="the last recorded CI run (exit 1 red or error, 2 none)")
     report.add_argument("--pr", type=int, default=None,
                         help="only this PR's runs")
+    report.add_argument("--gate", default=None,
+                        help="only this gate's runs: premerge, or the gate that "
+                             "decided a `hive ci run`, such as gate2_suite")
+    report.add_argument("--branch", default=None, help="only this branch's runs")
     report.add_argument("--page", type=int, default=1,
                         help="1 is the newest run, 2 the one before it")
     report.add_argument("--project", type=cliparse.project_arg, default=None,
@@ -374,3 +420,6 @@ def register(subparsers) -> None:
     reset.add_argument("--json", action="store_true",
                        help="machine-readable report")
     reset.set_defaults(func=cmd_ci_breaker_reset)
+
+    from . import premerge_cli      # lazy: its handlers import what they run
+    premerge_cli.register(group)
