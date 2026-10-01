@@ -267,7 +267,9 @@ def test_the_browser_leg_runs_the_hive_interpreter_against_the_legs_own_src(tmp_
     work = tmp_path / "work" / "browser"
     assert ran["env"]["PYTHONPATH"] == str(work / "repo" / "src")
     assert ran["env"]["HF_HUB_OFFLINE"] == "1"
-    assert ran["env"]["PATH"].split(os.pathsep)[0] == str(Path(host).parent)
+    # First on PATH, read as a prefix: on POSIX the separator is a colon, so a
+    # split there cuts `C:/venv/Scripts` at its drive letter.
+    assert ran["env"]["PATH"].startswith(str(Path(host).parent) + os.pathsep)
 
 
 CI_ADMIN = "postgresql://ci@localhost:55432/mindhive"
@@ -566,6 +568,10 @@ def _toy_origin(tmp_path):
                       ("data.txt", "one\ntwo\n"), ("tests/test_toy.py", TOY_TEST),
                       ("run.sh", "#!/bin/sh\necho ok\n")):
         (origin / rel).write_text(text, encoding="utf-8", newline="\n")
+    # Executable on disk too, not only in the index: where git trusts the file's
+    # mode (`core.fileMode`, POSIX), a 0644 file under a 100755 entry reads as
+    # modified, and the operator's checkout looked dirty before any leg ran.
+    (origin / "run.sh").chmod(0o755)
     ident = ["-c", "user.name=t", "-c", "user.email=t@example.invalid",
              "-c", "commit.gpgsign=false", "-c", "core.autocrlf=false"]
     _git(origin, "init", "-q", "-b", "master")
