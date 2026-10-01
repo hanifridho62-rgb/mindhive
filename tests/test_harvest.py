@@ -1,8 +1,16 @@
 # tests/test_harvest.py
 import json
 import os
+import subprocess
+import sys
 import time
-from mindhive import harvest, hookcapture, events, paths
+from pathlib import Path
+
+import pytest
+
+from mindhive import __main__ as cli, harvest, hookcapture, events, paths
+
+REPO = Path(__file__).resolve().parents[1]
 
 
 def _isolate(tmp_path, monkeypatch):
@@ -287,32 +295,130 @@ def test_catch_up_skips_unknown_projects_by_default(tmp_path, monkeypatch):
 
 
 # --- cross-process harvest lock (low-latency loop must not race the task) ---
+#
+# Two harvesters share every store: the dashboard's background loop (a tick per
+# 3 s whenever a transcript moved) and the scheduled `hive autosync` task (every
+# 2 minutes). Both stamp each row with the transcript line's OWN timestamp, so a
+# line walked twice is a row appended twice, byte for byte -- and the ledger is
+# append-only and hash-chained, so the second copy is permanent. The lock is the
+# only thing between the two, and these tests hold it to one rule: a live
+# harvester is never a second harvester's to take, however long its pass runs.
+
+
+def _usermsg_at(text, stamp):
+    """A typed prompt carrying the transcript's own timestamp, the one harvest
+    stamps on every row it mints from the line."""
+    return json.dumps({"type": "user", "message": {"content": text},
+                       "timestamp": stamp})
+
+
+def _canonical_rows(project="test"):
+    return [events.canonical_json(events.to_dict(e))
+            for e in events.read_all(project)]
+
+
+def test_a_live_harvester_older_than_the_stale_window_is_not_a_second_one_s_to_take(
+        tmp_path, monkeypatch):
+    """The live-store duplicate, reproduced: one `decision:` line, one
+    `decision` row -- not two byte-identical ones on adjacent lines.
+
+    A pass over the live store reads every transcript in every directory end to
+    end on every tick, plus three full `read_all`s per namespace, so it can run
+    for minutes; the scheduled task fires every two minutes regardless. The lock
+    used to call any holder older than 120 s dead, unlink its file and start a
+    second pass over the SAME cursor window (the first pass had loaded its
+    cursor before the theft and was about to walk it). The seam is exercised
+    exactly there: the second harvester arrives after the first has loaded its
+    state and taken its dedup snapshot, and before it appends."""
+    _isolate(tmp_path, monkeypatch)
+    root = tmp_path / "projects"
+    _write_transcript(root / "enc", "3e7af63e-d223-4832-88f0-a57b8022ab1b", [
+        json.dumps({"type": "attachment", "cwd": "C:/x"}),
+        _usermsg_at("decision: the lock is the kernel's, not a file's age",
+                    "2026-08-31T05:36:06.412Z"),
+    ])
+    monkeypatch.setattr(harvest, "claude_projects_root", lambda: root)
+    lock = paths.store_home() / "harvest.lock"
+    real = harvest._hook_captured_sessions
+    second = []
+
+    def captured_then_a_second_harvester(project):
+        out = real(project)
+        if not second:
+            # The first pass has loaded its cursor and is about to walk the
+            # window. Its lock is now older than the stale window, as it is on
+            # the live machine two minutes into a long pass -- and the
+            # scheduled task's tick lands.
+            second.append(None)
+            old = time.time() - 10_000
+            os.utime(lock, (old, old))
+            second[0] = harvest.catch_up(known_only=False)
+        return out
+
+    monkeypatch.setattr(harvest, "_hook_captured_sessions",
+                        captured_then_a_second_harvester)
+    first = harvest.catch_up(known_only=False)
+
+    rows = _canonical_rows()
+    assert len(rows) == len(set(rows)), "a row was appended twice, byte for byte"
+    assert [e.type for e in events.read_all("test")].count("decision") == 1
+    # The two passes are one harvester's worth of work between them: whichever
+    # ran, the other was told it did not.
+    assert second[0]["locked"] is True
+    assert first["total_new"] == 2 and not first.get("locked")
+
+
+def test_canary_a_second_pass_over_one_line_is_byte_identical(tmp_path, monkeypatch):
+    """CANARY for the test above: the duplicate detector can fire. Two passes
+    over one line -- the cursor reset between them -- mint two rows the
+    canonical serialiser cannot tell apart, because the timestamp is the
+    transcript's and not the clock's. That is what makes a double pass a
+    permanent duplicate rather than two rows a second apart."""
+    _isolate(tmp_path, monkeypatch)
+    tdir = tmp_path / "tx"
+    _write_transcript(tdir, "s1", [
+        _usermsg_at("decision: stamp the transcript's time", "2026-08-31T05:36:06Z")])
+    harvest.harvest(tdir, "test")
+    harvest._state_path("test").unlink()             # the cursor, forgotten
+    harvest.harvest(tdir, "test")
+
+    rows = [r for r, e in zip(_canonical_rows(), events.read_all("test"))
+            if e.type == "decision"]
+    assert len(rows) == 2 and len(set(rows)) == 1
+
 
 def test_catch_up_skips_when_locked(tmp_path, monkeypatch):
-    """If another harvester holds the lock, catch_up no-ops (no double-write)."""
+    """If another harvester holds the lock, catch_up no-ops (no double-write).
+    The holder is a real one -- a second descriptor holding the kernel lock --
+    not a file that happens to exist."""
     _isolate(tmp_path, monkeypatch)
-    lock = paths.store_home() / "harvest.lock"
-    lock.parent.mkdir(parents=True, exist_ok=True)
-    lock.write_text("99999", encoding="utf-8")          # fresh lock held by "someone"
     root = tmp_path / "projects"
     _write_transcript(root / "enc", "s1", [
         json.dumps({"type": "attachment", "cwd": "C:/x", "sessionId": "s1"}),
         _tooluse("Edit", {"file_path": "a.py"}),
     ])
     monkeypatch.setattr(harvest, "claude_projects_root", lambda: root)
-    res = harvest.catch_up(known_only=False)
+    with harvest.harvest_lock() as held:
+        assert held is True
+        res = harvest.catch_up(known_only=False)
     assert res.get("locked") is True
     assert res["total_new"] == 0
     assert [e for e in events.read_all("test") if e.type == "file_touched"] == []
 
 
-def test_catch_up_steals_stale_lock(tmp_path, monkeypatch):
-    """A lock older than the stale window is treated as orphaned and stolen."""
+@pytest.mark.parametrize("age_s", [10_000, 0], ids=["long-dead", "fresh"])
+def test_a_lock_file_without_a_live_holder_never_blocks_whatever_its_age(
+        tmp_path, monkeypatch, age_s):
+    """A crashed harvester leaves its file behind; the kernel has already
+    released its lock. So the file blocks nothing -- and not only once it is
+    old: a FRESH file with no holder is the case the old stale window got
+    wrong from the other side, blocking every tick for two minutes after a
+    crash. The file's age and content mean nothing; only a live holder does."""
     _isolate(tmp_path, monkeypatch)
     lock = paths.store_home() / "harvest.lock"
     lock.parent.mkdir(parents=True, exist_ok=True)
-    lock.write_text("dead", encoding="utf-8")
-    old = time.time() - 10_000
+    lock.write_text("99999", encoding="utf-8")
+    old = time.time() - age_s
     os.utime(lock, (old, old))
     root = tmp_path / "projects"
     _write_transcript(root / "enc", "s1", [
@@ -322,16 +428,93 @@ def test_catch_up_steals_stale_lock(tmp_path, monkeypatch):
     monkeypatch.setattr(harvest, "claude_projects_root", lambda: root)
     res = harvest.catch_up(known_only=False)
     assert not res.get("locked")
-    assert res["total_new"] == 1           # stale lock stolen, harvest proceeded
+    assert res["total_new"] == 1
 
 
 def test_catch_up_releases_lock(tmp_path, monkeypatch):
-    """The lock is released after a normal run so the next tick can acquire it."""
+    """The lock is released after a normal run so the next tick can acquire it
+    -- and the FILE stays on disk, by design. A release that unlinked it would
+    hand the next opener a different inode: on POSIX `flock` binds to the
+    inode, so two harvesters could each hold "the" lock at once, which is the
+    exact double-pass this file exists to refuse."""
     _isolate(tmp_path, monkeypatch)
     root = tmp_path / "projects"
     monkeypatch.setattr(harvest, "claude_projects_root", lambda: root)
-    harvest.catch_up(known_only=False)
-    assert not (paths.store_home() / "harvest.lock").exists()
+    lock = paths.store_home() / "harvest.lock"
+    first = harvest.catch_up(known_only=False)
+    assert not first.get("locked")
+    assert lock.exists()
+    second = harvest.catch_up(known_only=False)
+    assert not second.get("locked")
+
+
+def test_a_child_process_is_refused_while_the_parent_holds_the_lock(tmp_path, monkeypatch):
+    """The lock is the kernel's, so it holds across PROCESSES -- the dashboard
+    and the scheduled task are two -- and not only across descriptors of one.
+    A child asks for it while the parent holds it, then again after."""
+    _isolate(tmp_path, monkeypatch)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(REPO / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+    def child():
+        out = subprocess.run(
+            [sys.executable, "-c",
+             "from mindhive import harvest\n"
+             "with harvest.harvest_lock() as held:\n"
+             "    print(held)"],
+            capture_output=True, text=True, env=env, cwd=str(tmp_path))
+        assert out.returncode == 0, out.stderr
+        return out.stdout.strip()
+
+    with harvest.harvest_lock() as held:
+        assert held is True
+        assert child() == "False"
+    assert child() == "True"
+
+
+def test_a_lock_the_store_cannot_open_skips_the_tick_rather_than_running_unlocked(
+        tmp_path, monkeypatch):
+    """Fail-CLOSED, and the direction is the point: a skipped tick loses
+    nothing, since the cursor does not move, while an unlocked pass can
+    duplicate forever. The append lock chooses the other way for the other
+    reason (an event refused is an event lost)."""
+    _isolate(tmp_path, monkeypatch)
+    blocker = tmp_path / "blocker"
+    blocker.write_text("a file where the lock's directory should be", encoding="utf-8")
+    monkeypatch.setattr(harvest, "_harvest_lock_path", lambda: blocker / "harvest.lock")
+    root = tmp_path / "projects"
+    _write_transcript(root / "enc", "s1", [
+        json.dumps({"type": "attachment", "cwd": "C:/x", "sessionId": "s1"}),
+        _tooluse("Edit", {"file_path": "a.py"}),
+    ])
+    monkeypatch.setattr(harvest, "claude_projects_root", lambda: root)
+    res = harvest.catch_up(known_only=False)
+    assert res["locked"] is True
+    assert res["total_new"] == 0
+    assert events.read_all("test") == []
+
+
+def test_hive_harvest_direct_path_yields_to_a_running_harvester(
+        tmp_path, monkeypatch, capsys):
+    """`hive harvest --transcripts D --project P` is the one door to the
+    writer that did not pass through the lock at all: an operator running it
+    beside the dashboard's loop was a second harvester over the same cursor.
+    It now takes the same lock, and says so when refused."""
+    _isolate(tmp_path, monkeypatch)
+    tdir = tmp_path / "tx"
+    _write_transcript(tdir, "s1", [
+        _usermsg_at("decision: one door, one lock", "2026-08-31T05:36:06Z")])
+    with harvest.harvest_lock() as held:
+        assert held is True
+        rc = cli.main(["harvest", "--transcripts", str(tdir), "--project", "test"])
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert out["locked"] is True and out["new_events"] == 0
+    assert events.read_all("test") == []
+    # Released: the same command then does the work.
+    assert cli.main(["harvest", "--transcripts", str(tdir), "--project", "test"]) == 0
+    assert [e.type for e in events.read_all("test")] == ["decision", "user_prompt"]
 
 
 # --- per-bubble 5,000-word cap (one memory entry == one bubble) ---
@@ -1346,10 +1529,9 @@ def test_a_locked_catch_up_still_carries_the_count(tmp_path, monkeypatch):
     dict literal, so it needs the key too — a caller reading it must not
     KeyError on the one tick that did no work."""
     _isolate(tmp_path, monkeypatch)
-    lock = paths.store_home() / "harvest.lock"
-    lock.parent.mkdir(parents=True, exist_ok=True)
-    lock.write_text("99999", encoding="utf-8")          # held by "someone"
-    res = harvest.catch_up(known_only=False)
+    with harvest.harvest_lock() as held:                # held by "someone"
+        assert held is True
+        res = harvest.catch_up(known_only=False)
     assert res["locked"] is True
     assert res["unclosed_skill_calls"] == 0
 # --- injected non-user-authored bodies must not mint memos (harvest defect) ---

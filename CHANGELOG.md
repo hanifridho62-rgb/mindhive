@@ -17,6 +17,34 @@ history and grouped by what each release window introduced. They summarise;
 
 ### Added
 
+- **Native pre-merge CI — `hive ci premerge`, `watch`, `conflicts`, `legs`**
+  (spec `docs/superpowers/specs/2026-09-30-native-ci-premerge-design.md`):
+  the `ci.yml` jobs run on the operator's machine while the account's Actions
+  jobs are refused for payment. Each leg tests the merge a PR would make, in a
+  fresh repository whose `HEAD` is that merge commit, its history read through
+  git alternates, and a fresh venv; the verdict is posted as `mindhive-ci`
+  commit statuses and recorded as a `verification` with `gate: "premerge"`;
+  `--merge` merges a green PR guarded by a re-read, a re-checked base and a
+  pinned head, and says how it went as one word of `merged`, `refused`,
+  `failed`, `unknown`, `skipped`, the why in `merge_reason`. A fork's PR runs
+  only with `--trust`; a `--legs` run never posts the overall status nor
+  merges; Ctrl+C stops every leg and exits 130. Every verb prints JSON under
+  `--json` whatever happens, a refusal included, and its `--help` names its
+  exit codes. `hive ci status` judges a pre-merge run by its verdict, names
+  its legs, filters by `--gate` and `--branch` and says when a run was
+  `recorded_at`. New modules `ci/proc.py`, `ci/legs.py`, `ci/preview.py`,
+  `ci/github.py`, `ci/legrun.py`, `ci/premerge.py`, `ci/watch.py`,
+  `ci/premerge_cli.py`; new variables `MINDHIVE_CI_PG_DSN` and
+  `MINDHIVE_CI_PG_DSN_RO`.
+
+- **`ci.yml` checks out with `fetch-depth: 0`**: `tests/test_implementation_plan.py`
+  reads history, so the default one-commit checkout was red on master itself.
+
+- **A windows leg finds `sh` as GitHub's runner does**: when the operator's
+  PATH has no POSIX `sh` (a PowerShell or scheduled-task launch), the leg's
+  pytest gets Git for Windows' own `bin` last on PATH, and a leg that finds
+  none says so in its log, since every test needing `sh` would skip.
+
 - **Blueprint P11 — the traceability matrix and the audit that closes the
   blueprint** (RP §3, §4.7, §10.3; MEB §3.1, §153):
   - `IMPLEMENTATION_PLAN.md` at the root: the RTM for blueprint v1.0 and v1.1 with the commit that realised each row; the audit table `| Bab / Fitur PDF | Modul / Berkas Kode Sumber | Berkas Pengujian (Tests) | Status Verifikasi |` — one row per item, every status parsed from the junit of one full pytest run rather than typed; the MEB LOC forecast beside measured sizes; an ISO/IEC 25010 matrix of measured values; the three benches; the deviation register; and the real outcome of the one `hive mindnet ab --execute --record` run. `tests/test_implementation_plan.py` holds it to that: the commit it names must exist, every path it cites must exist, every status is one of seven words, the LOC rows equal `scripts/loc_report.py`'s.
@@ -180,6 +208,22 @@ history and grouped by what each release window introduced. They summarise;
 
 ### Fixed
 
+- **A harvest pass is never walked twice.** `harvest.lock` was an
+  exclusive-create file with a 120 s stale age, and a pass over the live
+  store can outlive that (every transcript in a directory is read end to end
+  on every tick, plus three full folds of the namespace) while the
+  scheduled `autosync` task fires every two minutes. So the task could take
+  a live harvester's lock mid-pass and walk the same cursor window; both stamp
+  the transcript's own timestamp, so the rows were byte-identical, and the
+  release then unlinked the thief's lock, admitting a third. Measured on a
+  copy of the live store: semantic rows held twice in 5 of 107
+  namespaces, 467 extra rows in `mindhive` across all types, and `hive
+  embed` refusing the content-addressed twin. `harvest.harvest_lock` is
+  now a kernel byte-range lock like `append.lock` -- released with the
+  process, no stale age, the file never unlinked -- and `hive harvest
+  --transcripts D --project P`, the one door that took no lock, holds it
+  too and answers `locked: true` when refused. The existing duplicates
+  stay: the ledger is append-only and hash-chained.
 - **The embedding watcher no longer records syncs that never happened.**
   Without the vector extras (`pip install -e .[vectors]`) it claims nothing,
   leaves the queue for the install that can drain it, and says why once per

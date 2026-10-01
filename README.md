@@ -70,6 +70,10 @@ On Windows use PowerShell 5.1 syntax — no `&&`, no ternaries — see the
 - `hive ci hook-install [--root R] [--force]` — write `pre-push` (POSIX `sh`, LF-only, executable) so every push runs `hive ci run --branch "$branch"` first. Written to the repository's COMMON hooks dir, so it works from a linked worktree too; refuses to clobber a hook someone else wrote unless `--force`
 - `hive ci breaker status [--project P] [--json]` — what the **integration circuit** is doing, without moving it: state, consecutive failures, trips inside the window, cooldown left, and the record behind it. Exit 1 while OPEN and 2 while QUARANTINED, so a script can gate on it. It deliberately does **not** call the breaker's own `check`, which is a transition: an OPEN circuit whose cooldown has elapsed moves itself to HALF_OPEN as it answers
 - `hive ci breaker reset [--project P] [--json]` — close the circuit by hand and clear its trip history. **The only exit from QUARANTINED**, which three trips inside the window reach and no cooldown leaves; total over every other state, so a reset of an already-closed circuit is a named no-op rather than an error
+- `hive ci premerge <PR> [--merge] [--allow-base-drift] [--legs L] [--jobs N] [--timeout S] [--no-status] [--keep] [--json]` — the **pre-merge CI** GitHub Actions used to be, on this machine: every `ci.yml` leg (the 3 × 2 OS × Python matrix, the node, browser and pg tiers) run against the MERGE the PR would make, each in a fresh repository with its own venv, and the verdict posted on the PR as commit statuses (`mindhive-ci`, `mindhive-ci/<leg>`). Exit 0 green, 1 red, 2 it could not be checked, 3 green but `--merge` did not merge. `--merge` re-reads the PR, re-checks the base and merges with `gh pr merge --merge --match-head-commit <tested head>`; `--branch B [--base M]` tests a local branch instead, with no statuses and no merge
+- `hive ci watch [--once] [--interval S] [--skip-drafts] [...]` — keep every open PR's verdict current: a new head is tested in full, a moved base is re-checked with one `git merge-tree` and a new conflict turns the PR red at once. Never merges
+- `hive ci conflicts [--base M] [--json]` — which open PRs conflict with their base, and which pairs cannot both land as they stand. Exit 1 when any does
+- `hive ci legs [--legs L] [--json]` — the `ci.yml` legs and whether this machine can run each, with the reason when it cannot
 - `hive dashboard [--port N] [--no-browser] [--idle-cutoff S]` — open the web control panel for every feature. Without `--idle-cutoff` it is exactly the 24/7 server it has always been and runs until you stop it; with one, it also shuts down after that many seconds with no page open
 - `hive ui [--port N] [--no-browser] [--idle-cutoff S] [--asgi]` — the same panel as a **page** rather than a service: it beats every 15 s from the open tab and shuts itself down 60 s after the last beat, so closing the tab ends the process. Defaults to port 54461, the dashboard's own — one panel, one URL — and if the 24/7 dashboard is already there it simply opens that one instead of binding over it. The heartbeat's timer runs in a Worker so a background tab is not throttled into a false shutdown, and there is no `document.hidden` guard: hidden is not closed. `--idle-cutoff` moves the beat interval with it (a quarter of the cutoff, never slower than 15 s), so `--idle-cutoff 5` is a five-second run rather than a usage error. `--asgi` serves through FastAPI/uvicorn instead of the stdlib server and needs `pip install -e .[ui]`; without the extras it exits 2 naming that line. `--idle-cutoff SECONDS` defaults to 60, or to `MINDHIVE_UI_IDLE_CUTOFF_S` when that holds a positive number of seconds (`5`, `0.5`, `1e2` all count). A value that is not a positive finite number — empty, text, `nan`/`inf`, zero, negative — is ignored: `hive ui` still starts, under 60, and prints one line on stderr (`hive ui: MINDHIVE_UI_IDLE_CUTOFF_S='abc' is not a positive number of seconds; using 60`). The flag beats the variable. `hive dashboard` does not read the variable; its own `--idle-cutoff` is unchanged
 - `hive plugins list [--json]` — print the **whole stored catalog**, free and paid, from the latest snapshot; never rescans (that's `scan`/`autoscan`), and says what to run when no snapshot exists yet. Under `--json` stdout is always parseable — `{}` when there is no snapshot, with the hint on stderr
@@ -280,6 +284,8 @@ list of spellings; anything else takes the default.
 | `MINDHIVE_AUTORESEARCH_DIR` | path inside WSL; default `~/autoresearch`; read once at import | `research.py` | where the autoresearch checkout the trainer runs lives |
 | `MINDHIVE_AUTORESUME_TIMER` | switch; unset = on. `off`, `0`, `none` turn it off | `autoresume.py::_timer_enabled` | whether `hive autoresume` registers a real Task Scheduler timer (the test suite turns it off) |
 | `MINDHIVE_BRIEF` | switch; default on. `0`, `off`, `false`, `no` turn it off | `mindnet/brief.py` | the per-task brief composed for a MindNetwork sub-agent |
+| `MINDHIVE_CI_PG_DSN` | libpq DSN; unset | `ci/legs.py`, `ci/legrun.py` | the admin login of a THROWAWAY Postgres 17 cluster of its own (a separate instance, port or container, like ci.yml's service container; the database under test is named `mindhive`), which the `pg` leg of `hive ci premerge` migrates and tests. Unset, or `MINDHIVE_CI_PG_DSN_RO` unset, the pg leg is named as not runnable here; equal to one of the operator's own DSNs, it is refused; and the leg stops before `pg migrate` when the cluster holds any other database. Never the real mirror's cluster: a migration from an unmerged branch cannot be taken back |
+| `MINDHIVE_CI_PG_DSN_RO` | libpq DSN; unset | `ci/legs.py`, `ci/legrun.py` | the same throwaway cluster's `mindhive_reader` login, its password set once by the operator (ci.yml's `ALTER ROLE` step does it on Actions). The pg tier's read-only tests need it; without it they would skip, so the pg leg is not run here |
 | `MINDHIVE_DASHBOARD_TOKEN` | string; unset → the token persisted in `dashboard.token` under the store root, minted once with `secrets.token_urlsafe(16)` | `dashboard.py::load_or_create_token`; `bench.py` reads it and never creates one | overrides the dashboard's URL token |
 | `MINDHIVE_EVENT_BACKEND` | `file` (default), `pg` or `dual` | `events.py::_maybe_read_from_pg`, `dashboard_memo.py`, `adaptivetail.py` | `pg`: `read_all` reads the Postgres mirror, falling back to the files. `pg` or `dual`: the dashboard's memo fingerprints are disabled and the `MEMORY.md` rollover line adds the `hive pg tool search_events_by_type` pointer. Appends never touch Postgres under any value, and `dual` performs no dual-read comparison. Nothing in `src/` sets it (docs/DATA_MODEL.md §5, invariant 6) |
 | `MINDHIVE_HEADLESS` | `1` when set; set by the code, not the operator | set by `claude_cli.py` and `workspace.py` on every headless `claude` child and removed by `rotation/supervisor.py` for its interactive successor; read by every `hooks/*.sh` / `hooks/*.ps1` shim | a hook fired inside a headless child exits at once (no recursion) |
@@ -289,8 +295,8 @@ list of spellings; anything else takes the default.
 | `MINDHIVE_LOOP_DASHBOARD` | switch; default on. `0`, `false`, `off`, `no` turn it off | `commands/orchestration.py` (`hive loop`) | whether a real `hive loop` run opens the dashboard; `--no-dashboard` does the same per run |
 | `MINDHIVE_MINDSWARM` | switch; default on. `0`, `false`, `off`, `no` turn it off | `dashboard.py`, per request | hides the Workspace's MindSwarm nav row; read from the environment the dashboard was started with |
 | `MINDHIVE_ORCHESTRATION_SECRET` | string; unset | `advice.py::is_authorized_sop_author` | when set, only a process whose `MINDHIVE_PROCESS_TOKEN` equals it may write an SOP; unset, the session-prefix rule decides |
-| `MINDHIVE_PG_DSN_ADMIN` | libpq DSN; unset | `pgmirror.py`, `autosync.py`, `ci/runner.py`, `storage/cli.py` | the owner credential for `hive pg migrate`/`rebuild`/`refresh`/`embed`; the default of `hive db migrate --dsn`; when set, `hive autosync` refreshes the mirror and `hive ci run` runs the pg tier |
-| `MINDHIVE_PG_DSN_RO` | libpq DSN; unset | `pgstore.py` | the reader credential (`mindhive_reader`, read-only at the role level) behind `hive pg tool` and the MCP server |
+| `MINDHIVE_PG_DSN_ADMIN` | libpq DSN; unset | `pgmirror.py`, `autosync.py`, `ci/runner.py`, `storage/cli.py`, `ci/legrun.py` (set inside the pg leg to `MINDHIVE_CI_PG_DSN`'s value, never read), `ci/legs.py` (compared, so the CI DSN is never this one) | the owner credential for `hive pg migrate`/`rebuild`/`refresh`/`embed`; the default of `hive db migrate --dsn`; when set, `hive autosync` refreshes the mirror and `hive ci run` runs the pg tier |
+| `MINDHIVE_PG_DSN_RO` | libpq DSN; unset | `pgstore.py`, `ci/legrun.py` (set inside the pg leg to `MINDHIVE_CI_PG_DSN_RO`'s value, never read), `ci/legs.py` (compared, so the CI DSN is never this one) | the reader credential (`mindhive_reader`, read-only at the role level) behind `hive pg tool` and the MCP server |
 | `MINDHIVE_PG_MAX_BYTES` | integer bytes; default 32768, ceiling 131072; zero, negative or unparseable → default | `pgshape.py` | the response cap on one AI-tool envelope |
 | `MINDHIVE_PLUGIN_AUTOSYNC` | switch; default off. `1`, `true`, `yes`, `on` turn it on | `plugin_cache.py`, through `hive plugins cache-check --hook` | on drift at session start, sync through `claude plugin update` (can hold session start up to 45 s) |
 | `MINDHIVE_PROCESS_TOKEN` | string; unset | `advice.py::is_authorized_sop_author` | the write token checked against `MINDHIVE_ORCHESTRATION_SECRET` (`hmac.compare_digest`); withheld from every agent the package spawns |
@@ -381,9 +387,95 @@ hive ci hook-install
 ```
 
 `.github/workflows/ci.yml` is **`workflow_dispatch` + `push: tags: ["v*"]`**
-only. It is what you reach for deliberately — a release tag, or a run you
-ask for by hand — because it is the only place the OS × Python matrix,
-the Postgres service container and the browser tier actually exist.
+only, and while the account's Actions jobs are refused for payment it cannot
+run at all. Its jobs run here instead:
+
+### Pre-merge CI on this machine (`hive ci premerge`)
+
+`hive ci premerge <PR>` does what the Actions checkout of `refs/pull/N/merge`
+did, without a runner or a bill:
+
+1. fetches the base and `refs/pull/N/head` into refs of its own
+   (`refs/mindhive-ci/<run>/…`, deleted afterwards) — nothing checked out is
+   read or moved;
+2. computes the merge with `git merge-tree --write-tree` (git ≥ 2.38) — a
+   conflict is red at once, and no leg runs;
+3. runs each `ci.yml` leg in a fresh repository whose `HEAD` is that merge
+   commit, with its whole history — read from this repository's object store
+   through `.git/objects/info/alternates`, not copied — no hooks, and CRLF for
+   a windows leg and LF for an ubuntu one, as the runners check out; then a
+   fresh venv, `pip install -e .[extras]` and the job's own pytest command —
+   windows legs through `py -0p`'s interpreters, ubuntu legs in WSL (a login
+   shell, so uv's interpreters are found), a few at a time, under
+   `<tempdir>/mindhive-ci` unless `--work-root` names another place;
+4. posts `mindhive-ci/<leg>` and the overall `mindhive-ci` as commit statuses
+   on the PR's head — a plain REST write, nothing billed;
+5. records one `verification` (`scope: "ci"`, `gate: "premerge"`) with every
+   leg's counts, and keeps the report and each leg's log as runlog artifacts.
+
+The suite reads history — `tests/test_implementation_plan.py` names a commit —
+so a one-commit checkout is red on master itself. Every `ci.yml` checkout is
+therefore `fetch-depth: 0`, and each leg has the history the same way.
+
+A windows leg's suite finds a POSIX `sh` where GitHub's Windows runner has
+one, on PATH: the hook-shim and leg-script tests need it, and the runner's
+green master run skipped none of them. When this machine's PATH has no `sh` —
+`hive ci premerge` started from PowerShell or a scheduled task — the leg's
+PATH gets Git for Windows' own `bin` last, so it shadows nothing; a leg that
+finds none says so in its log, because every test needing `sh` would skip.
+
+A leg this machine cannot run is **named, never counted**: the verdict says
+`not run here: pg`. `hive ci legs` shows which legs can run and why the others
+cannot. Three legs depart from their `ci.yml` job, and say so in `hive ci
+legs --json`: the `browser` leg runs the interpreter running `hive` (which must
+launch playwright's Chromium) against the leg's own `src`, so no Chromium is
+downloaded per run; the `node` leg runs on this machine with a fresh Python
+3.12 venv rather than on ubuntu-latest, because its cases have no OS or Python
+dimension; and the `pg` leg runs only against a throwaway Postgres cluster of
+its own, named by `MINDHIVE_CI_PG_DSN` and `MINDHIVE_CI_PG_DSN_RO` — never the
+operator's own DSNs. A leg whose pytest passed no test is not a pass: a tier
+whose every test skipped proved nothing.
+
+A PR from a fork is refused unless `--trust`: its legs would run its code on
+this machine as you, so read its diff first. `--legs` runs some legs only:
+each leg's status is posted, the overall `mindhive-ci` is not, and a partial
+run never merges.
+
+`--merge` merges a green PR, guarded: the PR must still be open, not a draft,
+and at the tested head; a base that moved is previewed again and a different
+merge is tested again (up to three rounds) unless `--allow-base-drift`; the
+merge is `gh pr merge N --merge --match-head-commit <head>`, and only GitHub
+reading back `MERGED` counts. The landed commit's tree is compared with the
+tested tree. How the merge went is `merge_state`, one word — `merged`,
+`refused`, `failed`, `unknown` (the run stopped inside `gh pr merge`, so the
+PR's state on GitHub says whether it landed) or `skipped` (no merge was asked
+for, or the verdict was not green) — and the why is `merge_reason`.
+
+Exit codes are for scripts and agents: `0` green; `1` red; `2` the check could
+not be made; `3` green, but `--merge` did not merge; `130` stopped by hand
+(Ctrl+C) — every leg it started is stopped, and a run that got as far as
+fetching is recorded as an error. A leg step whose command could not be
+started at all records exit `127`. Under `--json` stdout is JSON whatever
+happens: a refusal or a stop prints one object, `{"verdict": "error",
+"exit_code": N, "reason": "..."}`, beside the line on stderr, and each verb's
+`--help` ends with its exit codes. `hive ci status --gate premerge --pr N`
+reads the last run back with the time it was `recorded_at`; `--branch` picks a
+local branch's runs.
+
+To keep every open PR's verdict current, run the watch — by hand, or from a
+scheduled task you register yourself (MIND HIVE never registers one):
+
+```sh
+hive ci watch                  # loops; Ctrl+C to stop
+hive ci watch --once           # one pass, for a scheduled task
+schtasks /Create /TN "MindHive CI watch" /SC MINUTE /MO 30 /TR "<venv>\Scripts\hive.exe ci watch --once --root <repo> --project <namespace>"
+```
+
+Each pass tests a PR whose head moved; re-checks, with one `git merge-tree`, a
+PR whose base moved; tests again, once per head, a red that errors alone made;
+and posts again a verdict GitHub refused to take. Every action it reports has
+`pr`, `action`, `verdict`, `exit_code` and `detail`: `--once --json` prints the
+pass as one array, and a looping `--json` watch one JSON line per pass.
 
 ## Installing the hooks on a new machine
 The hooks are portable: nothing in `hooks/` names a user, a checkout, or a venv.

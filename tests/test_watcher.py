@@ -660,6 +660,13 @@ def test_hive_watcher_recover_honours_an_explicit_window(capsys):
     from mindhive.commands import verification as verif
     _append("one")
     claimed = watcher.BackgroundEmbeddingWatcher().claim()
+    # One second old: inside the default window, past an explicit 0. A claim
+    # made this instant is not reliably past 0: before 3.13, `time.time()` on
+    # Windows is coarser than the file's mtime stamp, and a fresh claim read
+    # as 0 s old, or less, in over half of 2000 tries on 3.11 and 3.12 (never
+    # on 3.14, whose `time.time()` is precise).
+    one_s_ago = time.time() - 1.0
+    os.utime(claimed, (one_s_ago, one_s_ago))
     verif.cmd_watcher_recover(_args(stale=0.0, json=False))
     capsys.readouterr()
     assert not claimed.exists(), "an explicit --stale 0 recovered nothing"

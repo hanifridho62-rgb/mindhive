@@ -55,7 +55,7 @@ import hashlib
 import re
 from dataclasses import dataclass, field, replace
 
-from . import events as ev_mod, paths
+from . import events as ev_mod, paths, verify
 
 # Outcome vocabulary. `landed` and `refused` are per-candidate; `truncated` and
 # `dry` are per-round facts about the round itself.
@@ -941,7 +941,7 @@ def iteration_outcome(ev) -> str:
     Split out of the fold so that "which events count as a verdict on injected
     work" has exactly one definition. A `verification` row is judged on its exit
     code, per `verify.py`'s own rule that the stamp attaches to the code and not
-    to the parsed counts."""
+    to the parsed counts. A PR's pre-merge verdict (`verify.is_pr_verdict`) is none."""
     etype = getattr(ev, "type", None)
     payload = getattr(ev, "payload", None)
     if etype == "tool_failed":
@@ -949,7 +949,7 @@ def iteration_outcome(ev) -> str:
     if etype == "loop_run_end" and isinstance(payload, dict) \
             and payload.get("reason") == "breaker_open":
         return "failed"
-    if etype == "verification" and isinstance(payload, dict):
+    if etype == "verification" and isinstance(payload, dict) and not verify.is_pr_verdict(payload):
         code = payload.get("exit_code")
         if isinstance(code, int) and not isinstance(code, bool):
             return "verified" if code == 0 else "failed"
@@ -1883,13 +1883,13 @@ def _passing_verification_ts(evs) -> str:
     `verified_by` stamp attaches to it and not to the counts, because an
     unparseable summary records counts absent rather than zero. So a run with a
     zero exit code and no parsed counts is a pass here, and a run with counts but
-    a non-zero exit code is not."""
+    a non-zero exit code is not. A PR's pre-merge verdict is no run of this tree."""
     newest = ""
     for ev in evs or []:
         if getattr(ev, "type", None) != "verification":
             continue
         p = getattr(ev, "payload", None)
-        if not isinstance(p, dict):
+        if not isinstance(p, dict) or verify.is_pr_verdict(p):
             continue
         code = p.get("exit_code")
         if isinstance(code, bool) or not isinstance(code, int) or code != 0:

@@ -47,6 +47,10 @@ _WS_TYPES = ev_mod.BOOKKEEPING_TYPES
 #: Spelled here rather than imported: `oversee` is on the dashboard's poll
 #: path and must not pull the runner in to read one string.
 _CI_SCOPE = "ci"
+#: `ci.premerge.GATE`, spelled here for the same reason. A pre-merge row is
+#: judged by its verdict, as `hive ci status` judges it: its exit 3 is a green
+#: run whose `--merge` did not happen.
+_PREMERGE_GATE = "premerge"
 
 _ACTIVITY_TYPES = {
     "session_start", "file_touched", "command_run", "user_prompt",
@@ -352,6 +356,7 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
             s["ci"] = {"exit_code": int(e.payload.get("exit_code") or 0),
                        "pr_id": int(e.payload.get("pr_id") or 0),
                        "gate": str(e.payload.get("gate") or ""),
+                       "verdict": str(e.payload.get("verdict") or ""),
                        "branch": str(e.payload.get("branch") or ""),
                        "ts": e.ts}
 
@@ -381,7 +386,8 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
         s["planned"] = s["planned"][-_DONE_CAP:]
         s["blockers"] = s["blockers"][-_DONE_CAP:]
         ci = s["ci"]
-        if ci and ci["exit_code"] != 0:
+        if ci and (ci["verdict"] != "green" if ci["gate"] == _PREMERGE_GATE
+                   else ci["exit_code"] != 0):
             # `failed` rather than a note on a running card: the gate that
             # decides whether work lands went red, and a card that still
             # reads "running" is telling the operator the opposite.
