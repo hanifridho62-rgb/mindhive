@@ -208,6 +208,17 @@ history and grouped by what each release window introduced. They summarise;
 
 ### Fixed
 
+- **`hive failures capture` takes the harvest lock.** `failures.capture_dir`
+  stamps each `tool_failed` row with the transcript line's own timestamp and
+  dedups against a snapshot taken before the walk, so the command run beside
+  the dashboard's auto-harvest sweep (which reaches the same `capture_dir`
+  under `harvest.catch_up`'s lock) was a second writer over one transcript
+  directory, minting byte-identical rows the append-only, hash-chained ledger
+  keeps for good. While a live harvester holds the lock the command now
+  answers `{"new_failures": 0, "files": 0, "locked": true}`, appends nothing
+  and exits 0, the way `hive harvest --catch-up` does; rerun once that pass
+  is over. The mutex is public as `harvest.harvest_lock` now, so every CLI
+  door to the writer holds the one `catch_up` holds.
 - **A harvest pass is never walked twice.** `harvest.lock` was an
   exclusive-create file with a 120 s stale age, and a pass over the live
   store can outlive that (every transcript in a directory is read end to end
