@@ -231,6 +231,13 @@ def _stream(argv, echo: bool, emit=None, env=None, cwd=None, timeout_s=None):
     finally:
         if timer is not None:
             timer.cancel()
+            # A kill already under way is let finish before anything reads
+            # `killed` or lets go of the tree. It ends the tree first and
+            # reports after, while the drain sees EOF the moment the child
+            # dies, so the check below could beat the report and answer the
+            # dead child's own exit code, 1 on Windows, for a run the cap had
+            # stopped. `terminate_process_tree` is bounded, so this wait is.
+            timer.join()
         driver.release_tree(proc)
     if killed:
         return TIMEOUT_EXIT, "".join(chunks), _cap_error(timeout_s, killed[0], abandoned)
