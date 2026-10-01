@@ -110,7 +110,10 @@ if rows:
 #: A WSL leg's whole job, fed to `bash -l -s -- ROOT SHA OBJECTS PY EXTRAS CAP
 #: <pytest args>` on stdin. OBJECTS is this machine's object store as git on
 #: Windows names it; `wslpath` turns it into the `/mnt/...` path Linux reads it
-#: through. A LOGIN shell, because uv's interpreters live in `~/.local/bin`,
+#: through. A path that is already POSIX is used as it is: run inside Linux
+#: itself, as `tests/test_ci_legrun.py` runs it on an ubuntu leg, the script
+#: was handed one, `wslpath -u` refused it and the leg read a failed checkout.
+#: A LOGIN shell, because uv's interpreters live in `~/.local/bin`,
 #: which only the login profile puts on PATH (measured). The body is one
 #: function called with `</dev/null`: bash reads a stdin script as it runs it,
 #: so without that a step that reads stdin -- pip, a test's child -- would eat
@@ -142,9 +145,12 @@ mhci_leg() {
     export MINDHIVE_HOME="$ROOT-home" PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1
     mkdir -p "$MINDHIVE_HOME" || mhci_fail home
     mhci_mark "step checkout: $SHA"
-    if command -v wslpath >/dev/null 2>&1; then
-        OBJECTS=$(wslpath -u "$OBJECTS") || mhci_fail checkout
-    fi
+    case "$OBJECTS" in
+        /*) ;;
+        *) if command -v wslpath >/dev/null 2>&1; then
+               OBJECTS=$(wslpath -u "$OBJECTS") || mhci_fail checkout
+           fi ;;
+    esac
     git -c init.defaultBranch=master init -q \
         && mkdir -p .git/objects/info \
         && printf '%s\n' "$OBJECTS" > .git/objects/info/alternates \

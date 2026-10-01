@@ -335,6 +335,24 @@ def test_the_verify_cap_calls_the_tree_kill_and_answers_timeout_exit(monkeypatch
     assert len(taken) == 1
 
 
+def test_the_verify_cap_answers_timeout_exit_however_late_the_kill_reports(monkeypatch):
+    """The kill ends the child first and reports after, on the timer's thread,
+    while the drain sees EOF the moment the child dies. A caller that read
+    `killed` before that report landed answered the killed child's own exit
+    code, 1 on Windows, for a run the cap had stopped: a loaded pre-merge leg
+    failed test_a_hung_gate_is_killed_at_its_cap with ``assert 1 == 124``."""
+    real = driver.terminate_process_tree
+
+    def late(proc):
+        took = real(proc)
+        time.sleep(1.0)              # the timer thread, descheduled after the kill
+        return took
+    monkeypatch.setattr(driver, "terminate_process_tree", late)
+    code, _, error = verify._stream(
+        [sys.executable, "-c", "import time; time.sleep(10)"], echo=False, timeout_s=0.2)
+    assert code == verify.TIMEOUT_EXIT and "0.2s cap" in error
+
+
 def test_the_verify_spawn_heads_its_own_group(monkeypatch):
     seen = {}
     real = subprocess.Popen
