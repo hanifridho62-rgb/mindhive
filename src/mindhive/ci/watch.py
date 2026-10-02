@@ -34,20 +34,176 @@ It never merges: that is `hive ci premerge N --merge`, asked for by name.
 sleeping `--interval` seconds between passes; a pass that fails is reported
 and the loop goes on. Each pass asks this machine again what it can run.
 
+One pass runs at a time in a namespace. A pass holds `state/ci_watch.lock` from
+its first step to its last, and a pass that finds it held does nothing else: one
+`skipped` action names the lock, its holder's pid and how long it has held it,
+and `--once` exits 0. A PR pushed after the running pass listed the open PRs
+waits for the next pass. The lock is a kernel byte-range lock (`PassLock`), for
+the harvest lock's reason: a pass has no bound -- one full run is most of an
+hour, and a scheduled `--once` may fire every half hour -- so no stale age is
+right, and a pid written in a file outlives its process (a reboot mid-pass, and
+the OS may hand it to anything). The OS lets go of a kernel lock when its
+process ends, however it ends, and the file it stands on is never removed; the
+pid in it only names the holder, and a record whose pid is gone names none. A
+holder past `STUCK_S`, half a day, makes that action an error and `--once` exit
+2 -- still no pass -- so a pass wedged on a child that never returns cannot keep
+every scheduled `--once` exiting 0. A loop holds the lock for each pass and not
+while it sleeps, so a scheduled `--once` can take its turn between. A lock that
+cannot be taken at all is an error and no pass: unlocked, two passes would spend
+an hour each on one head. `hive ci premerge` takes no part in it, so a merge
+asked for by name never waits behind a watch pass.
+
 Every action carries the same five keys -- `pr`, `action`, `verdict`,
 `exit_code` and `detail` -- so a script reads one shape; `--json` prints each
-pass's actions as one JSON line.
+pass's actions as one JSON line. An action about the pass rather than a PR has
+`pr` 0: the one a held lock makes -- `skipped`, or the error past `STUCK_S` --
+also has `lock`, `holder_pid` and `held_s` (None when the record names no live
+holder), and the error one a lock that cannot be taken makes has `lock`.
 """
+import os
 import time
+from pathlib import Path
 
+from .. import paths
+from ..core.locks import pid_alive
 from . import github as gh_mod
 from . import legs as legs_mod
 from . import premerge as premerge_mod
 from . import preview as preview_mod
 
-__all__ = ["DEFAULT_INTERVAL_S", "Watcher", "describe"]
+# The watch lock's mechanics are the harvest lock's: `msvcrt` on Windows, `fcntl`
+# everywhere else, both a real OS byte-range lock that the kernel releases when
+# its holder dies (`harvest.harvest_lock` says why a pass with no bound needs
+# one; `events._append_lock` holds the measurements).
+try:                                                    # pragma: no cover
+    import msvcrt
+    _flock = None
+except ImportError:                                     # pragma: no cover
+    msvcrt = None
+    import fcntl as _flock
+
+__all__ = ["DEFAULT_INTERVAL_S", "LOCK", "STUCK_S", "PassLock", "Watcher", "describe",
+           "holder", "lock_path"]
 
 DEFAULT_INTERVAL_S = 300.0
+#: The file a pass holds, in the namespace's `state/`. It is never removed.
+LOCK = "ci_watch.lock"
+#: How long a pass may hold the lock before the pass that finds it held calls it
+#: stuck: half a day, where one full run is most of an hour. Past it the finding
+#: is an error, not a skip -- still no pass, since the lock is held.
+STUCK_S = 12 * 3600
+#: The holder's record -- `<pid> <epoch seconds>`, padded with spaces -- fills
+#: this many bytes at the head of the lock file, and the byte locked is the one
+#: after them: Windows refuses a read that reaches a byte another handle locked.
+_RECORD = 64
+
+
+def lock_path(project=None):
+    """Where the watch lock of *project* stands."""
+    return paths.state_dir(project) / LOCK
+
+
+def _lock_byte(fd) -> None:
+    """Lock the byte after the record on *fd*, never waiting. An `OSError`
+    when it cannot be had: `BlockingIOError` (POSIX) or `PermissionError`
+    (Windows) when another holder has it, anything else for a real fault."""
+    if msvcrt is not None:
+        os.lseek(fd, _RECORD, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        _flock.flock(fd, _flock.LOCK_EX | _flock.LOCK_NB)
+
+
+def _unlock_byte(fd) -> None:
+    try:
+        if msvcrt is not None:
+            os.lseek(fd, _RECORD, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            _flock.flock(fd, _flock.LOCK_UN)
+    except OSError:
+        pass
+
+
+def _record(fd, text) -> None:
+    """Write *text* as the holder's record. Best effort: the record says who
+    holds the lock and since when; it never decides whether anyone does."""
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, text.encode("ascii").ljust(_RECORD)[:_RECORD])
+    except OSError:
+        pass
+
+
+class PassLock:
+    """The lock a watch pass holds: a kernel byte-range lock on *path*, taken
+    without waiting and let go of by the OS when its process ends, however it
+    ends -- so there is no stale age to get wrong, and no pid to outlive its
+    process. The file is never removed: on POSIX `flock` binds to the inode, and
+    a fresh file would be a second lock. Every taker opens a descriptor of its
+    own, so two passes in one process contend as two processes do."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self._fd = None
+
+    def take(self) -> bool:
+        """True when this process now holds the lock, False when another
+        holder has it. An `OSError` when the file cannot be opened, or locked
+        for any other reason."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(self.path), os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0),
+                     0o666)
+        try:
+            _lock_byte(fd)
+        except (BlockingIOError, PermissionError):      # held: EWOULDBLOCK, EACCES
+            os.close(fd)
+            return False
+        except OSError:
+            os.close(fd)
+            raise
+        self._fd = fd
+        _record(fd, f"{os.getpid()} {int(time.time())}")
+        return True
+
+    def release(self) -> None:
+        """Let go: the record blanked, the byte unlocked, the file closed. A
+        lock not held is let go of as nothing."""
+        fd, self._fd = self._fd, None
+        if fd is None:
+            return
+        _record(fd, "")
+        _unlock_byte(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def holder(path) -> tuple:
+    """`(pid, held_s)` from the record at *path*: who holds the lock, and for
+    how many seconds. Both None when it cannot be read -- a holder that has not
+    written it yet, a lock let go of, no file -- or when the pid it names is no
+    longer alive: a pass that died leaves its record until the next holder
+    writes its own, and the OS may since have handed that pid to anything."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    except OSError:
+        return None, None
+    try:
+        head = os.read(fd, _RECORD)                     # the record alone: see _RECORD
+    except OSError:
+        return None, None
+    finally:
+        os.close(fd)
+    fields = head.split()
+    if len(fields) != 2 or not all(f.isdigit() for f in fields) or not int(fields[0]):
+        return None, None
+    pid = int(fields[0])
+    if not pid_alive(pid):
+        return None, None
+    return pid, max(0, int(time.time()) - int(fields[1]))
+
 
 #: A verdict's exit code, as `hive ci premerge` exits on it.
 _EXIT = {"green": 0, "red": 1, "error": 2}
@@ -86,6 +242,25 @@ def describe(action) -> str:
     return f"{subject}: could not check -- {detail}"
 
 
+def _held(path) -> dict:
+    """The one action of a pass that found the watch lock held: skipped,
+    naming the lock, its holder's pid and how long it has held it -- or, past
+    `STUCK_S`, an error with the same keys."""
+    pid, held_s = holder(path)
+    detail = (f"another watch pass holds {path}" + (f", pid {pid}" if pid else "")
+              + (f", for {held_s}s" if held_s is not None else ""))
+    if held_s is not None and held_s > STUCK_S:
+        return _act(0, "error", "error", f"{detail}: past {STUCK_S}s, it looks stuck",
+                    lock=str(path), holder_pid=pid, held_s=held_s)
+    return _act(0, "skipped", detail=detail, lock=str(path), holder_pid=pid, held_s=held_s)
+
+
+def _untaken(path, exc) -> dict:
+    """The one action of a pass that could not take the watch lock at all."""
+    return _act(0, "error", "error", f"the watch lock {path or LOCK} could not be taken: {exc}",
+                lock=None if path is None else str(path))
+
+
 class Watcher:
     """Passes over the open PRs through one `premerge.Premerge`."""
 
@@ -106,7 +281,27 @@ class Watcher:
                                                 run=premerge.spawn))
 
     def once(self) -> list:
-        """One pass. Returns what it did, one action per open PR."""
+        """One pass. Returns what it did, one action per open PR -- or, when
+        the watch lock is held or cannot be taken, the one action that says
+        so, and nothing else is done."""
+        path = None
+        try:
+            path = lock_path(self.project)
+            lock = PassLock(path)
+            held = lock.take()
+        except OSError as exc:
+            held, action = False, _untaken(path, exc)
+        else:
+            action = None if held else _held(path)
+        if not held:
+            self._say(describe(action))
+            return [action]
+        try:
+            return self._pass()
+        finally:
+            lock.release()
+
+    def _pass(self) -> list:
         # Asked again each pass: a WSL too cold to answer the last pass's
         # probe inside its cap may answer this one.
         forget = getattr(getattr(self.premerge, "probe", None), "forget", None)

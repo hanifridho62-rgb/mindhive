@@ -4,9 +4,17 @@
 `Premerge` and gh are fakes; the sidecar is the real one in the test's own
 store, because what `watch` decides is a function of what `premerge` last
 remembered."""
+import errno
+import os
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
 import pytest
 
-from mindhive import events
+from mindhive import events, paths
 from mindhive.ci import github as gh_mod
 from mindhive.ci import premerge, watch
 
@@ -25,8 +33,10 @@ class FakeGitHub:
         self.prs = list(prs if prs is not None else [pr()])
         self.fail = list(fail or [])
         self.statuses = []
+        self.listed = 0
 
     def open_prs(self):
+        self.listed += 1
         if self.fail:
             raise self.fail.pop(0)
         return [dict(p) for p in self.prs]
@@ -368,3 +378,306 @@ def test_each_pass_asks_this_machine_again_what_it_can_run():
     w.once()
     w.once()
     assert forgot == ["forgot", "forgot"]
+
+
+# --- one pass at a time ----------------------------------------------------------------
+
+
+# Another process, holding the watch lock as a pass would until its stdin closes,
+# then ending as a crash ends one: no release, no cleanup. Told `idle`, it holds
+# nothing and only lives.
+_HOLDER = ("import os, sys\n"
+           "from mindhive.ci import watch\n"
+           "lock = watch.PassLock(sys.argv[1])\n"
+           "print(lock.take() if sys.argv[2] == 'hold' else 'idle', os.getpid(), flush=True)\n"
+           "sys.stdin.read()\n"
+           "os._exit(0)\n")
+
+
+class OtherPass:
+    """A pass in another process, mid-run -- or, with *hold* False, a live
+    process that holds nothing. Its pid is the one it reports: on Windows a
+    venv's python.exe is a launcher, whose pid is not the interpreter's."""
+
+    def __init__(self, path, hold=True):
+        src = str(Path(watch.__file__).resolve().parents[2])
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(
+            p for p in (src, os.environ.get("PYTHONPATH")) if p)}
+        self.proc = subprocess.Popen([sys.executable, "-c", _HOLDER, str(path),
+                                      "hold" if hold else "idle"], env=env,
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     text=True)
+        said = self.proc.stdout.readline().split()
+        if said[:1] != (["True"] if hold else ["idle"]):
+            self.end()
+            raise AssertionError(f"the other process did not start as asked: {said!r}")
+        self.pid = int(said[1])
+
+    def end(self):
+        """End it as a crash would: it lets go of nothing itself."""
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=60)
+        finally:
+            if self.proc.poll() is None:
+                self.proc.kill()
+                self.proc.wait()
+            self.proc.stdout.close()
+
+
+def eventually(check, within_s=5.0):
+    """Whether *check* comes true inside *within_s* seconds. The OS lets go of
+    a dead process's lock on its own schedule, a millisecond or two here; five
+    seconds leaves room for a loaded machine and none for a stale age like the
+    30 s and 60 s that file locks keep."""
+    deadline = time.monotonic() + within_s
+    while not check():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+def write_record(path, pid, age_s):
+    """Write a holder's record into *path*, *age_s* seconds old, through a
+    descriptor of the test's own: the record's bytes stay writable while the
+    byte after them is locked."""
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | getattr(os, "O_BINARY", 0))
+    try:
+        os.write(fd, f"{pid} {int(time.time()) - age_s}".encode("ascii").ljust(64))
+    finally:
+        os.close(fd)
+
+
+def identity(path):
+    """Which file *path* is: a lock file removed and made again is another."""
+    st = os.stat(path)
+    return st.st_dev, st.st_ino
+
+
+def a_dead_pid():
+    """The pid of a process that has ended, as it reported it."""
+    proc = subprocess.Popen([sys.executable, "-c", "import os; print(os.getpid())"],
+                            stdout=subprocess.PIPE, text=True)
+    out, _ = proc.communicate(timeout=60)
+    return int(out)
+
+
+def test_a_pass_that_finds_another_still_running_does_nothing_and_names_it():
+    gh = FakeGitHub()
+    pm = FakePremerge(gh)
+    w, said = watcher(pm)
+    path = watch.lock_path("test")
+    other = OtherPass(path)
+    try:
+        [action] = w.once()
+    finally:
+        other.end()
+    held_s = action.get("held_s")
+    assert other.pid != os.getpid() and isinstance(held_s, int) and 0 <= held_s < 600
+    detail = f"another watch pass holds {path}, pid {other.pid}, for {held_s}s"
+    assert action == {"pr": 0, "action": "skipped", "verdict": None, "exit_code": None,
+                      "detail": detail, "lock": str(path), "holder_pid": other.pid,
+                      "held_s": held_s}
+    assert (gh.listed, pm.runs, pm.fetches) == (0, [], [])
+    assert said == [f"watch: skipped ({detail})"]
+
+
+def test_a_live_pass_keeps_the_lock_however_long_it_has_held_it():
+    # No age frees it: a pass two hours in is a pass that is running.
+    path = watch.lock_path("test")
+    other = OtherPass(path)
+    try:
+        write_record(path, other.pid, 7200)
+        pm = FakePremerge(FakeGitHub())
+        [action] = watcher(pm)[0].once()
+    finally:
+        other.end()
+    assert (action["action"], action["holder_pid"], pm.runs) == ("skipped", other.pid, [])
+    assert 7200 <= action["held_s"] < watch.STUCK_S
+
+
+def test_a_pass_held_past_any_honest_run_is_an_error_and_still_no_pass():
+    # A pass wedged on a child that never returns holds the lock for ever; a
+    # skip would keep every scheduled --once exiting 0 over a watch that stopped.
+    path = watch.lock_path("test")
+    other = OtherPass(path)
+    try:
+        write_record(path, other.pid, watch.STUCK_S + 60)
+        gh = FakeGitHub()
+        pm = FakePremerge(gh)
+        w, said = watcher(pm)
+        [action] = w.once()
+    finally:
+        other.end()
+    held_s = action["held_s"]
+    assert watch.STUCK_S + 60 <= held_s < watch.STUCK_S + 660
+    detail = (f"another watch pass holds {path}, pid {other.pid}, for {held_s}s: "
+              f"past {watch.STUCK_S}s, it looks stuck")
+    assert action == {"pr": 0, "action": "error", "verdict": "error", "exit_code": 2,
+                      "detail": detail, "lock": str(path), "holder_pid": other.pid,
+                      "held_s": held_s}
+    assert (gh.listed, pm.runs) == (0, [])
+    assert said == [f"watch: could not check -- {detail}"]
+
+
+def test_a_record_a_dead_pass_left_names_no_holder():
+    # The next holder has not written its own yet: the skip must not send anyone
+    # after a pid that is gone, or that the OS has since handed to something else.
+    path = watch.lock_path("test")
+    other = OtherPass(path)
+    try:
+        write_record(path, a_dead_pid(), watch.STUCK_S + 60)
+        [action] = watcher(FakePremerge(FakeGitHub()))[0].once()
+    finally:
+        other.end()
+    assert action == {"pr": 0, "action": "skipped", "verdict": None, "exit_code": None,
+                      "detail": f"another watch pass holds {path}", "lock": str(path),
+                      "holder_pid": None, "held_s": None}
+
+
+def test_a_pass_that_died_holding_the_lock_leaves_none_behind_however_fresh():
+    path = watch.lock_path("test")
+    OtherPass(path).end()                   # died mid-pass, a moment ago
+    before = identity(path)                 # the file stays, by design; the lock does not
+    pm = FakePremerge(FakeGitHub())
+    w, _ = watcher(pm)
+    assert eventually(lambda: w.once()[0]["action"] != "skipped")
+    assert pm.runs == [(151, None, False)] and identity(path) == before
+
+
+def test_a_lock_file_naming_a_live_process_that_holds_nothing_stops_nothing():
+    # A reboot mid-pass leaves the file naming a pid the OS may since have given
+    # to an unrelated live process. The record names a holder; only the lock decides.
+    path = watch.lock_path("test")
+    live = OtherPass(path, hold=False)
+    try:
+        write_record(path, live.pid, 7200)
+        pm = FakePremerge(FakeGitHub())
+        actions = watcher(pm)[0].once()
+    finally:
+        live.end()
+    assert [a["action"] for a in actions] == ["tested"] and pm.runs == [(151, None, False)]
+
+
+def test_two_passes_never_overlap():
+    started, finish = threading.Event(), threading.Event()
+    first_pm = FakePremerge(FakeGitHub())
+    run_pr = first_pm.run_pr
+
+    def parked(number, **kw):                   # the first pass, mid-run
+        started.set()
+        finish.wait(60)
+        return run_pr(number, **kw)
+    first_pm.run_pr = parked
+    first, _ = watcher(first_pm)
+    done = []
+    thread = threading.Thread(target=lambda: done.append(first.once()))
+    thread.start()
+    try:
+        assert started.wait(60)
+        second_pm = FakePremerge(FakeGitHub())
+        [action] = watcher(second_pm)[0].once()
+    finally:
+        finish.set()
+        thread.join(60)
+    assert (action["action"], action["holder_pid"]) == ("skipped", os.getpid())
+    assert second_pm.runs == [] and [a["action"] for a in done[0]] == ["tested"]
+    assert watch.holder(watch.lock_path("test")) == (None, None)    # let go, record blanked
+
+
+def test_a_loop_lets_go_of_the_lock_while_it_sleeps():
+    path = watch.lock_path("test")
+    free = []
+
+    def sleeping(seconds):                      # a scheduled --once, between two passes
+        lock = watch.PassLock(path)
+        free.append(lock.take())
+        lock.release()
+    w, _ = watcher(FakePremerge(FakeGitHub()), sleep=sleeping)
+    assert w.loop(passes=2) == 2
+    assert free == [True]
+
+
+def test_a_loop_that_finds_the_lock_held_skips_each_such_pass_and_goes_on():
+    other = OtherPass(watch.lock_path("test"))
+    reports = []
+    try:
+        pm = FakePremerge(FakeGitHub())
+        w, _ = watcher(pm, sleep=lambda seconds: None)
+        assert w.loop(passes=2, report=reports.append) == 2
+    finally:
+        other.end()
+    assert [[a["action"] for a in r] for r in reports] == [["skipped"], ["skipped"]]
+    assert pm.runs == []
+
+
+def test_a_pass_lets_go_of_the_lock_however_it_ends():
+    pm = FakePremerge(FakeGitHub(fail=[RuntimeError("gh exploded")]))
+    w, _ = watcher(pm)
+    path = watch.lock_path("test")
+    with pytest.raises(RuntimeError):
+        w.once()
+    before = identity(path)
+    assert watch.holder(path) == (None, None)
+    assert w.once()[0]["action"] == "tested"        # the next pass is not shut out
+    assert identity(path) == before                 # let go of, never removed
+
+
+def test_a_holder_that_has_not_written_its_record_yet_still_holds():
+    path = watch.lock_path("test")
+    lock = watch.PassLock(path)
+    assert lock.take()
+    try:
+        fd = os.open(str(path), os.O_WRONLY | getattr(os, "O_BINARY", 0))
+        try:
+            os.write(fd, b"?" * 32)             # over a record no holder has finished
+        finally:
+            os.close(fd)
+        [action] = watcher(FakePremerge(FakeGitHub()))[0].once()
+    finally:
+        lock.release()
+    assert action == {"pr": 0, "action": "skipped", "verdict": None, "exit_code": None,
+                      "detail": f"another watch pass holds {path}", "lock": str(path),
+                      "holder_pid": None, "held_s": None}
+
+
+def test_the_lock_is_the_namespaces_own():
+    assert watch.lock_path("test") == paths.state_dir("test") / watch.LOCK
+    elsewhere = watch.PassLock(watch.lock_path("other"))
+    assert elsewhere.take()
+    try:
+        here, there = FakePremerge(FakeGitHub()), FakePremerge(FakeGitHub())
+        there.project = "other"
+        assert [a["action"] for a in watcher(here)[0].once()] == ["tested"]
+        assert [a["action"] for a in watcher(there)[0].once()] == ["skipped"]
+    finally:
+        elsewhere.release()
+
+
+def test_a_lock_that_cannot_be_taken_is_an_error_and_no_pass():
+    namespace = paths.project_dir("test")
+    namespace.mkdir(parents=True, exist_ok=True)
+    (namespace / "state").write_text("a file where the state directory belongs",
+                                     encoding="utf-8")
+    gh = FakeGitHub()
+    pm = FakePremerge(gh)
+    w, said = watcher(pm)
+    [action] = w.once()
+    assert (action["pr"], action["action"], action["verdict"], action["exit_code"],
+            action["lock"]) == (0, "error", "error", 2, None)
+    assert action["detail"].startswith("the watch lock ci_watch.lock could not be taken: ")
+    assert (gh.listed, pm.runs) == (0, [])
+    assert said == [f"watch: could not check -- {action['detail']}"]
+
+
+def test_a_lock_the_os_refuses_for_another_reason_is_an_error_not_a_skip(monkeypatch):
+    def refused(fd):
+        raise OSError(errno.ENOLCK, "No locks available")
+    monkeypatch.setattr(watch, "_lock_byte", refused)
+    pm = FakePremerge(FakeGitHub())
+    w, _ = watcher(pm)
+    [action] = w.once()
+    assert (action["action"], action["verdict"], action["exit_code"], action["lock"]) == (
+        "error", "error", 2, str(watch.lock_path("test")))
+    assert "No locks available" in action["detail"] and pm.runs == []

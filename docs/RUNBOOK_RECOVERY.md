@@ -232,7 +232,11 @@ exists again.
 ## Scenario 4 — a lock looks stuck
 
 **How you notice.** A command waits, or reports a lock timeout. A harvest
-silently does nothing because another holds `harvest.lock`.
+silently does nothing because another holds `harvest.lock`. A `hive ci watch`
+pass prints `skipped (another watch pass holds ...)` and does nothing, because
+another pass holds `ci_watch.lock`. Past 12 hours it prints
+`could not check -- ... it looks stuck` and exits 2 instead: find the process
+by the pid it names and stop it if it is wedged.
 
 **What to know before deleting anything.** Every lock recovers on its own. A lock
 is either released by the kernel when its holder dies, or taken over once it is
@@ -245,12 +249,14 @@ Manager, or `ps aux | grep mindhive`. Stop it if it is wedged.
 |---|---|---|---|
 | `append.lock` | `<ns>/` | a kernel byte-range lock (`msvcrt.locking` / `fcntl.flock`) on a file that stays on disk **by design** | the OS releases it with the process. A waiter tries for 10 s (`events._LOCK_WAIT_S`) and then appends **unlocked**, rather than lose the event. There is no stale age because none is needed; deleting the file achieves nothing |
 | `harvest.lock` | `<store>/` | a kernel byte-range lock, exactly as `append.lock`, on a file that stays on disk **by design** | the OS releases it with the process. A second harvester skips its pass rather than waiting. There is no stale age: a leftover file from a dead harvester blocks nothing, and deleting the file achieves nothing |
+| `ci_watch.lock` | `<ns>/state/` | a kernel byte-range lock, as `harvest.lock`, on a file that stays on disk **by design**; its first 64 bytes name the holder and since when, which the skip prints (`type` and editors cannot read the file while it is held, since they read past them) | the OS releases it with the process. A second watch pass skips rather than waiting (exit 0), naming the holder's pid and how long it has held it; past 12 hours that is an error (exit 2) and still no pass. There is no stale age. Never delete the file: Windows refuses while it is held, and on POSIX a new file would let a second pass run beside the live one |
 | `chroma.lock` | `<ns>/` | `core.locks.file_lock` | waits up to 30 s; older than 600 s it is taken over (a cold model load plus a first index really takes minutes) |
 | `.tasktool.lock` | `<ns>/` | `tasktool.task_lock` | 15 s timeout; older than 60 s it is stolen; a Windows delete-pending `PermissionError` counts as contention (20 spins) |
 | `task_tools.json.lock` | beside the task sidecar | exclusive-create file | waits 2 s, then writes unlocked; older than 30 s it is stale |
 | `.worksession.lock` | `<ns>/` | `core.locks` | 15 s timeout; older than 10 s it is stale |
 | `.storage.lock` | `<ns>/` | `core.locks` | 5 s timeout; older than 60 s it is stale |
 | `integration_breaker.lock` | `<ns>/state/` | `core.locks`, fail-open | 5 s timeout; older than 60 s it is stale |
+| `ci_premerge.json.lock` | `<ns>/state/` | `core.locks` | 10 s timeout, then that write to `ci_premerge.json` is not made and the sidecar keeps what it had; older than 60 s with its holder's process gone it is stale |
 | `rules/incidents/.write.lock` | `<ns>/` | exclusive-create file | waits 30 s, then writes unlocked; older than 60 s it is stolen |
 | `rules/.reflect.lock` | `<ns>/` | the reflection gate | older than 600 s it is stale |
 | any other `core.locks` lock | | `core.locks.LockPolicy` defaults | 2 s timeout, 10–50 ms jittered backoff; older than 30 s with its holder's process gone it is stale (the file carries `<pid> <clock>`; a live holder keeps it at any age, and a pid the OS reused for an unrelated live process holds it until that process exits or the file is removed by hand) |
@@ -276,8 +282,13 @@ the code:
   store can outlive that, so the scheduled task could take a live harvester's
   lock mid-pass and walk the same cursor window, which appended the same rows
   twice, byte for byte (`harvest.harvest_lock` tells the whole story).
+- `ci_watch.lock` is a kernel lock for the same reason (2026-10-02): a watch
+  pass has no bound, one full run is most of an hour, so any stale age would
+  let a second pass test the same heads beside a live one. Its age decides only
+  how a skip is reported: past 12 hours, as an error.
 - 60 s is the stale age of `.tasktool.lock`, `.storage.lock`,
-  `integration_breaker.lock` and the incidents write lock.
+  `integration_breaker.lock`, `ci_premerge.json.lock` and the incidents write
+  lock.
 - Every other lock has its own age, as in the table above.
 
 ## Scenario 5 — the Postgres mirror disagrees with the ledger
