@@ -25,13 +25,8 @@ def dashboard_server():
     token = "test-token-123"
     handler = dashboard.make_handler(token)
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    import threading
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    port = server.server_address[1]
-    try:
-        yield f"http://127.0.0.1:{port}", token
-    finally:
-        server.shutdown()
+    with serve_in_thread(server):
+        yield f"http://127.0.0.1:{server.server_address[1]}", token
 
 
 def _get(base, path, token=None):
@@ -2227,6 +2222,8 @@ def test_reflect_unexpected_error_becomes_a_failed_job(dashboard_server,
 # /api/improvements efficiency stats + per-lesson enrichment
 # --------------------------------------------------------------------------
 import time as time_mod
+
+from tests.serving import serve_in_thread
 
 
 def _iso_ago(seconds):

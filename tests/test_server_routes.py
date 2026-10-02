@@ -19,7 +19,6 @@ the base classes are untouched, that a plain `hive dashboard` page carries no
 heartbeat at all, and that the guards really do still apply to the new routes.
 """
 import json
-import threading
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
@@ -31,6 +30,8 @@ from mindhive.dashboard_page import render_page
 from mindhive.server.lifecycle import HeartbeatMonitor
 from mindhive.server.routes import LifecycleRoutes, with_lifecycle
 
+from tests.serving import serve_in_thread
+
 TOKEN = "test-token-lifecycle"
 
 
@@ -40,11 +41,8 @@ def ui():
     monitor = HeartbeatMonitor()
     handler = with_lifecycle(dashboard.make_handler(TOKEN), monitor)
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    try:
+    with serve_in_thread(httpd):
         yield f"http://127.0.0.1:{httpd.server_address[1]}", monitor, handler
-    finally:
-        httpd.shutdown()
 
 
 def _get(base, path, token=None, timeout=10.0):

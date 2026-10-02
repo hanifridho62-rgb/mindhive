@@ -29,6 +29,8 @@ from mindhive import advice, claude_cli, events, sop, sopgate
 from mindhive.mindnet import advice as mn_advice
 from mindhive.mindnet import executor
 
+from tests.serving import serve_in_thread
+
 SECRET, TOKEN = advice.SECRET_ENV, advice.TOKEN_ENV
 BODY = "Read the file before editing it, then run the whole suite."
 AGENT = "mn9-T-14"
@@ -762,14 +764,12 @@ def _post_sop(tags="style," + advice.VALIDATED_TAG):
 
 
 def _post_body(body):
-    import threading
     import urllib.request
     from http.server import ThreadingHTTPServer
 
     from mindhive import dashboard
     server = ThreadingHTTPServer(("127.0.0.1", 0), dashboard.make_handler("t"))
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    try:
+    with serve_in_thread(server):
         data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(
             f"http://127.0.0.1:{server.server_address[1]}/api/append?token=t",
@@ -777,8 +777,6 @@ def _post_body(body):
             headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read().decode("utf-8"))
-    finally:
-        server.shutdown()
         server.server_close()
 
 

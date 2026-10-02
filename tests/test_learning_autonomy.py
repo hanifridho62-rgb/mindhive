@@ -10,6 +10,8 @@ import json
 from mindhive import (dashboard, enforce, events, harvest, incidents, plugins,
                       projector, reflect)
 
+from tests.serving import serve_in_thread
+
 
 def _fail(sig, session, ts, text="boom"):
     events.append_event("tool_failed",
@@ -329,14 +331,12 @@ def test_skills_stats_endpoint_aggregates_hive_mind():
     events.append_event("invoke_result", {"name": "circle", "ok": True,
                                           "text": "ok"},
                         session_id="s1", tags=["invoke"], project="test")
-    import threading
     from http.server import ThreadingHTTPServer
     import urllib.request
     handler = dashboard.make_handler("tok")
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_address[1]
-    try:
+    with serve_in_thread(server):
         def get(path):
             with urllib.request.urlopen(
                     f"http://127.0.0.1:{port}{path}&token=tok", timeout=5) as r:
@@ -348,8 +348,6 @@ def test_skills_stats_endpoint_aggregates_hive_mind():
         assert get("/api/skills/status?project=*")["counts"] == {"circle": 1}
         hist = get("/api/skills/history?project=*&name=circle")
         assert len(hist) == 1 and hist[0]["ok"] is True
-    finally:
-        server.shutdown()
 
 
 # --- failures: bare-exit-code noise filter ----------------------------------------

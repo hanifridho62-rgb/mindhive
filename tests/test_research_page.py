@@ -5,7 +5,6 @@ against a real dashboard server with the controller swapped for a test-wired
 instance (mock trainer + stubbed agent — no WSL, GPU, or CLI)."""
 import json
 import sys
-import threading
 import time
 import urllib.request
 from http.server import ThreadingHTTPServer
@@ -16,6 +15,8 @@ import pytest
 from mindhive import dashboard, research
 from mindhive.research_page import render_research
 from mindhive.dashboard_page import render_page
+
+from tests.serving import serve_in_thread
 
 MOCK = Path(__file__).resolve().parents[1] / "scripts" / "self_reliant" / "mock_trainer.py"
 PAGE = render_research("tok-123")
@@ -201,7 +202,6 @@ def server(tmp_path):
     token = "test-token-123"
     handler = dashboard.make_handler(token)
     srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
 
     class StubResearcher:
         def turn(self, prompt):
@@ -222,13 +222,13 @@ def server(tmp_path):
         cap_s=10, turn_timeout_s=5)
     old = research.CONTROLLER
     research.CONTROLLER = ctl
-    try:
-        yield f"http://127.0.0.1:{srv.server_address[1]}", token, ctl
-    finally:
-        ctl.stop()
-        ctl.wait(10)
-        research.CONTROLLER = old
-        srv.shutdown()
+    with serve_in_thread(srv):
+        try:
+            yield f"http://127.0.0.1:{srv.server_address[1]}", token, ctl
+        finally:
+            ctl.stop()
+            ctl.wait(10)
+            research.CONTROLLER = old
 
 
 def _get(base, path, token):

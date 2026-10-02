@@ -7,7 +7,6 @@ page test alone would pass against an API that never sends the field, and an API
 test alone would pass against a page that never draws it.
 """
 import json
-import threading
 import urllib.request
 from http.server import ThreadingHTTPServer
 
@@ -15,6 +14,8 @@ import pytest
 
 from mindhive import dashboard, events, replenish_sinks, roadmap
 from mindhive.replenish import Candidate
+
+from tests.serving import serve_in_thread
 
 SID = "sess-dash-01"
 
@@ -24,11 +25,8 @@ def server():
     token = "test-token-123"
     handler = dashboard.make_handler(token)
     srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    try:
+    with serve_in_thread(srv):
         yield f"http://127.0.0.1:{srv.server_address[1]}", token
-    finally:
-        srv.shutdown()
 
 
 def _get(base, path, token=None):

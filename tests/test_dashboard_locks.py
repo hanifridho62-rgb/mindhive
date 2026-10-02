@@ -31,6 +31,8 @@ import pytest
 from mindhive import (dashboard, dashboard_get, dashboard_jobs,
                       dashboard_memo, dedupe, events, jobs, paths, taskview)
 
+from tests.serving import serve_in_thread
+
 # Patch targets are the module that OWNS the name, not the one that re-exports
 # it. `dashboard` still exposes the locks and memos (same objects), but the code
 # under test reads `run_catch_up` and `time` from the modules imported above, and
@@ -81,11 +83,8 @@ def dashboard_server():
     whole point is one request arriving while another is still running."""
     token = "test-token-123"
     server = ThreadingHTTPServer(("127.0.0.1", 0), dashboard.make_handler(token))
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    try:
+    with serve_in_thread(server):
         yield f"http://127.0.0.1:{server.server_address[1]}", token
-    finally:
-        server.shutdown()
 
 
 def _post(base, path, payload, token):
@@ -2020,11 +2019,8 @@ def lock_watching_server():
                 self.wfile = real
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Watching)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    try:
+    with serve_in_thread(server):
         yield f"http://127.0.0.1:{server.server_address[1]}", token, seen
-    finally:
-        server.shutdown()
 
 
 def test_guarded_route_has_released_its_lock_before_it_answers(
@@ -2187,11 +2183,10 @@ def corner_server():
             return super().do_GET()
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Corners)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        yield f"http://127.0.0.1:{server.server_address[1]}", token, seen
+        with serve_in_thread(server):
+            yield f"http://127.0.0.1:{server.server_address[1]}", token, seen
     finally:
-        server.shutdown()
         for lk in (_PROBE_OUTER, _PROBE_INNER):
             if lk.locked():
                 lk.release()
