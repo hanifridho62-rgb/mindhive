@@ -3,12 +3,14 @@
 codes and output. The modules behind the verbs are swapped for fakes at the
 names the handlers look up, so what runs here is the handler and argparse."""
 import json
+import os
+import time
 from types import SimpleNamespace
 
 import pytest
 
 from mindhive import __main__ as cli_mod
-from mindhive import events
+from mindhive import events, paths
 from mindhive.ci import cli as ci_cli
 from mindhive.ci import github as gh_mod
 from mindhive.ci import legrun, legs, premerge, premerge_cli, preview, watch
@@ -39,6 +41,7 @@ class Recorder:
 
         class _Premerge:
             spawn = "the-spawn"
+            project = None
             github = SimpleNamespace(open_prs=lambda: [dict(p) for p in outer.prs])
 
             def run_pr(self, n, **kw):
@@ -184,6 +187,64 @@ def test_watch_once_exits_by_the_verdicts_it_saw(monkeypatch, tmp_path, actions,
     assert run("watch", "--once", "--skip-drafts", "--interval", "9",
                "--root", str(tmp_path)) == code
     assert (built[0]["skip_drafts"], built[0]["interval_s"]) == (True, 9.0)
+
+
+_OPEN = [{"number": 151, "state": "OPEN", "isDraft": False, "isCrossRepository": False,
+          "headRefName": "claude/f151", "headRefOid": "2" * 40, "baseRefName": "master"}]
+
+
+def test_watch_once_finding_another_pass_running_does_nothing_and_exits_0(
+        monkeypatch, tmp_path, capsys):
+    rec = Recorder(prs=_OPEN)
+    monkeypatch.setattr(premerge, "Premerge", rec)
+    path = watch.lock_path("test")
+    other = watch.PassLock(path)
+    assert other.take()
+    try:
+        code = run("watch", "--once", "--json", "--root", str(tmp_path))
+    finally:
+        other.release()
+    [action] = json.loads(capsys.readouterr().out)
+    assert (code, rec.calls) == (0, [])
+    assert (action["pr"], action["action"], action["lock"], action["holder_pid"]) == (
+        0, "skipped", str(path), os.getpid())
+
+
+def test_watch_once_whose_lock_cannot_be_taken_exits_2_and_tests_nothing(
+        monkeypatch, tmp_path, capsys):
+    rec = Recorder(prs=_OPEN)
+    monkeypatch.setattr(premerge, "Premerge", rec)
+    namespace = paths.project_dir("test")
+    namespace.mkdir(parents=True, exist_ok=True)
+    (namespace / "state").write_text("a file where the state directory belongs",
+                                     encoding="utf-8")
+    assert run("watch", "--once", "--json", "--root", str(tmp_path)) == 2
+    [action] = json.loads(capsys.readouterr().out)
+    assert (action["action"], action["exit_code"], action["lock"], rec.calls) == (
+        "error", 2, None, [])
+
+
+def test_watch_once_finding_a_pass_held_past_any_honest_run_exits_2(
+        monkeypatch, tmp_path, capsys):
+    rec = Recorder(prs=_OPEN)
+    monkeypatch.setattr(premerge, "Premerge", rec)
+    path = watch.lock_path("test")
+    other = watch.PassLock(path)
+    assert other.take()
+    try:
+        fd = os.open(str(path), os.O_WRONLY | getattr(os, "O_BINARY", 0))
+        try:
+            os.write(fd, f"{os.getpid()} {int(time.time()) - watch.STUCK_S - 60}"
+                     .encode("ascii").ljust(64))
+        finally:
+            os.close(fd)
+        code = run("watch", "--once", "--json", "--root", str(tmp_path))
+    finally:
+        other.release()
+    [action] = json.loads(capsys.readouterr().out)
+    assert (code, rec.calls) == (2, [])
+    assert (action["action"], action["exit_code"], action["lock"], action["holder_pid"]) == (
+        "error", 2, str(path), os.getpid())
 
 
 def test_watch_refuses_legs_it_does_not_know_before_anything_runs(monkeypatch, capsys,
@@ -438,8 +499,11 @@ def test_legs_json_names_the_job_and_the_check_as_a_run_does(monkeypatch, capsys
     ("premerge", ("0    green", "1    red", "2    the check could not be made",
                   "3    green, but --merge did not merge",
                   "130  stopped by hand (Ctrl+C): every leg it started is stopped")),
-    ("watch", ("0    every PR the pass looked at is green; a loop stopped by Ctrl+C",
-               "1    a PR is red", "2    a PR could not be checked",
+    ("watch", ("0    every PR the pass looked at is green, or another pass still held "
+               "the watch lock and this one did nothing; a loop stopped by Ctrl+C",
+               "1    a PR is red",
+               "2    a PR could not be checked, the watch lock could not be taken, or "
+               "another pass has held it past 12 hours",
                "130  --once stopped by hand (Ctrl+C)")),
     ("conflicts", ("0    no conflict",
                    "1    a PR conflicts with its base or with another PR",
@@ -456,6 +520,16 @@ def test_each_verbs_help_names_its_exit_codes_and_its_json_refusal(capsys, verb,
     for line in lines:
         assert "  " + line in tail, line
     assert '{"verdict": "error", "exit_code": N, "reason": "..."}' in tail
+
+
+def test_watch_help_says_what_a_pass_about_its_lock_prints(capsys):
+    with pytest.raises(SystemExit):
+        parse("watch", "--help")
+    text = " ".join(capsys.readouterr().out.split())
+    assert "An action about the pass rather than a PR has pr 0" in text
+    assert "also has lock, holder_pid and held_s" in text
+    assert "an error with them when its holder has held it past 12 hours" in text
+    assert watch.STUCK_S == 12 * 3600                   # the hours the help names
 
 
 def _row(**kw):

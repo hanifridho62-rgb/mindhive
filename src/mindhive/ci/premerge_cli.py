@@ -13,9 +13,11 @@ Exit codes are for scripts and scheduled tasks:
   `--merge` did not merge; 130 stopped by hand (Ctrl+C) -- every leg it
   started is stopped, and a run that got as far as fetching is recorded as an
   error.
-* `watch --once`: 0 every PR it looked at is green; 1 one is red; 2 one
-  could not be checked; 130 stopped by hand. Without `--once` the watch runs
-  until Ctrl+C, which exits 0.
+* `watch --once`: 0 every PR it looked at is green, or another pass still
+  held the watch lock and this one did nothing; 1 one is red; 2 one could not
+  be checked, the watch lock could not be taken, or another pass has held it
+  past 12 hours; 130 stopped by hand. Without `--once` the watch runs until
+  Ctrl+C, which exits 0.
 * `conflicts`: 0 none; 1 a PR conflicts with its base or with another PR; 2
   the check could not be made.
 * `legs`: 0 at least one full-suite leg can run here; 2 none can, or `--legs`
@@ -218,8 +220,11 @@ _EXITS = {
     "premerge": (("0", "green"), ("1", "red"), ("2", "the check could not be made"),
                  ("3", "green, but --merge did not merge"),
                  ("130", "stopped by hand (Ctrl+C): every leg it started is stopped")),
-    "watch": (("0", "every PR the pass looked at is green; a loop stopped by Ctrl+C"),
-              ("1", "a PR is red"), ("2", "a PR could not be checked"),
+    "watch": (("0", "every PR the pass looked at is green, or another pass still held "
+                    "the watch lock and this one did nothing; a loop stopped by Ctrl+C"),
+              ("1", "a PR is red"),
+              ("2", "a PR could not be checked, the watch lock could not be taken, or "
+                    "another pass has held it past 12 hours"),
               ("130", "--once stopped by hand (Ctrl+C)")),
     "conflicts": (("0", "no conflict"),
                   ("1", "a PR conflicts with its base or with another PR"),
@@ -231,7 +236,11 @@ _JSON_NOTES = {
     "premerge": "Under --json a refusal or a stop is one JSON object too:",
     "watch": ("Under --json, --once prints the pass's actions as one array and a loop\n"
               "one line per pass; every action has pr, action, verdict, exit_code and\n"
-              "detail. A refusal or a stop is one JSON object:"),
+              "detail. An action about the pass rather than a PR has pr 0: one that\n"
+              "found the watch lock held is skipped and also has lock, holder_pid and\n"
+              "held_s, or is an error with them when its holder has held it past 12\n"
+              "hours; one that could not take it is an error with lock. A refusal or a\n"
+              "stop is one JSON object:"),
     "conflicts": "Under --json a check that could not be made is one JSON object:",
     "legs": "Under --json a refusal is one JSON object:",
 }

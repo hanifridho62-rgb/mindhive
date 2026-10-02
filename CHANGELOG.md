@@ -45,6 +45,17 @@ history and grouped by what each release window introduced. They summarise;
   pytest gets Git for Windows' own `bin` last on PATH, and a leg that finds
   none says so in its log, since every test needing `sh` would skip.
 
+- **`hive ci watch` runs one pass at a time**: a pass holds the namespace's
+  `state/ci_watch.lock` for its whole run, a kernel byte-range lock as
+  `harvest.lock` is, so a scheduled `--once` that fires while the last pass is
+  still testing does nothing and exits 0, naming the lock, the holder's pid and
+  how long it has held it. The OS lets go when the pass's process ends, however
+  it ends, so there is no stale age; the pid in the file only names the holder,
+  and a record whose pid is gone names none. A holder past 12 hours is reported
+  as an error, exit 2, still with no pass, so a wedged pass cannot keep a
+  scheduled task green. A lock that cannot be taken is exit 2 and no pass.
+  `hive ci premerge` takes no part in it.
+
 - **Blueprint P11 — the traceability matrix and the audit that closes the
   blueprint** (RP §3, §4.7, §10.3; MEB §3.1, §153):
   - `IMPLEMENTATION_PLAN.md` at the root: the RTM for blueprint v1.0 and v1.1 with the commit that realised each row; the audit table `| Bab / Fitur PDF | Modul / Berkas Kode Sumber | Berkas Pengujian (Tests) | Status Verifikasi |` — one row per item, every status parsed from the junit of one full pytest run rather than typed; the MEB LOC forecast beside measured sizes; an ISO/IEC 25010 matrix of measured values; the three benches; the deviation register; and the real outcome of the one `hive mindnet ab --execute --record` run. `tests/test_implementation_plan.py` holds it to that: the commit it names must exist, every path it cites must exist, every status is one of seven words, the LOC rows equal `scripts/loc_report.py`'s.

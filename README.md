@@ -71,7 +71,7 @@ On Windows use PowerShell 5.1 syntax — no `&&`, no ternaries — see the
 - `hive ci breaker status [--project P] [--json]` — what the **integration circuit** is doing, without moving it: state, consecutive failures, trips inside the window, cooldown left, and the record behind it. Exit 1 while OPEN and 2 while QUARANTINED, so a script can gate on it. It deliberately does **not** call the breaker's own `check`, which is a transition: an OPEN circuit whose cooldown has elapsed moves itself to HALF_OPEN as it answers
 - `hive ci breaker reset [--project P] [--json]` — close the circuit by hand and clear its trip history. **The only exit from QUARANTINED**, which three trips inside the window reach and no cooldown leaves; total over every other state, so a reset of an already-closed circuit is a named no-op rather than an error
 - `hive ci premerge <PR> [--merge] [--allow-base-drift] [--legs L] [--jobs N] [--timeout S] [--no-status] [--keep] [--json]` — the **pre-merge CI** GitHub Actions used to be, on this machine: every `ci.yml` leg (the 3 × 2 OS × Python matrix, the node, browser and pg tiers) run against the MERGE the PR would make, each in a fresh repository with its own venv, and the verdict posted on the PR as commit statuses (`mindhive-ci`, `mindhive-ci/<leg>`). Exit 0 green, 1 red, 2 it could not be checked, 3 green but `--merge` did not merge. `--merge` re-reads the PR, re-checks the base and merges with `gh pr merge --merge --match-head-commit <tested head>`; `--branch B [--base M]` tests a local branch instead, with no statuses and no merge
-- `hive ci watch [--once] [--interval S] [--skip-drafts] [...]` — keep every open PR's verdict current: a new head is tested in full, a moved base is re-checked with one `git merge-tree` and a new conflict turns the PR red at once. Never merges
+- `hive ci watch [--once] [--interval S] [--skip-drafts] [...]` — keep every open PR's verdict current: a new head is tested in full, a moved base is re-checked with one `git merge-tree` and a new conflict turns the PR red at once. One pass at a time in a namespace: a pass that finds another still running does nothing, and `--once` exits 0, or 2 once that holder is past 12 hours. Never merges
 - `hive ci conflicts [--base M] [--json]` — which open PRs conflict with their base, and which pairs cannot both land as they stand. Exit 1 when any does
 - `hive ci legs [--legs L] [--json]` — the `ci.yml` legs and whether this machine can run each, with the reason when it cannot
 - `hive dashboard [--port N] [--no-browser] [--idle-cutoff S]` — open the web control panel for every feature. Without `--idle-cutoff` it is exactly the 24/7 server it has always been and runs until you stop it; with one, it also shuts down after that many seconds with no page open
@@ -476,6 +476,20 @@ PR whose base moved; tests again, once per head, a red that errors alone made;
 and posts again a verdict GitHub refused to take. Every action it reports has
 `pr`, `action`, `verdict`, `exit_code` and `detail`: `--once --json` prints the
 pass as one array, and a looping `--json` watch one JSON line per pass.
+
+Passes never overlap in one namespace. A pass holds `state/ci_watch.lock` for
+its whole run, a kernel byte-range lock as `harvest.lock` is, so a scheduled
+`--once` that fires while the last pass is still testing does nothing: its one
+`skipped` action names the lock, the holder's pid and how long it has held it
+(`lock`, `holder_pid`, `held_s`), and it exits `0`. A holder past 12 hours makes
+that action an error and the exit `2`, still with no pass, so a pass wedged on
+a child that never returns cannot keep a scheduled task green. The OS lets go of
+the lock when the pass's process ends, however it ends, so there is no stale age
+to wait out; the file stays on disk by design. A lock that cannot be taken at
+all is exit `2` and no pass. The lock is the namespace's own, so give the
+scheduled task the same `--project` as a watch you run by hand. `hive ci
+premerge` takes no part in it: a merge asked for by name never waits behind a
+watch.
 
 ## Installing the hooks on a new machine
 The hooks are portable: nothing in `hooks/` names a user, a checkout, or a venv.
