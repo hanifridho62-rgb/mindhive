@@ -146,8 +146,8 @@ memory-store/network/deploy changes — fall back to per-action confirmation.
   (`{files, batches, created_at, session_id}`) — written by `session_end.ps1`,
   deleted when the review completes. No change to the closed `VALID_TYPES` event
   schema. The `projector` renders a "⚠ Pending thermo-nuclear review" notice from
-  the sidecar into `STATE.md`, which `session_start.ps1` already injects via
-  `mindhive state`.
+  the sidecar into `STATE.md` and its brief (`STATE_BRIEF.md`), which
+  `session_start.ps1` injects via `mindhive state --brief`.
 
 - **Skill artifact = project-level, Claude Code format** (grill Q7, 2026-06-24).
   Lives at `.claude/skills/thermo-nuclear-code-quality-review/SKILL.md` in the

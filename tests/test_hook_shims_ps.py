@@ -1195,8 +1195,11 @@ def test_session_start_forwards_its_context_but_swallows_the_append(tmp_path):
     assert r.returncode == 0, r.stderr
     seen = log.read_text(encoding="ascii", errors="replace") if log.exists() else ""
     assert "append session_start" in seen, seen
-    assert CHILD_STDOUT + "-m mindhive directives" in r.stdout, r.stdout
-    assert CHILD_STDOUT + "-m mindhive state" in r.stdout, r.stdout
+    # The BRIEF forms, which keep the hook's stdout under the session-start cap
+    # (`mindhive.sessionstart`). The closing quote pins the whole argv, so a
+    # shim that went back to the full forms fails here.
+    assert CHILD_STDOUT + '-m mindhive directives --brief"' in r.stdout, r.stdout
+    assert CHILD_STDOUT + '-m mindhive state --brief"' in r.stdout, r.stdout
     assert CHILD_STDOUT + "-m mindhive append" not in r.stdout, r.stdout
 
 
@@ -1509,6 +1512,9 @@ def test_resolve_mindhive_python_is_a_function_the_library_defines(tmp_path):
 # it off the hook's stderr.
 
 CACHE_CHECK = "-m mindhive plugins cache-check --hook"
+# The brief forms the hook prints, as in `tests/test_hook_shims.py`.
+DIRECTIVES = "-m mindhive directives --brief"
+STATE = "-m mindhive state --brief"
 
 
 def session_start_interpreter(tmp_path: Path, log: Path) -> Path:
@@ -1551,11 +1557,11 @@ def test_session_start_checks_the_plugin_cache_right_after_state(tmp_path):
                env={"MINDHIVE_PYTHON": str(stub)})
     assert r.returncode == 0, r.stderr
     calls = _calls(log)
-    assert "-m mindhive state" in calls, calls
-    at = calls.index("-m mindhive state")
+    assert STATE in calls, calls
+    at = calls.index(STATE)
     assert calls[at + 1:at + 2] == [CACHE_CHECK], calls
-    assert r.stdout.splitlines() == ["child stdout: -m mindhive directives",
-                                     "child stdout: -m mindhive state",
+    assert r.stdout.splitlines() == ["child stdout: " + DIRECTIVES,
+                                     "child stdout: " + STATE,
                                      "child stdout: " + CACHE_CHECK], r.stdout
 
 
@@ -1575,8 +1581,8 @@ def test_a_failing_plugin_cache_check_leaves_session_start_quiet_and_exit_0(tmp_
     assert r.returncode == 0, r.stderr
     assert r.stderr == "", r.stderr
     assert CACHE_CHECK in _calls(log), _calls(log)
-    assert r.stdout.splitlines() == ["child stdout: -m mindhive directives",
-                                     "child stdout: -m mindhive state"], r.stdout
+    assert r.stdout.splitlines() == ["child stdout: " + DIRECTIVES,
+                                     "child stdout: " + STATE], r.stdout
     bare = subprocess.run([str(stub)] + CACHE_CHECK.split(), capture_output=True,
                           text=True, env=clean_env(env), timeout=30)
     assert (bare.returncode, bare.stdout, bare.stderr) == (

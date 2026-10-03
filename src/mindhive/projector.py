@@ -5,6 +5,9 @@ import threading
 from . import paths, events, chain, review, changelog, incidents, reflect, sop
 from . import provenance, state as state_mod
 from . import roadmap
+# Reaches only `directives` and `paths`: the session-start budget the brief
+# STATE is rendered under.
+from . import sessionstart
 # Reaches only `events` at import; the tag grammar lives with its contract.
 from . import initiatives, worksessions
 # `sopgate` reaches only `outcomes` (stdlib), `sop` and `promptgate` (-> `paths`),
@@ -47,15 +50,21 @@ def _ts_compact(ts: str) -> str:
     return ts.replace("-", "").replace(":", "").replace("T", "-").rstrip("Z")
 
 
-def build_state(evs, pending=None, health_note="", changelog_pending=None,
-                injection=None) -> str:
-    latest_state = None
-    last_decision = None
+def _latest(evs):
+    """The newest `state_set` and the newest `decision`: what both renderings
+    of the state, STATE.md and its brief, fold the ledger down to."""
+    latest_state = last_decision = None
     for ev in evs:
         if ev.type == "state_set":
             latest_state = ev
         elif ev.type == "decision":
             last_decision = ev
+    return latest_state, last_decision
+
+
+def build_state(evs, pending=None, health_note="", changelog_pending=None,
+                injection=None) -> str:
+    latest_state, last_decision = _latest(evs)
     # `state.validate_payload` now refuses a non-dict payload at both
     # raw-append surfaces, so this is no longer the only thing standing between
     # a hostile `hive append state_set` and a raise inside the function that
@@ -65,8 +74,8 @@ def build_state(evs, pending=None, health_note="", changelog_pending=None,
     # message, it produces no STATE.md at all.
     s = state_mod.fields(latest_state)
     out = ["# STATE", ""]
-    # Pending thermo-nuclear review rides at the top so the next session sees it
-    # first when session_start injects STATE.md via `hive state`.
+    # Pending thermo-nuclear review rides at the top so a reader sees it first.
+    # The session-start brief (`build_state_brief`) carries the same notice.
     note = review.notice(pending)
     if note:
         out.append(note)
@@ -146,6 +155,115 @@ def build_state(evs, pending=None, health_note="", changelog_pending=None,
     out.append("")
     out.append(f"_events: {len(evs)}_")
     return "\n".join(out) + "\n"
+
+
+# The brief STATE's shares of `sessionstart.STATE_BRIEF_CAP`. A field gets a
+# fixed width and a list shows its head, so a long field cannot crowd out the
+# ones after it; `sessionstart.cut` is the last guard, not the plan.
+BRIEF_FIELD_CHARS = 280
+BRIEF_BULLET_CHARS = 140
+BRIEF_BULLETS = 4
+BRIEF_PLANS = 3
+BRIEF_DECISION_CHARS = 220
+BRIEF_NOTICE_CHARS = 300
+
+
+def _clip(value, width: int) -> str:
+    """`provenance.safe_line`, cut at *width* with an ellipsis that says so."""
+    text = provenance.safe_line(value, None)
+    return text if len(text) <= width else text[:width - 1].rstrip() + "…"
+
+
+def _brief_notices(evs, pending, changelog_pending, injection,
+                   health_note) -> list:
+    """`build_state`'s notices, one line each, the interrupted plans a short
+    list: what is wrong and the command that acts on it. The file lists and
+    the plan detail stay in STATE.md. Total over junk markers, like the full
+    notices they shorten."""
+    def n_files(marker) -> int:
+        # `review.load_pending` returns any valid JSON, so `files` may be a
+        # number or a string: count a list, and nothing else.
+        files = marker.get("files")
+        return len(files) if isinstance(files, list) else 0
+
+    out = []
+    if isinstance(pending, dict) and pending:
+        out.append(f"⚠ Pending thermo-nuclear review: "
+                   f"{n_files(pending)} file(s) — run the "
+                   "`thermo-nuclear-code-quality-review` skill on them, then "
+                   "`hive review clear`.")
+    if isinstance(changelog_pending, dict) and changelog_pending:
+        out.append(f"⚠ Unlogged code changes: "
+                   f"{n_files(changelog_pending)} file(s) — "
+                   "`hive log <category> \"<brief explanation>\"` is mandatory "
+                   "before the work is done.")
+    plans = roadmap.interrupted(evs)
+    if plans:
+        # Marked, not withheld, on `roadmap.notice`'s reasoning: the marker is
+        # the operator's recovery path whoever last touched the plan.
+        tainted = provenance.agent_touched(evs, ("roadmap", "autoresume"),
+                                           "plan_id")
+        out.append(f"⚠ Interrupted plans: {len(plans)} — resume with "
+                   "`hive roadmap resume <id>`, detail `hive roadmap show <id>`:")
+        for r in plans[:BRIEF_PLANS]:
+            step = roadmap.next_step(r)
+            nxt = _clip(step.get("text"), 90) if step else "(every step done)"
+            mark = provenance.AGENT_MARK if tainted.get(r["plan_id"]) else ""
+            out.append(f"- `{_clip(r['plan_id'], 40)}` "
+                       f"{_clip(r['title'] or r['plan_id'], 70)} — next: "
+                       f"{nxt}{mark}")
+        if len(plans) > BRIEF_PLANS:
+            out.append(f"- … {len(plans) - BRIEF_PLANS} more: `hive state`")
+    sop_note = sopgate.notice(injection)
+    if sop_note:
+        out.append(_clip(sop_note.splitlines()[0], BRIEF_NOTICE_CHARS))
+    if health_note:
+        out.append(_clip(health_note, BRIEF_NOTICE_CHARS))
+    return out
+
+
+def build_state_brief(evs, pending=None, health_note="", changelog_pending=None,
+                      injection=None, cap=None) -> str:
+    """The state as the session-start hook injects it (`hive state --brief`):
+    `build_state`'s notices and fields under `sessionstart.STATE_BRIEF_CAP`
+    delivered characters.
+
+    A second rendering rather than the head of STATE.md, because the head is
+    not the most important part: STATE.md opens with its notices, and one
+    interrupted-plan block was most of the 2 KB a session used to receive.
+    Here a notice is one line, each field has a fixed width, and every list
+    shows its head and names what it leaves out. The sanitizing is
+    `build_state`'s own (`provenance`), since this text lands in the same
+    channel with the same trust."""
+    cap = sessionstart.STATE_BRIEF_CAP if cap is None else cap
+    latest_state, last_decision = _latest(evs)
+    s = state_mod.fields(latest_state)
+    out = ["# STATE (brief) — full state, SOPs, rules and skills: `hive state`"]
+    out += _brief_notices(evs, pending, changelog_pending, injection,
+                          health_note)
+    state_banner = provenance.agent_banner(
+        "This state block", getattr(latest_state, "session_id", ""))
+    if state_banner:
+        out.append(state_banner)
+    for label, key in (("Active task", "task"), ("Last verified", "verified"),
+                       ("Next step", "next_step")):
+        out.append(f"**{label}:** "
+                   f"{_clip(s.get(key), BRIEF_FIELD_CHARS) or '(none)'}")
+    out.append("**Open questions:**")
+    out += [f"- {q}" for q in provenance.safe_bullets(
+        s.get("open_questions"), BRIEF_BULLET_CHARS, limit=BRIEF_BULLETS)]
+    deferred = [d for d in provenance.safe_bullets(s.get("deferred"), empty="",
+                                                   limit=None) if d]
+    out.append(f"**Deferred:** {len(deferred)} item(s) — `hive state`")
+    if last_decision:
+        dp = last_decision.payload if isinstance(last_decision.payload, dict) \
+            else {}
+        out.append(f"**Last decision "
+                   f"({provenance.safe_line(last_decision.ts, 40)}):** "
+                   f"{_clip(dp.get('text'), BRIEF_DECISION_CHARS)}"
+                   f"{provenance.mark_for(getattr(last_decision, 'session_id', ''))}")
+    out.append(f"_events: {len(evs)}_")
+    return sessionstart.cut("\n".join(out), cap)
 
 
 def suggested_skills_block(project=None, evs=None) -> str:
@@ -259,6 +377,19 @@ def compose_state(evs, project=None, include_rules=True, suggestions=None,
     if sugg:
         body = body + "\n" + sugg + "\n"
     return body
+
+
+def compose_state_brief(evs, project=None, injection=None) -> str:
+    """`build_state_brief` over the markers `compose_state` reads, so STATE.md
+    and its brief report the same notices from one rebuild. No SOPs, rules or
+    suggested skills: MEMORY.md carries those, and the brief points at
+    `hive state` for all of them."""
+    if injection is None:
+        injection = sopgate.probe(project=project)
+    return build_state_brief(evs, pending=review.load_pending(project),
+                             health_note=reflect.health_note(project),
+                             changelog_pending=changelog.load_pending(project),
+                             injection=injection)
 
 
 def build_ledger_entries(evs):
@@ -393,6 +524,10 @@ def _project(project=None, evs=None, suggestions=None) -> dict:
     # dashboard's constant STATE.md reads can otherwise refuse.
     paths.write_text_atomic(pdir / "STATE.md",
                             compose_state(evs, project, suggestions=suggestions))
+    # Beside it, from the same events: the brief the session-start hook prints
+    # (`hive state --brief`), under its share of the session-start cap.
+    paths.write_text_atomic(pdir / sessionstart.STATE_BRIEF_FILE,
+                            compose_state_brief(evs, project) + "\n")
 
     ldir = pdir / "LEDGER"
     ldir.mkdir(exist_ok=True)

@@ -121,6 +121,10 @@ def add_state(sub) -> None:
     st = sub.add_parser("state", help="print STATE.md")
     st.add_argument("--project", type=cliparse.project_arg, default=None,
                     help="target namespace explicitly (default: detect from cwd)")
+    st.add_argument("--brief", action="store_true",
+                    help="print the brief the session-start hook injects "
+                         "(STATE_BRIEF.md, under its share of the 6,000-character "
+                         "session-start cap) instead of the whole STATE.md")
     st.set_defaults(func=cmd_state)
 
 
@@ -131,7 +135,10 @@ def add_projects(sub) -> None:
 
 def add_directives(sub) -> None:
     """Register `hive directives`."""
-    sub.add_parser("directives", help="print the session operating directives").set_defaults(func=cmd_directives)
+    di = sub.add_parser("directives", help="print the session operating directives")
+    di.add_argument("--brief", action="store_true",
+                    help="print the brief form the session-start hook injects")
+    di.set_defaults(func=cmd_directives)
 
 
 def add_context(sub) -> None:

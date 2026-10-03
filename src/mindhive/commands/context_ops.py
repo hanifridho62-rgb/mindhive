@@ -81,6 +81,12 @@ def cmd_state(args) -> int | None:
     # the right place: this is the one command in that hook that is this repo's.
     from .. import sop as _sop
     _sop.heal_sidecar(project)
+    if getattr(args, "brief", False):
+        # What the session-start hook prints: the brief, cut to its share of
+        # the session-start cap, never the whole file (see `sessionstart`).
+        from .. import sessionstart
+        print(sessionstart.state_brief(project))
+        return None
     s = paths.project_dir(project) / "STATE.md"
     print(s.read_text(encoding="utf-8") if s.exists()
           else "(no STATE.md — run: hive project)")
@@ -88,7 +94,7 @@ def cmd_state(args) -> int | None:
 
 def cmd_directives(args) -> int | None:
     from .. import directives as directives_mod
-    print(directives_mod.directives())
+    print(directives_mod.directives(brief=getattr(args, "brief", False)))
     return None
 
 def cmd_context(args) -> int | None:
@@ -97,10 +103,12 @@ def cmd_context(args) -> int | None:
     paths are --set-budget (and the memory budgets beside it), which persists
     the namespace's token budget, and --set-adaptive-tail, which persists the
     digest's adaptive-tail opt-in. --check turns the report into a gate: exit 1
-    when over the budget (the hook adoption flows and scripts rely on) or when
-    MEMORY.md is truncated with no rollover notice arriving before the cut,
-    exit 2 when asked to check with no budget configured at all. A managed
-    truncation, or a digest past the composer's safe budget, is a WARNING."""
+    when over the budget (the hook adoption flows and scripts rely on), when
+    MEMORY.md is truncated with no rollover notice arriving before the cut, or
+    when a part of the session-start hook's output is over its share of that
+    hook's cap; exit 2 when asked to check with no budget configured at all. A
+    managed truncation, or a digest past the composer's safe budget, is a
+    WARNING."""
     from .. import context as context_mod
     project = getattr(args, "project", None)
     origin = getattr(args, "origin", "all")
@@ -169,11 +177,12 @@ def cmd_context(args) -> int | None:
     if getattr(args, "check", False):
         # Two independent failures, checked in this order because they are not
         # the same kind of problem. The token budget is about COST — context
-        # spent. A truncated MEMORY.md is about LOSS — context paid for and never
-        # delivered, which is the worse of the two and needs no configured
-        # budget to be a fact, so it is reported even when the token check
-        # cannot run for want of one.
-        truncated = [f for f in found if f.rule == "memory_truncated"]
+        # spent. A truncated MEMORY.md, or session-start output over its cap, is
+        # about LOSS — context paid for and never delivered, which is the worse
+        # of the two and needs no configured budget to be a fact, so it is
+        # reported even when the token check cannot run for want of one.
+        truncated = [f for f in found
+                     if f.rule in ("memory_truncated", "session_start_over_cap")]
         for f in truncated:
             print(f"TRUNCATED: {f.message}", file=sys.stderr)
         # Warned, never failed (blueprint P1c): the rollover notice tells the

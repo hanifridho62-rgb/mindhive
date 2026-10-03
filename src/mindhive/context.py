@@ -863,6 +863,11 @@ def findings(segments: list[Segment], project=None) -> list[Finding]:
     out += _finding_duplicate_lines(segs, texts)
     out += _finding_dead_paths(segs, texts)
     out += _finding_outlier_skills(segs)
+    if any(s.origin == "hive" for s in segs):
+        # The session-start hook's output against its cap -- LOSS, like a
+        # truncated MEMORY.md, so `--check` fails on it (`sessionstart`).
+        from . import sessionstart
+        out += [Finding(**f) for f in sessionstart.findings(project)]
     order = {"high": 0, "medium": 1, "low": 2}
     return sorted(out, key=lambda f: (order.get(f.severity, 3), f.rule, f.subject))
 

@@ -6,7 +6,8 @@ pending-review marker the next session can act on.
 A fire-and-forget hook cannot run an LLM review itself, so session_end only does
 the cheap bookkeeping here: filter touched files to first-party source/tests,
 split them into line-bounded batches, and write a sidecar marker. The projector
-renders that marker into STATE.md, which session_start injects — so the *next*
+renders that marker into STATE.md and its session-start brief, which
+session_start injects — so the *next*
 interactive session runs the review where an LLM actually exists. See
 docs/adr/0004-queue-and-inject-thermo-nuclear-review.md.
 """

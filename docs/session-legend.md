@@ -394,7 +394,7 @@ parsing and the decision live in Python so they are unit-testable.
 
 | Script | Claude Code event | Python it calls |
 |---|---|---|
-| `session_start.ps1` | SessionStart | `append session_start`, `directives`, `state` (injects STATE.md), then `plugins cache-check --hook` (**blueprint P5, spec §2.8 Bug 8**: one line, only when the plugin Claude Code loads has drifted from this checkout, and never a failure; the sync runs only with `MINDHIVE_PLUGIN_AUTOSYNC=1`, which adds the sync's outcome line and can hold the hook up to 45 s); detached `plugins autoscan` + trigger refresh |
+| `session_start.ps1` | SessionStart | `append session_start`, `directives --brief`, `state --brief` (injects STATE_BRIEF.md; everything it prints stays under the 6,000-character session-start cap — `mindhive.sessionstart`, checked by `hive context --check`), then `plugins cache-check --hook` (**blueprint P5, spec §2.8 Bug 8**: one line, only when the plugin Claude Code loads has drifted from this checkout, and never a failure; the sync runs only with `MINDHIVE_PLUGIN_AUTOSYNC=1`, which adds the sync's outcome line and can hold the hook up to 45 s); detached `plugins autoscan` + trigger refresh |
 | `user_prompt_submit.ps1` | UserPromptSubmit | `hook user_prompt_submit` |
 | `pre_tool_use.ps1` | PreToolUse | `hook pre_tool_use` → `enforce.hook_decision` |
 | `post_tool_use.ps1` | PostToolUse | `hook post_tool_use` → `hookcapture.record_post_tool_use` (+ faculty beat) |
@@ -413,7 +413,7 @@ Properties that hold for all of them — do not weaken:
 - **stdout is the decision/context channel — for the gate hooks only.** In
   `pre_tool_use.ps1`, `user_prompt_submit.ps1` and `stop.ps1` nothing may print
   there except the Python decision/context JSON, and silence = allow / no
-  injection. `session_start.ps1` (`directives` + `state`, plus `plugins cache-check --hook`, which prints only when the loaded plugin has drifted from this checkout) and `pre_compact.ps1`
+  injection. `session_start.ps1` (`directives --brief` + `state --brief`, plus `plugins cache-check --hook`, which prints only when the loaded plugin has drifted from this checkout) and `pre_compact.ps1`
   deliberately emit plain markdown/text to stdout — that *is* their injection
   mechanism. Do not "fix" them to be silent.
 - **Fail-open and hang-proof.** Any error allows the tool and injects nothing.

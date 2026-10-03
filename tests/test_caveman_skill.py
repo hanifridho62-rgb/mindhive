@@ -7,6 +7,8 @@ requires, and the language-preservation clause that keeps an Indonesian question
 getting an Indonesian answer."""
 from pathlib import Path
 
+import pytest
+
 _ROOT = Path(__file__).resolve().parents[1]
 _SKILL = _ROOT / "skills" / "caveman" / "SKILL.md"
 _LICENSE = _ROOT / "skills" / "caveman" / "LICENSE"
@@ -180,11 +182,14 @@ def test_directives_document_the_sticky_lesson_and_slash_commands():
     assert "slash commands count" in text
 
 
-def test_session_directives_establish_the_style_from_message_one():
+@pytest.mark.parametrize("brief", [False, True], ids=["full", "brief"])
+def test_session_directives_establish_the_style_from_message_one(brief):
     # The SessionStart half of the mechanism, read from the live module rather
-    # than from a doc — this is what actually reaches the model.
+    # than from a doc. The hook prints the BRIEF form (`directives --brief`,
+    # which keeps it under the session-start cap), so that is the text that
+    # actually reaches the model; the full form is what `hive directives` shows.
     from mindhive import directives
-    text = " ".join(directives.directives().lower().split())
+    text = " ".join(directives.directives(brief=brief).lower().split())
     assert "caveman is the standing default" in text
     assert "compress the style, not the language" in text
     assert "teaching carve-out" in text

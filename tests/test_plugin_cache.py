@@ -285,6 +285,44 @@ def test_nothing_to_report_is_silent():
         assert plugin_cache.session_notice(_status(state)) == ""
 
 
+def _crowded(n=40, name_chars=90, **over):
+    """A drift whose every list is long and whose file names are long."""
+    names = [f"skills/{i:02d}/" + "n" * name_chars + "/SKILL.md" for i in range(n)]
+    return _status(only_in_repo=names, only_in_cache=names, changed=names,
+                   diff_counts={"only_in_repo": n, "only_in_cache": n,
+                                "changed": n}, cache_version="0.4.0", **over)
+
+
+def test_a_crowded_notice_keeps_to_its_session_start_share():
+    """The line rides the session-start hook beside the brief directives and
+    state, and `sessionstart` reserves it a fixed share of the 6,000-character
+    cap. Past the share the file names go first: the counts, both versions and
+    the fix are what the session needs to act on."""
+    from mindhive import sessionstart
+    note = plugin_cache.session_notice(_crowded())
+    assert len(note) <= sessionstart.CACHE_NOTICE_CHARS
+    for needle in ("0.5.0", "0.4.0", "40 only in this checkout", "40 changed",
+                   "claude plugin update mindhive@mindhive-dev"):
+        assert needle in note, needle
+    assert "nnnn" not in note
+
+
+def test_a_notice_that_fits_keeps_its_file_names():
+    """CANARY for the test above: the names go only when they do not fit."""
+    from mindhive import sessionstart
+    note = plugin_cache.session_notice(_crowded(n=2, name_chars=10))
+    assert len(note) <= sessionstart.CACHE_NOTICE_CHARS
+    assert "nnnnnnnnnn" in note
+
+
+def test_a_pathological_install_path_still_keeps_to_the_share():
+    from mindhive import sessionstart
+    for state in ("diverged", "missing_on_disk"):
+        note = plugin_cache.session_notice(
+            _crowded(state=state, install_path="C:/" + "p" * 5000))
+        assert 0 < len(note) <= sessionstart.CACHE_NOTICE_CHARS, state
+
+
 # --- the sync ---------------------------------------------------------------
 
 def _fake_run(calls, returncode=0, stdout="updated", stderr="", exc=None):

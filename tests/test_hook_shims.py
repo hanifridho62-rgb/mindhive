@@ -2117,6 +2117,12 @@ def test_a_dot_or_underscore_after_the_first_character_is_kept(value):
 # the same three properties for `session_start.ps1`.
 
 CACHE_CHECK = "-m mindhive plugins cache-check --hook"
+# The BRIEF forms, never the full ones: the whole of the hook's stdout has to
+# stay under the session-start cap (`mindhive.sessionstart`, 6,000 characters)
+# for Claude Code to deliver it rather than persist it to a file and show the
+# session a 2 KB preview. `tests/test_sessionstart.py` locks the cap itself.
+DIRECTIVES = "-m mindhive directives --brief"
+STATE = "-m mindhive state --brief"
 
 
 def _session_start_python(tmp_path, fail=""):
@@ -2155,11 +2161,11 @@ def test_session_start_checks_the_plugin_cache_right_after_state(tmp_path):
     got = run_shim("session_start", env=env)
     assert got.returncode == 0, got.stderr
     calls = log.read_text(encoding="utf-8").splitlines()
-    assert "-m mindhive state" in calls, calls
-    at = calls.index("-m mindhive state")
+    assert STATE in calls, calls
+    at = calls.index(STATE)
     assert calls[at + 1:at + 2] == [CACHE_CHECK], calls
-    assert got.stdout.splitlines() == ["child stdout: -m mindhive directives",
-                                       "child stdout: -m mindhive state",
+    assert got.stdout.splitlines() == [f"child stdout: {DIRECTIVES}",
+                                       f"child stdout: {STATE}",
                                        f"child stdout: {CACHE_CHECK}"], got.stdout
 
 
@@ -2176,8 +2182,8 @@ def test_a_failing_plugin_cache_check_leaves_session_start_quiet_and_exit_0(tmp_
     assert got.returncode == 0, got.stderr
     assert got.stderr == "", got.stderr
     assert CACHE_CHECK in log.read_text(encoding="utf-8").splitlines()
-    assert got.stdout.splitlines() == ["child stdout: -m mindhive directives",
-                                       "child stdout: -m mindhive state"], got.stdout
+    assert got.stdout.splitlines() == [f"child stdout: {DIRECTIVES}",
+                                       f"child stdout: {STATE}"], got.stdout
     bare = subprocess.run([SH, env["MINDHIVE_PYTHON"], *CACHE_CHECK.split()],
                           capture_output=True, text=True, timeout=30,
                           env={**os.environ, **env})

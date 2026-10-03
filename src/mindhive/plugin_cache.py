@@ -32,7 +32,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from . import plugins
+from . import plugins, sessionstart
 
 __all__ = ["PLUGIN_COMPONENTS", "AUTOSYNC_ENV", "SYNC_TIMEOUT_S", "DIFF_LIST_CAP",
            "DRIFT_STATES", "plugin_tree_digest", "plugin_tree_hash",
@@ -239,12 +239,24 @@ def _fix(status: dict) -> str:
 
 
 def session_notice(status: dict) -> str:
-    """One line for the session-start context when the cache drifted, else ""."""
-    state = status.get("state")
-    if state not in DRIFT_STATES:
+    """One line for the session-start context when the cache drifted, else "".
+
+    Kept to `sessionstart.CACHE_NOTICE_CHARS`, its share of the session-start
+    cap: the hook prints it beside the brief directives and state, and the
+    shares are locked to sum under the cap. Past the share the file names go
+    first -- the counts, both versions and the fix are what a session acts
+    on -- and only a pathological install path is ever cut."""
+    if status.get("state") not in DRIFT_STATES:
         return ""
+    line = _notice_line(status, names=True)
+    if len(line) > sessionstart.CACHE_NOTICE_CHARS:
+        line = _notice_line(status, names=False)
+    return line[:sessionstart.CACHE_NOTICE_CHARS]
+
+
+def _notice_line(status: dict, names: bool) -> str:
     key = status.get("key") or status.get("plugin") or "plugin"
-    if state == "missing_on_disk":
+    if status.get("state") == "missing_on_disk":
         return (f"[mindhive] plugin cache missing: Claude Code's registry points {key} "
                 f"at {status.get('install_path') or '(nothing)'}, which does not "
                 f"exist -- {_fix(status)}")
@@ -254,10 +266,12 @@ def session_notice(status: dict) -> str:
                          ("only in this checkout", "only_in_repo"),
                          ("changed", "changed")):
         n = int(counts.get(field) or 0)
-        if n:
+        if n and names:
             shown = list(status.get(field) or [])[:3]
             more = f" +{n - len(shown)} more" if n > len(shown) else ""
             parts.append(f"{n} {label} ({', '.join(shown)}{more})")
+        elif n:
+            parts.append(f"{n} {label}")
     drift = "; ".join(parts) or "the recorded version differs"
     return (f"[mindhive] plugin cache out of date: this checkout has "
             f"{status.get('plugin') or key} {status.get('repo_version') or '?'} "
