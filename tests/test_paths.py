@@ -83,6 +83,19 @@ def test_project_dir_uses_env_project(tmp_path, monkeypatch):
     assert paths.events_dir() == tmp_path / "fabio-v18" / "events"
 
 
+def test_detect_project_can_place_a_folder_past_the_pinned_namespace(tmp_path,
+                                                                     monkeypatch):
+    """MINDHIVE_PROJECT pins the namespace THIS process writes to. A reader
+    placing other folders by their own cwd (`hive spend`) passes
+    honor_env=False, or every folder lands in the pinned one."""
+    monkeypatch.setenv("MINDHIVE_PROJECT", "Pinned")
+    folder = tmp_path / "Not A Repo"
+    folder.mkdir()
+
+    assert paths.detect_project(folder) == "pinned"
+    assert paths.detect_project(folder, honor_env=False) == "not-a-repo"
+
+
 def test_known_projects_reads_registry(tmp_path, monkeypatch):
     monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
     (tmp_path / "autosync.json").write_text(

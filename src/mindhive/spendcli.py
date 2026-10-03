@@ -8,15 +8,19 @@ on it. `spend` is imported at call time, so `import mindhive.__main__` stays as
 light as `tests/test_cli_startup.py` holds it.
 
 Exit codes: 0 a report printed (an empty window is a report too); 2 the
-arguments stopped it -- `--days` that is not a positive number, or an
-`--against` snapshot that cannot be read. A default snapshot that cannot be
-read is warned about on stderr and the report prints without it.
+arguments stopped it -- `--days` that is not a positive number, a
+`--claude-dir` with no `projects` directory under it, or an `--against`
+snapshot that cannot be read (an empty one included). A default snapshot that
+cannot be read is warned about on stderr and the report prints without it.
 """
 from __future__ import annotations
 
 import json
 import math
 import sys
+from pathlib import Path
+
+_READ_ONLY = "This command is read-only and changed nothing."
 
 
 def _is_num(value) -> bool:
@@ -54,8 +58,19 @@ def _head(report: dict) -> str:
     src = report["source"]
     since = report.get("since")
     window = f"sessions started since {since}" if since else "every session on disk"
+    unreadable = src.get("transcripts_unreadable")
     return (f"hive spend {report['report']} -- {window}; {src['transcripts_read']} "
-            f"transcript(s) read, {src['transcripts_skipped_as_older']} older skipped")
+            f"transcript(s) read, {src['transcripts_skipped_as_older']} older skipped"
+            + (f", {unreadable} unreadable" if unreadable else ""))
+
+
+def _footer(report: dict) -> list:
+    """The close the repo's read-only reports share (`context.py`,
+    `packs.py`); the `~` figures are characters divided by a constant."""
+    if "chars_per_token" not in report:
+        return ["", _READ_ONLY]
+    return ["", f"Figures marked ~ are estimates (~{report['chars_per_token']} "
+                f"chars/token). {_READ_ONLY}"]
 
 
 def _render_baseline(report: dict) -> list:
@@ -145,13 +160,15 @@ def _snapshot(args):
     from . import spend
     if getattr(args, "no_compare", True):
         return None, None
-    path = args.against or spend.find_snapshot()
+    if args.against == "":
+        raise spend.SnapshotError("--against needs a snapshot path, not an empty string")
+    path = args.against if args.against is not None else spend.find_snapshot()
     if path is None:
         return None, None
     try:
         return spend.load_snapshot(path), str(path)
     except spend.SnapshotError as exc:
-        if args.against:
+        if args.against is not None:
             raise
         print(f"hive spend: warning: {exc}; printing without a comparison",
               file=sys.stderr)
@@ -164,16 +181,26 @@ def _run(args, build, render, compare=None) -> int | None:
         print(f"hive spend: --days must be a positive number of days, not {args.days:g}",
               file=sys.stderr)
         return 2
+    claude_dir = None
+    if args.claude_dir is not None:
+        # Named, it must hold transcripts: a typo would otherwise print an
+        # all-zero report, and an empty value would read the default home.
+        claude_dir = Path(args.claude_dir).expanduser()
+        if not args.claude_dir or not (claude_dir / "projects").is_dir():
+            where = claude_dir / "projects" if args.claude_dir else "an empty --claude-dir"
+            print(f"hive spend: no Claude Code transcripts under {where}", file=sys.stderr)
+            return 2
     try:
         snapshot, path = _snapshot(args) if compare else (None, None)
     except spend.SnapshotError as exc:
         print(f"hive spend: {exc}", file=sys.stderr)
         return 2
-    report = build(spend.scan(args.claude_dir, days=None if args.all else args.days))
+    report = build(spend.scan(claude_dir, days=None if args.all else args.days))
     if snapshot is not None:
         report["against"] = {"path": path, "created": snapshot.get("created"),
                              **compare(report, snapshot)}
-    print(json.dumps(report, indent=1) if args.json else "\n".join(render(report)))
+    print(json.dumps(report, indent=1) if args.json
+          else "\n".join(render(report) + _footer(report)))
     return None
 
 

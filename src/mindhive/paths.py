@@ -224,8 +224,11 @@ def path_spellings(normalised) -> set:
     return out
 
 
-def detect_project(cwd: Path | None = None) -> str:
-    env = os.environ.get("MINDHIVE_PROJECT")
+def detect_project(cwd: Path | None = None, *, honor_env: bool = True) -> str:
+    # MINDHIVE_PROJECT pins the namespace THIS process writes to. A reader that
+    # places other folders by their own cwd passes honor_env=False, or every
+    # folder would land in the pinned one.
+    env = os.environ.get("MINDHIVE_PROJECT") if honor_env else None
     if env:
         return normalize(env)
     cwd = cwd or Path.cwd()

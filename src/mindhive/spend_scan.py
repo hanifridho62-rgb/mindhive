@@ -17,7 +17,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 CHORE_PREFIXES = ("You are the Reflection Engine", "You are the Resolution Engine",
                   "You are proposing follow-up", "Break one software task", "Use the ")
@@ -26,7 +26,13 @@ UNATTRIBUTED = "(unattributed)"
 UNKNOWN_AGENT = "(unknown)"
 
 _CTX_KEYS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
-_CACHE_RE = re.compile(r"plugins[\\/]+cache[\\/]+([^\\/\"' ]+)[\\/]+([^\\/\"' ]+)")
+# The owner it captures is printed, so the plugin segment must be a whole name
+# that ends at a separator, a quote, a space or the end: a segment running on
+# into `;KEY=...` is command text, not a plugin.
+_CACHE_RE = re.compile(
+    r"plugins[\\/]+cache[\\/]+([^\\/\"' ]+)[\\/]+([A-Za-z0-9._-]+)(?=[\\/\"' ]|$)")
+# json.loads raises RecursionError, not ValueError, past its depth limit.
+_JSON_ERRORS = (ValueError, RecursionError)
 _LOOKUP_RE = re.compile(
     r"(?:\bhive(?:\.exe)?['\"]?|-m\s+mindhive)\s+(recall|pg|state|briefing|sop\s+show"
     r"|graph|memo|roadmap\s+show|premise|search|context)\b")
@@ -61,6 +67,7 @@ class Scan:
     sessions: list = field(default_factory=list)
     files_read: int = 0
     files_skipped: int = 0
+    files_unreadable: int = 0          # failed to stat, open or read: never "read"
 
 
 def default_claude_dir() -> Path:
@@ -71,7 +78,7 @@ def default_claude_dir() -> Path:
 def _read_json(path: Path):
     try:
         return json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, *_JSON_ERRORS):
         return None
 
 
@@ -87,6 +94,14 @@ def _commands(node, out: set) -> None:
             _commands(value, out)
 
 
+def _inside_plugin(ref: str) -> bool:
+    """A manifest's hook-file path names a file in the plugin. An absolute
+    path, a drive, a UNC share or a `..` step names one elsewhere -- for a
+    share, reading it would open a connection -- and is not followed."""
+    pure = PureWindowsPath(ref)      # reads `/` and `\` alike, on any platform
+    return bool(ref) and not pure.anchor and ".." not in pure.parts
+
+
 def _plugin_hook_commands(root: Path) -> set:
     """Commands in a plugin's `hooks/hooks.json` and in whatever its
     `plugin.json` `hooks` field names: an inline map, a file, or a list."""
@@ -97,7 +112,7 @@ def _plugin_hook_commands(root: Path) -> set:
     for ref in refs if isinstance(refs, list) else [refs]:
         if isinstance(ref, dict):
             _commands(ref, found)
-        elif isinstance(ref, str):
+        elif isinstance(ref, str) and _inside_plugin(ref):
             _commands(_read_json(root / ref), found)
     return found
 
@@ -112,7 +127,9 @@ def hook_owners(plugins_dir: Path) -> dict:
     for pid, installs in (plugins.items() if isinstance(plugins, dict) else ()):
         for inst in installs if isinstance(installs, list) else ():
             root = inst.get("installPath") if isinstance(inst, dict) else None
-            for cmd in _plugin_hook_commands(Path(root)) if root else ():
+            if not (isinstance(root, str) and root):
+                continue
+            for cmd in _plugin_hook_commands(Path(root)):
                 owners.setdefault(cmd, set()).add(str(pid).split("@")[0])
     return {cmd: "+".join(sorted(names)) for cmd, names in owners.items()}
 
@@ -178,7 +195,7 @@ def _json_answer(stdout) -> str | None:
         return None
     try:
         data = json.loads(stdout)
-    except ValueError:
+    except _JSON_ERRORS:
         return None
     hso = data.get("hookSpecificOutput") if isinstance(data, dict) else None
     text = hso.get("additionalContext") if isinstance(hso, dict) else None
@@ -188,8 +205,14 @@ def _json_answer(stdout) -> str | None:
 def _int(value) -> int:
     try:
         return int(value or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):       # Infinity parses as a float
         return 0
+
+
+def _key(value) -> str | None:
+    """An id as a set or dict key. Claude Code writes ids as strings; a list or
+    an object where one belongs cannot be hashed, so it reads as no id."""
+    return value if isinstance(value, str) else None
 
 
 class _Reader:
@@ -209,8 +232,8 @@ class _Reader:
             return True
         return any(marker in line for marker in _MARKERS)
 
-    def row(self, row: dict, line: str) -> None:
-        uid = row.get("uuid")
+    def row(self, row: dict) -> None:
+        uid = _key(row.get("uuid"))
         if uid is not None:
             if uid in self.seen_rows:
                 return
@@ -226,7 +249,7 @@ class _Reader:
         elif kind == "system" and row.get("subtype") == "compact_boundary":
             self._close()
         elif kind == "attachment" and isinstance(row.get("attachment"), dict):
-            self._attachment(row["attachment"], line)
+            self._attachment(row["attachment"])
 
     def _assistant(self, row: dict, ts) -> None:
         msg = row.get("message")
@@ -234,7 +257,7 @@ class _Reader:
             return
         if msg.get("model") == "<synthetic>":
             return
-        mid = msg.get("id") or row.get("requestId")
+        mid = _key(msg.get("id")) or _key(row.get("requestId"))
         if mid not in self.index:
             usage = msg["usage"]
             self.index[mid] = len(self.calls)
@@ -248,7 +271,8 @@ class _Reader:
                 found = classify_lookup(block)
                 if found:
                     self.lookups[self.index[mid]].add(found)
-                    self.lookup_ids.add(block.get("id"))
+                    if _key(block.get("id")) is not None:
+                        self.lookup_ids.add(block["id"])
 
     def _user(self, row: dict) -> None:
         msg = row.get("message") if isinstance(row.get("message"), dict) else {}
@@ -261,13 +285,13 @@ class _Reader:
         for block in content if isinstance(content, list) else ():
             if not (isinstance(block, dict) and block.get("type") == "tool_result"):
                 continue
-            tool_id = block.get("tool_use_id")
+            tool_id = _key(block.get("tool_use_id"))
             if tool_id in self.lookup_ids and tool_id not in self.charged:
                 self.charged.add(tool_id)
                 chars = sum(len(p) for p in _pieces(block.get("content")))
                 self.open_res.append((len(self.calls), chars))
 
-    def _attachment(self, att: dict, line: str) -> None:
+    def _attachment(self, att: dict) -> None:
         kind = str(att.get("type"))
         if "hookEvent" not in att and not kind.startswith("hook_"):
             return
@@ -283,10 +307,14 @@ class _Reader:
             return
         owner = hook_owner(str(att.get("command") or ""), self.owners)
         ms = att.get("durationMs")
+        text = "\n".join(_pieces(att.get("content")))
+        # Claude Code swaps an oversized output for this preview. A hook that
+        # merely quotes the phrase, or an error carrying it, is not too large.
+        too_large = (text.lstrip().startswith("<persisted-output>")
+                     and "Output too large" in text)
         self.runs.append((owner, event, kind, ms if isinstance(ms, (int, float)) else None,
-                          "Output too large" in line))
+                          too_large))
         if kind == "hook_success":
-            text = "\n".join(_pieces(att.get("content")))
             if text and event in _INJECTING_EVENTS:
                 self.open_inj.append((len(self.calls), event, owner, len(text)))
             answer = _json_answer(att.get("stdout"))
@@ -317,25 +345,26 @@ class _Reader:
 
 
 def read_transcript(path: Path, owners: dict, *, subagent: bool,
-                    project_dir: Path | None = None) -> Session | None:
-    """One transcript as a Session, or None when it holds no call and no hook
-    run. Unreadable files and malformed lines are skipped, never raised."""
+                    project_dir: Path | None = None) -> tuple[Session | None, bool]:
+    """`(session, readable)` for one transcript. `session` is None when the
+    file holds no call and no hook run. `readable` is False when opening or
+    reading it failed, part-way included: what was read is then dropped, not
+    reported as the whole file. Malformed lines are skipped; nothing raises."""
     reader = _Reader(owners, subagent)
     try:
-        fh = open(path, encoding="utf-8", errors="replace")
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if not reader.wants(line):
+                    continue
+                try:
+                    row = json.loads(line)
+                except _JSON_ERRORS:
+                    continue
+                if isinstance(row, dict):
+                    reader.row(row)
     except OSError:
-        return None
-    with fh:
-        for line in fh:
-            if not reader.wants(line):
-                continue
-            try:
-                row = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(row, dict):
-                reader.row(row, line)
-    return reader.session(Path(path), Path(project_dir or Path(path).parent))
+        return None, False
+    return reader.session(Path(path), Path(project_dir or Path(path).parent)), True
 
 
 def _iso(moment: datetime) -> str:
@@ -345,7 +374,8 @@ def _iso(moment: datetime) -> str:
 def scan(claude_dir=None, *, days: float | None = 7, now: datetime | None = None) -> Scan:
     """Every transcript under `<claude_dir>/projects` whose session started in
     the last `days` (None: all of them). A file last written before the cutoff
-    cannot hold a call inside the window, so it is skipped unread."""
+    cannot hold a call inside the window, so it is skipped unread; one that
+    cannot be stat'd, opened or read through is counted unreadable."""
     claude_dir = Path(claude_dir) if claude_dir else default_claude_dir()
     root = claude_dir / "projects"
     now = now or datetime.now(timezone.utc)
@@ -366,10 +396,15 @@ def scan(claude_dir=None, *, days: float | None = 7, now: datetime | None = None
                 result.files_skipped += 1
                 continue
         except OSError:
+            result.files_unreadable += 1
             continue
         parts = path.relative_to(root).parts
-        session = read_transcript(path, owners, subagent="subagents" in parts[:-1],
-                                  project_dir=root / parts[0])
+        session, readable = read_transcript(path, owners,
+                                            subagent="subagents" in parts[:-1],
+                                            project_dir=root / parts[0])
+        if not readable:
+            result.files_unreadable += 1
+            continue
         result.files_read += 1
         if session is not None and (since is None or session.first_ts >= since):
             result.sessions.append(session)

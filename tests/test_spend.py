@@ -319,6 +319,100 @@ def test_malformed_lines_are_skipped(claude):
     assert spend.baseline(_scan(claude))["tokens"]["interactive"]["ctx_tokens"] == 200
 
 
+def test_rows_with_wrong_typed_ids_or_numbers_are_read_not_raised(claude):
+    """Totality past the JSON parse: a row Claude Code would never write -- a
+    list or an object where an id belongs, Infinity in a usage count -- is
+    measured as far as it can be, and the rest of the transcript still counts."""
+    odd_uuid = {**_call("w1", _t(minute=1), read=100), "uuid": ["not", "a", "str"]}
+    odd_mid = _call("w2", _t(minute=2), read=200)
+    odd_mid["message"]["id"] = {"odd": 1}             # falls back to the requestId
+    odd_tool = _call("w3", _t(minute=3), read=300,
+                     tools=[(["t", "x"], "Bash", {"command": 'hive recall "x"'})])
+    odd_result = _result("t", "r", _t(minute=3))
+    odd_result["message"]["content"][0]["tool_use_id"] = ["t", "x"]
+    endless = _call("w4", _t(minute=4), read=400)
+    endless["message"]["usage"]["input_tokens"] = float("inf")   # written as Infinity
+    huge = json.dumps(_call("w5", _t(minute=5), read=500), separators=(",", ":")
+                      ).replace('"output_tokens":0', '"output_tokens":1e999')
+    _write(claude, "C--odd/s1.jsonl", [_prompt("hi", _t(minute=0)), odd_uuid, odd_mid,
+                                       odd_tool, odd_result, endless, huge])
+
+    scan = _scan(claude)
+
+    tok = spend.baseline(scan)["tokens"]["interactive"]
+    assert (tok["calls"], tok["ctx_tokens"]) == (5, 100 + 200 + 300 + 400 + 500)
+    assert spend.lookups(scan)["lookup_calls"] == 1
+
+
+def test_json_nested_past_the_parser_s_depth_is_skipped_not_raised(claude):
+    """Past its depth limit `json.loads` raises RecursionError, which is not a
+    ValueError: a transcript line, a hook's JSON answer and the plugin
+    registry each meet it here."""
+    deep = "[" * 100000 + "]" * 100000
+    (claude / "plugins").mkdir()
+    (claude / "plugins" / "installed_plugins.json").write_text(
+        '{"plugins":' + deep + "}", encoding="utf-8")
+    _write(claude, "C--d/s1.jsonl", [
+        deep,
+        _hook(_t(minute=0), command=MH_CMD, stdout='{"a":' * 100000 + "1" + "}" * 100000),
+        _prompt("hi", _t(minute=0)),
+        _call("d1", _t(minute=1), read=10), _call("d2", _t(minute=2), read=10)])
+
+    scan = _scan(claude)
+
+    assert scan.files_read == 1
+    assert spend.baseline(scan)["tokens"]["interactive"]["ctx_tokens"] == 20
+    assert _by(spend.hooks(scan)["health"], owner="mindhive")["runs"] == 1
+
+
+class _FailingFile:
+    """Yields one line, then fails the way a read can on Windows when another
+    process truncates or locks the transcript mid-scan."""
+
+    def __init__(self, line):
+        self.line = line
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def __iter__(self):
+        yield self.line
+        raise OSError(22, "Invalid argument")
+
+
+def test_a_transcript_that_fails_mid_read_is_counted_unreadable(claude, monkeypatch):
+    from mindhive import spend_scan
+    path = _write(claude, "C--r/s1.jsonl", [
+        _prompt("hi", _t(minute=0)),
+        _call("f1", _t(minute=1), read=10), _call("f2", _t(minute=2), read=10)])
+    first = path.read_text(encoding="utf-8").splitlines(keepends=True)[0]
+    monkeypatch.setattr(spend_scan, "open", lambda *a, **k: _FailingFile(first),
+                        raising=False)
+
+    scan = _scan(claude)
+
+    assert (scan.files_read, scan.files_unreadable, scan.sessions) == (0, 1, [])
+    assert spend.baseline(scan)["source"]["transcripts_unreadable"] == 1
+
+
+def test_a_transcript_that_cannot_be_opened_is_unreadable_not_read(claude, monkeypatch):
+    """CANARY beside the mid-read case: the open itself failing was already
+    total, but it was counted as a transcript read."""
+    from mindhive import spend_scan
+    _write(claude, "C--r/s1.jsonl", [_prompt("hi", _t(minute=0))])
+
+    def refuse(*args, **kwargs):
+        raise PermissionError(13, "denied")
+    monkeypatch.setattr(spend_scan, "open", refuse, raising=False)
+
+    scan = _scan(claude)
+
+    assert (scan.files_read, scan.files_unreadable) == (0, 1)
+
+
 # --- 3. hooks: owner, health, injection ---------------------------------------
 
 def _hooks_world(claude):
@@ -496,6 +590,85 @@ def test_without_plugin_maps_the_command_rules_still_attribute(claude):
     assert {r["owner"] for r in health} == {"mindhive", "(unattributed)", "protect-mcp"}
 
 
+def test_an_install_path_that_is_not_a_string_is_ignored(claude):
+    from mindhive import spend_scan
+    _plugins(claude)
+    registry = claude / "plugins" / "installed_plugins.json"
+    data = json.loads(registry.read_text(encoding="utf-8"))
+    data["plugins"]["odd@m"] = [{"installPath": ["a", "list"]}, {"installPath": 7},
+                                {"installPath": ""}, "not a dict"]
+    registry.write_text(json.dumps(data), encoding="utf-8")
+
+    assert spend_scan.hook_owners(claude / "plugins") == {SP_CMD: "superpowers",
+                                                         PV_CMD: "pensyve"}
+
+
+def test_a_manifest_hooks_path_outside_the_plugin_is_not_followed(claude, tmp_path,
+                                                                  monkeypatch):
+    """A plugin.json `hooks` string names a file relative to the plugin root.
+    An absolute path or a `..` step would read whatever the manifest names, and
+    a UNC path would make `hive spend` open a connection to that share."""
+    from mindhive import spend_scan
+    elsewhere = tmp_path / "ELSEWHERE.json"
+    root = claude / "plugins" / "cache" / "m" / "p" / "1.0.0"
+    (root / ".claude-plugin").mkdir(parents=True)
+    for path, command in ((elsewhere, "ELSEWHERE-CMD"), (root / "inside.json", "INSIDE-CMD")):
+        path.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": command}]}]}}), encoding="utf-8")
+    (root / ".claude-plugin" / "plugin.json").write_text(json.dumps({"hooks": [
+        "./inside.json", str(elsewhere), "../" * 6 + "ELSEWHERE.json",
+        "//attacker.invalid/share/h.json"]}), encoding="utf-8")
+    (claude / "plugins" / "installed_plugins.json").write_text(json.dumps(
+        {"plugins": {"p@m": [{"installPath": str(root)}]}}), encoding="utf-8")
+    asked, real = [], spend_scan._read_json
+
+    def spy(path):
+        asked.append(str(path).replace("\\", "/"))
+        # The test itself must never reach for a share, whatever the code does.
+        return None if asked[-1].startswith("//") else real(path)
+    monkeypatch.setattr(spend_scan, "_read_json", spy)
+
+    owners = spend_scan.hook_owners(claude / "plugins")
+
+    assert owners == {"INSIDE-CMD": "p"}            # the relative file still counts
+    assert not [a for a in asked if "ELSEWHERE" in a or "attacker.invalid" in a]
+
+
+@pytest.mark.parametrize("command, owner", [
+    (CACHE_CMD, "protect-mcp"),
+    ('node "C:\\Users\\x\\.claude\\plugins\\cache\\m\\my-plugin_2.0\\h.js"', "my-plugin_2.0"),
+    ("cd ~/.claude/plugins/cache/m/tail-end", "tail-end"),
+    # A plugin segment that runs on into command text is not a plugin name:
+    ("PLUGIN_DIR=~/.claude/plugins/cache/m/plug;KEY=TOPSECRET;node x.js", "(unattributed)"),
+    ("X=~/.claude/plugins/cache/m/plug&&echo TOPSECRET", "(unattributed)"),
+])
+def test_the_cache_path_rule_takes_only_a_whole_plugin_name(command, owner):
+    """The cache-path owner is printed, so it must be a name, never a slice of
+    the command after it."""
+    from mindhive import spend_scan
+    assert spend_scan.hook_owner(command, {}) == owner
+
+
+def test_output_too_large_is_read_off_the_persisted_output_wrapper(claude):
+    """Claude Code swaps an oversized hook output for a `<persisted-output>`
+    preview. Searching the whole raw row also counted a hook that merely
+    quoted the phrase, or an error whose stderr carried it."""
+    quoting = _hook(_t(minute=0), command=MH_CMD,
+                    content="notes: the Output too large (31.5KB) bug is fixed")
+    failing = _hook(_t(minute=0), kind="hook_non_blocking_error", command=MH_CMD)
+    failing["attachment"]["stderr"] = "Output too large"
+    _write(claude, "C--t/s1.jsonl", [
+        quoting, failing,
+        _hook(_t(minute=0), command=MH_CMD,
+              content="<persisted-output>\nOutput too large (31.5KB). Full output saved"),
+        _prompt("go", _t(minute=1)),
+        _call("t1", _t(minute=2), read=10), _call("t2", _t(minute=3), read=10)])
+
+    mh = _by(spend.hooks(_scan(claude))["health"], owner="mindhive", event="SessionStart")
+
+    assert (mh["runs"], mh["output_too_large"]) == (3, 1)
+
+
 # --- 4. lookups ---------------------------------------------------------------
 
 @pytest.mark.parametrize("name, inp, kind", [
@@ -670,8 +843,15 @@ def test_load_snapshot_refuses_a_missing_file(tmp_path):
 
 # --- 7. namespaces --------------------------------------------------------------
 
-def test_baseline_attributes_sessions_to_mindhive_namespaces(claude, monkeypatch):
-    monkeypatch.delenv("MINDHIVE_PROJECT", raising=False)
+@pytest.mark.parametrize("pinned", [None, "pinned"])
+def test_baseline_attributes_sessions_to_mindhive_namespaces(claude, monkeypatch, pinned):
+    """Each folder is placed by its own recorded cwd. MINDHIVE_PROJECT pins the
+    namespace this process writes to; read as a placement it folded every
+    folder on the machine into that one row."""
+    if pinned:
+        monkeypatch.setenv("MINDHIVE_PROJECT", pinned)
+    else:
+        monkeypatch.delenv("MINDHIVE_PROJECT", raising=False)
     for d, cwd in (("C--alpha", "C:/nowhere/alpha"), ("C--beta", "C:/nowhere/beta")):
         _write(claude, f"{d}/s1.jsonl", [
             {**_prompt("hi", _t(minute=0)), "cwd": cwd},
@@ -769,38 +949,108 @@ def test_cli_an_unreadable_explicit_snapshot_is_exit_2(claude, tmp_path, capsys)
     assert "absent.json" in capsys.readouterr().err
 
 
+def test_cli_an_empty_against_is_exit_2_not_the_default_snapshot(claude, capsys):
+    """`--against ""` used to fall through to the newest snapshot and print a
+    comparison the caller never asked for."""
+    _baseline_world(claude)
+    _snapshot()
+
+    code = _cli("baseline", "--claude-dir", str(claude), "--all", "--against", "")
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "--against" in captured.err and "against" not in captured.out
+
+
+def test_cli_an_unreadable_default_snapshot_is_warned_about_not_fatal(claude, capsys):
+    """CANARY beside the explicit case: the same unreadable file, found rather
+    than named, warns and prints the report without a comparison."""
+    _baseline_world(claude)
+    _snapshot().write_text("{not json", encoding="utf-8")
+
+    code = _cli("baseline", "--claude-dir", str(claude), "--all")
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert captured.err.startswith("hive spend: warning:")
+    assert "against" not in captured.out and "interactive" in captured.out
+
+
+@pytest.mark.parametrize("given", ["missing", "a file", "empty"])
+def test_cli_an_explicit_claude_dir_without_transcripts_is_exit_2(tmp_path, capsys,
+                                                                 monkeypatch, given):
+    """A mistyped --claude-dir printed an all-zero report and exit 0, and an
+    empty one silently read the default home instead."""
+    from mindhive import spend_scan
+    default = tmp_path / "default-home"
+    (default / "projects").mkdir(parents=True)
+    monkeypatch.setattr(spend_scan, "default_claude_dir", lambda: default)
+    target = tmp_path / "typo"
+    if given == "a file":
+        target.write_text("x", encoding="utf-8")
+
+    code = _cli("baseline", "--claude-dir", "" if given == "empty" else str(target),
+                "--all", "--no-compare")
+
+    assert code == 2
+    assert "no Claude Code transcripts" in capsys.readouterr().err
+
+
 def test_cli_days_must_be_positive(claude):
     assert _cli("hooks", "--claude-dir", str(claude), "--days", "0") == 2
 
 
 @pytest.mark.parametrize("report", ["baseline", "hooks", "lookups", "agents"])
 def test_cli_every_report_runs_in_text_and_json(claude, capsys, report):
+    """Every report closes the way the repo's read-only reports do, and the two
+    that estimate tokens from characters say so, in both forms."""
     _baseline_world(claude)
     _hooks_world(claude)
     _lookup_world(claude)
+    estimates = report in ("hooks", "lookups")
 
     assert _cli(report, "--claude-dir", str(claude), "--all") == 0
     text = capsys.readouterr().out
-    assert text.strip()
+    assert text.rstrip().endswith("This command is read-only and changed nothing.")
+    assert ("are estimates (~4 chars/token)" in text) == estimates
     assert _cli(report, "--claude-dir", str(claude), "--all", "--json") == 0
-    assert json.loads(capsys.readouterr().out)["report"] == report
+    out = json.loads(capsys.readouterr().out)
+    assert out["report"] == report
+    assert out.get("chars_per_token") == (4 if estimates else None)
 
 
 @pytest.mark.parametrize("report", ["baseline", "hooks", "lookups", "agents"])
 def test_no_report_prints_a_prompt_a_command_or_hook_text(claude, capsys, report):
-    """Aggregates only: what a session typed, ran or was handed by a hook
-    never reaches the output, in either form."""
+    """Aggregates only: what a session typed, ran or was handed by a hook --
+    and what a subagent was asked -- never reaches the output, in either form.
+    Each JSON leg is first shown to have measured the planted rows; a report
+    that saw nothing would pass this vacuously."""
     _plugins(claude)
+    leaky = "PLUGIN_DIR=~/.claude/plugins/cache/mkt/plug;KEY=TOPSECRET-CMD2;node x.js"
     _write(claude, "C--p/s1.jsonl", [
         _hook(_t(minute=0), command=OTHER_CMD + " TOPSECRET-HOOK",
               content="TOPSECRET-INJECTED"),
+        _hook(_t(minute=0), event="UserPromptSubmit", command=leaky,
+              content="TOPSECRET-INJECTED2"),
         _prompt("TOPSECRET-PROMPT", _t(minute=0)),
         _call("p1", _t(minute=1), read=10,
               tools=[("t1", "Bash", {"command": "hive recall TOPSECRET-CMD"})]),
         _result("t1", "TOPSECRET-RESULT", _t(minute=1)),
         _call("p2", _t(minute=2), read=10),
     ])
+    sub = _write(claude, "C--p/s1/subagents/agent-a1.jsonl", [
+        _prompt("TOPSECRET-SUBAGENT-PROMPT", _t(minute=3)),
+        _call("q1", _t(minute=4), read=10), _call("q2", _t(minute=5), read=10)])
+    sub.with_name(sub.stem + ".meta.json").write_text(json.dumps(
+        {"agentType": "Explore", "description": "TOPSECRET-DESCRIPTION"}), encoding="utf-8")
+    measured = {"baseline": lambda r: r["tokens"]["interactive"]["sessions"] == 1,
+                "hooks": lambda r: sum(row["runs"] for row in r["health"]) == 2,
+                "lookups": lambda r: r["lookup_calls"] == 1,
+                "agents": lambda r: r["total"]["sessions"] == 1}
 
-    for extra in ((), ("--json",)):
+    for extra in (("--json",), ()):
         assert _cli(report, "--claude-dir", str(claude), "--all", *extra) == 0
-        assert "TOPSECRET" not in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "TOPSECRET" not in out
+        if extra:
+            assert measured[report](json.loads(out))

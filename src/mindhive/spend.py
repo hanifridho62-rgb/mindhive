@@ -23,6 +23,10 @@ the snapshot number for number, which is how Fase 0.5 judges the plugin diet.
   `mindhive`. A `hook_additional_context` piece carries no command; it takes
   the owner of the run whose JSON answer it repeats, else `(no command)`. Such
   pieces are context, not runs, so hook health does not count them.
+- **Output too large** is a run whose output Claude Code replaced with its
+  `<persisted-output>` preview; a hook that only quotes the phrase is not.
+- **A namespace** is where harvest places a transcript folder: by its own
+  recorded cwd, with MINDHIVE_PROJECT not honoured.
 - **Injected hook text and lookup results** stay in context for every call
   after them until the next `compact_boundary`, at `CHARS_PER_TOKEN`.
 - **A row a transcript repeats** under a `uuid` it already holds counts once.
@@ -31,6 +35,7 @@ the snapshot number for number, which is how Fase 0.5 judges the plugin diet.
 
 Hook health counts every session in the window; the token reports count the
 sessions with two or more calls, injection and lookups the interactive ones.
+A transcript that cannot be read through counts as unreadable, never as read.
 Aggregates only: no prompt, command, hook output or tool result reaches a
 report. Nothing here writes. The reading half lives in `spend_scan.py`.
 """
@@ -95,12 +100,15 @@ def _agg(sessions: list) -> dict:
 def _frame(scan_: Scan, report: str) -> dict:
     return {"schema": SCHEMA, "report": report, "since": scan_.since,
             "source": {"root": str(scan_.root), "transcripts_read": scan_.files_read,
-                       "transcripts_skipped_as_older": scan_.files_skipped}}
+                       "transcripts_skipped_as_older": scan_.files_skipped,
+                       "transcripts_unreadable": scan_.files_unreadable}}
 
 
 def _by_namespace(sessions: list) -> list:
     """Sessions per MindHive namespace, read off each transcript folder's
-    recorded cwd the way harvest places them."""
+    recorded cwd the way harvest places them. MINDHIVE_PROJECT names the
+    namespace this process writes to, not where other folders belong, so it
+    is not honoured here."""
     from . import harvest
     placed: dict = {}
     groups: dict = {}
@@ -108,7 +116,7 @@ def _by_namespace(sessions: list) -> list:
         if s.project_dir not in placed:
             try:
                 placed[s.project_dir] = harvest.project_for_transcript_dir(
-                    s.project_dir) or "(unplaced)"
+                    s.project_dir, honor_env=False) or "(unplaced)"
             except Exception:  # noqa: BLE001 - a report never dies on one folder
                 placed[s.project_dir] = "(unplaced)"
         row = groups.setdefault(placed[s.project_dir], [0, 0, 0])
@@ -159,7 +167,7 @@ def hooks(scan_: Scan) -> dict:
              "share": _share(c["tokens"], ctx)} for (e, o), c in cost.items()]
     rows.sort(key=lambda r: (-r["tokens"], r["event"], r["owner"]))
     total = sum(c["tokens"] for c in cost.values())
-    return {**_frame(scan_, "hooks"), "health": health,
+    return {**_frame(scan_, "hooks"), "chars_per_token": CHARS_PER_TOKEN, "health": health,
             "injection": {"sessions": len(interactive), "ctx_tokens": ctx, "rows": rows,
                           "total_tokens": round(total), "total_share": _share(total, ctx)}}
 
@@ -181,7 +189,8 @@ def lookups(scan_: Scan) -> dict:
         per_session.append(n)
         results += sum(chars / CHARS_PER_TOKEN * kept for chars, kept in s.lookup_results)
     looked = sum(per_session)
-    return {**_frame(scan_, "lookups"), "sessions": len(interactive), "calls": calls,
+    return {**_frame(scan_, "lookups"), "chars_per_token": CHARS_PER_TOKEN,
+            "sessions": len(interactive), "calls": calls,
             "ctx_tokens": ctx, "lookup_calls": looked,
             "lookup_call_pct": round(100 * looked / calls, 2) if calls else None,
             "lookup_ctx_share": _share(lookup_ctx, ctx),

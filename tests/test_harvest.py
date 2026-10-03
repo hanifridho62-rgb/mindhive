@@ -600,7 +600,7 @@ def test_assistant_response_capped_at_5000_words(tmp_path, monkeypatch):
 
 def test_project_for_transcript_dir_extracts_first_cwd(tmp_path, monkeypatch):
     _isolate(tmp_path, monkeypatch)
-    monkeypatch.setattr(harvest.paths, "detect_project", lambda p: p.name)
+    monkeypatch.setattr(harvest.paths, "detect_project", lambda p, **_: p.name)
     d = tmp_path / "enc"
     d.mkdir()
     lines = [json.dumps({"cwd": "C:/ProjX"})] + [json.dumps({"i": i}) for i in range(200)]
@@ -620,11 +620,11 @@ def test_project_for_transcript_dir_skips_malformed_cwd_line(tmp_path, monkeypat
     """A malformed line containing '"cwd"' must not abandon the whole file — a
     later valid cwd line still resolves the project."""
     _isolate(tmp_path, monkeypatch)
-    monkeypatch.setattr(harvest.paths, "detect_project", lambda p: p.name)
+    monkeypatch.setattr(harvest.paths, "detect_project", lambda p, **_: p.name)
     d = tmp_path / "enc"
     d.mkdir()
     lines = [
-        '{"cwd": "C:/Broken"',                       # truncated JSON, has "cwd"
+        '{"cwd": "C:/Broken"',                      # truncated JSON, has "cwd"
         json.dumps({"cwd": "C:/ProjY"}),             # valid, later
     ]
     (d / "s.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")

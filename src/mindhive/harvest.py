@@ -786,10 +786,11 @@ def claude_projects_root() -> Path:
     return Path.home() / ".claude" / "projects"
 
 
-def project_for_transcript_dir(d) -> str | None:
+def project_for_transcript_dir(d, *, honor_env: bool = True) -> str | None:
     """Infer the MIND HIVE project namespace for a Claude transcript directory
     by reading the first ``cwd`` recorded in any transcript and applying the
-    normal project detection. None when no cwd is found (can't be placed)."""
+    normal project detection. None when no cwd is found (can't be placed).
+    ``honor_env`` goes to `paths.detect_project`."""
     for f in sorted(Path(d).glob("*.jsonl")):
         try:
             # Stream and stop at the first cwd (it's near the top) instead of
@@ -807,7 +808,7 @@ def project_for_transcript_dir(d) -> str | None:
                         # dropped from catch_up entirely.
                         continue
                     if cwd:
-                        return paths.detect_project(Path(cwd))
+                        return paths.detect_project(Path(cwd), honor_env=honor_env)
         except OSError:
             continue
     return None
