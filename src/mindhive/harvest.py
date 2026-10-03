@@ -147,8 +147,20 @@ def _is_injected(o, text: str) -> bool:
     is not: only SOME injected bodies open with the skill marker. A reference
     document that merely CONTAINS 'Caveat:' mid-body passed the prefix guard
     and was mined for a memo, minting junk caveats from text the user never
-    wrote. The prefix check stays as a fallback for rows without the field."""
-    return bool((o or {}).get("isMeta")) or _is_injected_prompt(text)
+    wrote. The prefix check stays as a fallback for rows without the field.
+
+    A compaction summary is the other machine-written user-role row: Claude
+    Code writes it back stamped ``isCompactSummary: True``, never ``isMeta``.
+    With only ``isMeta`` read, every summary was filed as the operator's
+    prompt and mined for a memo at its first 'decision:' or 'caveat:'; 51 of
+    221 summary rows over 80 transcripts did, measured 2026-10-03. It gets no
+    text-prefix fallback: the flag sat on all 221 and on no other row, and the
+    summary's opening sentence is also what a user pastes when they carry a
+    summary over by hand, and a pasted summary is typed input."""
+    o = o or {}
+    if o.get("isMeta") or o.get("isCompactSummary"):
+        return True
+    return _is_injected_prompt(text)
 
 
 _CMD_NAME_RE = re.compile(r"<command-name>\s*/?([^<\s]+)\s*</command-name>")
@@ -458,7 +470,8 @@ def _items_from_obj(o, prev=None, pending=None) -> list:
                 items.append({"kind": "memo", "value": _cap_words(val), "memo_type": mtype})
         # Capture the typed prompt itself so EVERY prompt enters the hive — not
         # only marker-bearing ones. Skip harness-injected rows — `_is_injected`
-        # reads the ``isMeta`` envelope first and falls back to the body mark.
+        # reads the envelope first (``isMeta``, or ``isCompactSummary`` on a
+        # compaction summary) and falls back to the body mark.
         # The envelope half is load-bearing here because `_skill_from_command`
         # accepts bodies that do NOT carry the mark: without it the very row
         # just recognised as a machine-written skill body is also filed as
