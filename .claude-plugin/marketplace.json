@@ -9,7 +9,7 @@
     {
       "name": "mindhive",
       "description": "MindHive — /circle drives the headless Claude Code CLI until a task is done (budget-gated, circuit-broken) — the loop primitive; /mindhive orchestrates an idea end-to-end with ULT-IDEA rigor on a memory spine (recall-before-ask preflight, five-gap idea pressure test, agent-native architecture review, scored skill Recommendation Matrix, follow-up chaining, learnings logged back — portable across Claude Code, Cowork, and NewTask); /mindhive-orchestrator is the single centralized pipeline: a ten-stage sequential, dynamic workflow (brainstorm → plan → observation → understand → PRD → matrix → kanban → execution → quality → learning) with the superpowers + compound-engineering plugins as its execution backbone and a parallel sub-agent layer over a file-complexity cluster database (hive clusters); /engineering-loop fuses circle+lfg into a memory-driven plan→work→review→fix→verify→learn loop, with any skill callable through MindHive (green/red) and failures feeding an improvement loop; /caveman is the presentation layer — ultra-compressed replies at lite/full/ultra/wenyan intensity, held in the user's own language, code and error strings verbatim (vendored MIT from JuliusBrussee/caveman).",
-      "version": "0.5.0",
+      "version": "0.5.1",
       "source": "./",
       "author": {
         "name": "hanifridho62",
