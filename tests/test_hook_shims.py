@@ -88,6 +88,10 @@ PAYLOAD = ('{"session_id":"sh-test-1","tool_name":"Bash",'
 
 REMINDER = "MIND HIVE: before compaction, fold this session"
 
+# The one line `session_start` writes on stderr when it fails open, up to what
+# failed. `tests/test_hook_shims_ps.py` pins the same text for the `.ps1` twin.
+FAILED_OPEN = "mindhive session_start: failed open: "
+
 sh_missing = pytest.mark.skipif(shutil.which("sh") is None,
                                 reason="no POSIX sh on this machine")
 
@@ -246,6 +250,22 @@ def _lines(fake) -> list:
                 if ln.strip()]
     except OSError:
         return []
+
+
+def assert_failed_open(name, got, cause):
+    """A shim's stderr after it failed open: empty for every shim but
+    `session_start`, which names its failure in exactly ONE line carrying
+    *cause*. Claude Code drops a SessionStart hook's transcript row only when
+    its content, stdout and stderr are all empty, and `hive spend` reads a
+    typed session whose MindHive SessionStart left no row as a headless child;
+    the line keeps the row."""
+    if name != "session_start":
+        assert got.stderr == "", (name, got.stderr)
+        return
+    lines = got.stderr.splitlines()
+    assert len(lines) == 1, (name, got.stderr)
+    assert lines[0].startswith(FAILED_OPEN), (name, got.stderr)
+    assert cause in lines[0], (name, cause, got.stderr)
 
 
 # --- the drift guard -----------------------------------------------------------
@@ -673,6 +693,7 @@ def test_a_headless_child_does_nothing_at_all(name, fake_python):
     got = run_shim(name, env=env)
     assert got.returncode == 0
     assert got.stdout == ""
+    assert got.stderr == "", got.stderr
     assert logged(fake_python) == [], "a headless run still spawned an interpreter"
 
 
@@ -713,6 +734,9 @@ def test_a_shim_survives_an_interpreter_that_fails(name, fake_python):
     assert "ModuleNotFoundError" not in got.stdout
     assert "ModuleNotFoundError" not in got.stderr, (
         f"{name}.sh leaked the child's stderr to the user")
+    if name == "session_start":
+        # Its own line instead: the first failing call and its exit code.
+        assert_failed_open(name, got, cause="mindhive append session_start exited 3")
 
 
 @sh_missing
@@ -735,6 +759,7 @@ def test_a_shim_with_no_interpreter_is_a_silent_no_op(name, tmp_path):
         # The one deliberate exception: the reminder is the half a person acts
         # on, and it needs no working backend.
         assert REMINDER in got.stdout
+    assert_failed_open(name, got, cause="no Python interpreter resolved")
 
 
 # --- the library guard ---------------------------------------------------------
@@ -776,7 +801,7 @@ def test_a_shim_with_no_library_is_a_silent_no_op(name, tmp_path, fake_python):
     assert got.returncode == 0, (
         f"{name}.sh exited {got.returncode} with no lib.sh: {got.stderr!r}")
     assert got.stdout == ""
-    assert got.stderr == "", got.stderr
+    assert_failed_open(name, got, cause="lib.sh is missing")
     assert logged(fake_python) == []
 
 
@@ -789,17 +814,30 @@ def test_a_shim_with_a_broken_library_is_a_silent_no_op(name, tmp_path, fake_pyt
     assert got.returncode == 0, (
         f"{name}.sh exited {got.returncode} with a broken lib.sh: {got.stderr!r}")
     assert got.stdout == ""
-    assert got.stderr == "", got.stderr
+    assert_failed_open(name, got, cause="lib.sh does not load")
     assert logged(fake_python) == []
+
+
+# A guard in `session_start.sh` that names its failure before it exits.
+_REPORTED_EXIT = re.compile(r'\|\| \{ session_start_failed_open "[^"]*"; exit 0; \}')
 
 
 @sh_missing
 @pytest.mark.parametrize("name", sorted(STAGE))
 def test_the_library_guard_is_the_first_thing_after_the_headless_check(name):
     """Static: nothing may run between the headless guard and the proof that
-    the library loads, because anything there runs unguarded."""
+    the library loads, because anything there runs unguarded.
+
+    `session_start` alone defines its failure reporter in between -- a
+    definition, which runs nothing -- and has every guard name its failure
+    before it exits, so no bare `|| exit 0` is left in it. Read with those two
+    normalised away, its preamble must be the same as every other shim's."""
     body = code_lines(f"{name}.sh")
     body = [ln.strip() for ln in body if ln.strip()]
+    if name == "session_start":
+        assert body[1].startswith("session_start_failed_open() {"), body[1]
+        assert [ln for ln in body if "|| exit 0" in ln] == [], body
+        body = [body[0]] + [_REPORTED_EXIT.sub("|| exit 0", ln) for ln in body[2:]]
     assert body[0].startswith('if [ "${MINDHIVE_HEADLESS:-}" = "1" ]'), body[0]
     assert body[1].startswith("MINDHIVE_HOOK_DIR=$(CDPATH= cd --"), body[1]
     assert body[1].endswith("&& pwd -P) || exit 0"), body[1]
@@ -2189,3 +2227,69 @@ def test_a_failing_plugin_cache_check_leaves_session_start_quiet_and_exit_0(tmp_
                           env={**os.environ, **env})
     assert (bare.returncode, bare.stdout, bare.stderr) == (
         3, "", f"child stderr: {CACHE_CHECK}\n")
+
+
+# --- session_start names its failure on stderr when it fails open ---------------
+#
+# The POSIX half of the same section in `tests/test_hook_shims_ps.py`, which
+# says why: Claude Code keeps a SessionStart hook's transcript row only when its
+# content, stdout or stderr is non-empty, and `hive spend` files a typed session
+# whose MindHive SessionStart left no row as a headless child. One line on
+# stderr, the first failure only; never on stdout, never in a headless child.
+
+@sh_missing
+@pytest.mark.parametrize("fail, forwarded", [
+    ("append session_start", [DIRECTIVES, STATE, CACHE_CHECK]),
+    ("directives --brief", [STATE, CACHE_CHECK]),
+    ("state --brief", [DIRECTIVES, CACHE_CHECK]),
+], ids=["append", "directives", "state"])
+def test_a_failing_mindhive_call_is_named_in_one_stderr_line(tmp_path, fail, forwarded):
+    """Each checked call failing alone: the hook exits 0, names that call and
+    its exit code in one line, keeps the child's own stderr discarded, and
+    still forwards every other call's context."""
+    env, _ = _session_start_python(tmp_path, fail=fail)
+    got = run_shim("session_start", env=env)
+    assert got.returncode == 0, got.stderr
+    assert got.stderr.splitlines() == [f"{FAILED_OPEN}mindhive {fail} exited 3"], got.stderr
+    assert got.stdout.splitlines() == [f"child stdout: {c}" for c in forwarded], got.stdout
+
+
+@sh_missing
+def test_only_the_first_failure_is_named(tmp_path):
+    """Every call fails: still exactly ONE line, naming the first, while the
+    log shows the later calls ran all the same."""
+    env, log = _session_start_python(tmp_path, fail="-m mindhive")
+    got = run_shim("session_start", env=env)
+    assert got.returncode == 0, got.stderr
+    assert got.stderr.splitlines() == [
+        f"{FAILED_OPEN}mindhive append session_start exited 3"], got.stderr
+    assert got.stdout == "", got.stdout
+    assert STATE in log.read_text(encoding="utf-8").splitlines()
+
+
+@sh_missing
+def test_a_session_start_that_succeeds_says_nothing_on_stderr(tmp_path):
+    """The line marks a failure, so a run that succeeds writes nothing on
+    stderr. CANARY: the same fixture with one call failing does write the
+    line, so this silence is a verdict rather than a shim that cannot speak."""
+    env, _ = _session_start_python(tmp_path)
+    ok = run_shim("session_start", env=env)
+    assert ok.returncode == 0, ok.stderr
+    assert ok.stderr == "", ok.stderr
+    bad = run_shim("session_start", env={**env, "STUB_FAIL": "state --brief"})
+    assert len(bad.stderr.splitlines()) == 1, bad.stderr
+
+
+@sh_missing
+def test_a_headless_session_start_says_nothing_where_it_would_fail_open(tmp_path):
+    """`MINDHIVE_HEADLESS=1` still exits on the first line, before the line
+    could be written: no call, no stdout, no stderr. It runs first, so no
+    background call of the canary can reach the log. CANARY: the same fixture
+    without the flag names its failure."""
+    env, log = _session_start_python(tmp_path, fail="-m mindhive")
+    quiet = run_shim("session_start", env={**env, "MINDHIVE_HEADLESS": "1"})
+    assert (quiet.returncode, quiet.stdout, quiet.stderr) == (0, "", ""), quiet
+    assert not log.exists(), log.read_text(encoding="utf-8")
+    loud = run_shim("session_start", env=env)
+    assert loud.returncode == 0, loud.stderr
+    assert len(loud.stderr.splitlines()) == 1, loud.stderr

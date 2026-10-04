@@ -533,10 +533,16 @@ Each shim resolves its interpreter at run time through `hooks/lib.sh` (POSIX) or
    `lib.sh` also accepts an extensionless `#!` script, which that shell can
    exec and PowerShell cannot, so `lib.ps1` passes such a file over.
 
-If none of those resolve, every shim exits 0 and prints nothing — with one
-documented exception: `pre_compact` still prints its human reminder, because
+If none of those resolve, every shim exits 0 and prints nothing — with two
+documented exceptions. `pre_compact` still prints its human reminder, because
 that text is the whole point of the hook and needs no interpreter to compose.
-The silence is deliberate — these hooks fire in every session on the machine, so
+And `session_start` names its failure in one line on stderr
+(`mindhive session_start: failed open: <what>`, the first failure only, a
+failing `mindhive` call included), never on stdout, which is the context it
+injects: Claude Code drops a SessionStart hook's transcript row when its
+content, stdout and stderr are all empty, and `hive spend` reads a typed session
+whose MindHive SessionStart left no row as a headless child. Otherwise the
+silence is deliberate — these hooks fire in every session on the machine, so
 a hook that can fail loudly is worse than one that occasionally does nothing.
 
 So the whole setup is:

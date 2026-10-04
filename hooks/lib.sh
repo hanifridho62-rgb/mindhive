@@ -17,8 +17,10 @@
 # family names an interpreter path any more, and
 # `test_no_shim_hard_codes_an_interpreter_path` fails on a hard-code in either
 # spelling. So this resolves, in a fixed order, and answers nothing when it
-# cannot — the caller then exits 0 and the hook is a silent no-op, which is the
-# only acceptable failure for a hook.
+# cannot — the caller then exits 0 and the hook is a no-op, which is the only
+# acceptable failure for a hook. A silent one, in every shim but
+# `session_start.sh`, which names the failure in one line on stderr so Claude
+# Code keeps its transcript row.
 #
 # ## The order, and why the venv beats PATH
 #

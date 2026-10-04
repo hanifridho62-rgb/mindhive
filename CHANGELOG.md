@@ -15,7 +15,25 @@ history and grouped by what each release window introduced. They summarise;
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-10-04 (`a71b0ab`)
+
 ### Added
+
+- **`hive spend baseline`, `hooks`, `lookups` and `agents`** (Terion plan
+  item 0.3): read-only token-spend reports over Claude Code's own
+  transcripts, by the Fase 0.1 snapshot's definitions and read against the
+  namespace's newest `state/spend_baseline_*.json`. `spend_scan.py` reads each
+  transcript once, `spend.py` holds the definitions and folds the four
+  reports, `spendcli.py` registers the group; aggregates only, nothing is
+  written. `--since DATE` keeps the sessions that started at or after a moment
+  (UTC unless the time names an offset), and a `headless` kind holds the
+  children `claude_cli` starts with `MINDHIVE_HEADLESS=1`, in which MindHive's
+  SessionStart hook leaves no run while another owner's does;
+  `--include-headless` folds them back into interactive, which reproduces the
+  snapshot, and `--json` names the mode in `headless_split` (`separate`,
+  `folded`, `unavailable`) on every report but `agents`. A `--claude-dir`
+  with no `projects` directory, an empty `--claude-dir` or an empty
+  `--against` exits 2.
 
 - **Native pre-merge CI — `hive ci premerge`, `watch`, `conflicts`, `legs`**
   (spec `docs/superpowers/specs/2026-09-30-native-ci-premerge-design.md`):
@@ -204,6 +222,17 @@ history and grouped by what each release window introduced. They summarise;
 
 ### Changed
 
+- **The SessionStart hook names its failure on stderr when it fails open**
+  (`hooks/session_start.ps1`, `hooks/session_start.sh`): one line,
+  `mindhive session_start: failed open: <what>`, for the first failure only
+  (the library missing or not loading, no interpreter, a non-zero `append`,
+  `directives` or `state` call, an exception), never on stdout, and the exit
+  stays 0; a headless child (`MINDHIVE_HEADLESS=1`) stays silent. Claude Code
+  drops a SessionStart hook's transcript row only when its content, stdout and
+  stderr are all empty, so a silent failure left no row, and `hive spend`
+  filed the typed session it started as headless. Every other shim still fails
+  open in silence.
+
 - **The pending-embed queue is appended to, bounded, and counted before the
   lock** (merge-safety follow-ups to PR #136): `state/pending_embed.json` is
   now one JSON object per line — a semantic append is one `open(..., "a")` and
@@ -219,6 +248,24 @@ history and grouped by what each release window introduced. They summarise;
 
 ### Fixed
 
+- **The SessionStart hook's output stays under 6,000 characters.** It printed
+  the full directives (11 KB) and the full STATE.md (27 KB); Claude Code
+  persists hook output that large to a file and shows the session a 2 KB
+  preview, so every session start got the first 2 KB of the directives and
+  none of the state. It now prints `hive directives --brief` (at most 2,900
+  characters), `hive state --brief` (`STATE_BRIEF.md`, which `hive project`
+  renders beside STATE.md; at most 2,300) and the plugin cache-check line (at
+  most 700): shares of a cap held in `mindhive.sessionstart`, counted with
+  every newline as CRLF. `hive context --check` fails with
+  `session_start_over_cap` when a part is over its share. The full texts stay
+  at `hive directives` and `hive state`.
+- **Harvest no longer mints memos from compaction summaries.** Claude Code
+  writes a compaction summary back into the transcript as a user-role row
+  stamped `isCompactSummary`, never `isMeta`, and harvest filed each one as a
+  prompt the operator typed and mined it for a memo at its first `decision:`
+  or `caveat:`. `_is_injected` reads `isCompactSummary` beside `isMeta`, so a
+  summary becomes neither a memo nor a `user_prompt` capture. Memos already in
+  the ledgers stay: the ledger is append-only.
 - **`hive failures capture` takes the harvest lock.** `failures.capture_dir`
   stamps each `tool_failed` row with the transcript line's own timestamp and
   dedups against a snapshot taken before the walk, so the command run beside

@@ -85,13 +85,13 @@ def _boundary(ts):
 
 
 def _hook(ts, kind="hook_success", event="SessionStart", name=None, command="",
-          content="", stdout="", ms=100):
+          content="", stdout="", stderr="", ms=100):
     att = {"type": kind, "hookEvent": event, "hookName": name or event,
            "toolUseID": event}
     if kind == "hook_additional_context":
         att["content"] = content if isinstance(content, list) else [content]
     else:
-        att.update(command=command, content=content, stdout=stdout, stderr="",
+        att.update(command=command, content=content, stdout=stdout, stderr=stderr,
                    exitCode=0, durationMs=ms)
     return {"type": "attachment", "timestamp": ts, "uuid": _uid(), "attachment": att}
 
@@ -459,6 +459,37 @@ def test_a_mindhive_session_start_that_failed_still_ran(claude, kind):
         _call("f1", _t(minute=1), read=10), _call("f2", _t(minute=2), read=10)])
 
     assert spend.baseline(_scan(claude))["tokens"]["interactive"]["sessions"] == 1
+
+
+def test_a_mindhive_session_start_that_failed_open_on_stderr_still_ran(claude):
+    """`hooks/session_start.*` fails open with one line on stderr and nothing on
+    stdout. Claude Code 2.1.198's transcript filter drops a `hook_success` row
+    only when its content, stdout AND stderr are all empty, so that row is kept
+    -- empty content and stdout, the line in `stderr`, MindHive's command -- and
+    the typed session it started stays interactive.
+
+    CANARY in the same world: a session whose MindHive row is gone, which is
+    what a failure that printed nothing left, is filed as headless. The two are
+    told apart by their calls (10 against 700 context tokens each), so the
+    assertion cannot pass with the sessions swapped."""
+    _register_mindhive(claude)
+    _write(claude, "C--hl/failed-open.jsonl", [
+        _hook(_t(minute=0), command=SP_CMD, content="s"),
+        _hook(_t(minute=0), command=MH_CMD, content="", stdout="",
+              stderr="mindhive session_start: failed open: no Python interpreter resolved"),
+        _prompt("hi", _t(minute=0)),
+        _call("o1", _t(minute=1), read=10), _call("o2", _t(minute=2), read=10)])
+    _write(claude, "C--hl/silent.jsonl", [
+        _hook(_t(minute=10), command=SP_CMD, content="s"),
+        _prompt("hi", _t(minute=10)),
+        _call("q1", _t(minute=11), read=700), _call("q2", _t(minute=12), read=700)])
+
+    tokens = spend.baseline(_scan(claude))["tokens"]
+
+    assert tokens["interactive"]["sessions"] == 1
+    assert tokens["interactive"]["ctx_tokens"] == 20
+    assert tokens["headless"]["sessions"] == 1
+    assert tokens["headless"]["ctx_tokens"] == 1400
 
 
 @pytest.mark.parametrize("kind", ["chore", "subagent"])
