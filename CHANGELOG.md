@@ -15,7 +15,7 @@ history and grouped by what each release window introduced. They summarise;
 
 ## [Unreleased]
 
-## [0.5.1] — 2026-10-04
+## [0.5.1] — 2026-10-04 (`a71b0ab`)
 
 ### Added
 
