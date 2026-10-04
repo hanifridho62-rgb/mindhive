@@ -11,13 +11,30 @@ the snapshot number for number, which is how Fase 0.5 judges the plugin diet.
   cache_read_input`, counted once per message id (one reply is written as one
   row per content block), with `<synthetic>` replies skipped.
 - **A session** is one transcript. It is in the window when its first recorded
-  timestamp is, and it counts toward the token reports with at least two
-  calls. `subagent` = under a `subagents/` directory, `chore` = its first
-  prompt opens one of `CHORE_PREFIXES`, `interactive` = the rest. `"Use the "`
-  is the skill invoker's prompt (`invoker.py`); it also caught the snapshot's
-  five chores, which were headless probes ("Use the Write tool to create a
-  file named probe.txt…"), and it would misfile a typed prompt that opens
-  with those words, as the snapshot did.
+  timestamp is -- at or after `--since`, or within the last `--days` -- and
+  it counts toward the token reports with at least two calls. `subagent` =
+  under a `subagents/` directory, `chore` = its first prompt opens one of
+  `CHORE_PREFIXES`, `headless` = one of MindHive's headless children (below),
+  `interactive` = the rest. `"Use the "` is the skill invoker's prompt
+  (`invoker.py`); it also caught the snapshot's five chores, which were
+  headless probes ("Use the Write tool to create a file named probe.txt…"),
+  and it would misfile a typed prompt that opens with those words, as the
+  snapshot did.
+- **A headless session** is one in which MindHive's SessionStart hook left no
+  run while another owner's did. `claude_cli` starts its children -- an
+  auto-resume delivery, a mindnet mission -- with `MINDHIVE_HEADLESS=1`, on
+  which MindHive's hooks exit without a word and no other plugin's do; Claude
+  Code's own `entrypoint` cannot tell them apart, because a child inherits its
+  parent's. Loop and fabricate iterations (a loop-mode auto-resume too),
+  Workspace board agents and rotation successors start with their parent's
+  environment, so MindHive's hooks run in them and they count as
+  interactive. A SessionStart run whose command was not recorded is left
+  out: its owner cannot be read. The split needs a readable MindHive
+  SessionStart hook in `settings.json` (`headless_split: "unavailable"`
+  otherwise). The snapshot had no such kind: its `interactive` row holds
+  them, so `include_headless` (`"folded"`) reads against it like for like.
+  Either way the headless kind is then not measured, and `tokens` says
+  `None` for it, never a count of 0.
 - **A hook's owner** is read off its command: each installed plugin's hook
   map, then `plugins/cache/<marketplace>/<plugin>` in the command, then
   `mindhive`. A `hook_additional_context` piece carries no command; it takes
@@ -34,7 +51,8 @@ the snapshot number for number, which is how Fase 0.5 judges the plugin diet.
   rows, all in one transcript; its token figures are unaffected.
 
 Hook health counts every session in the window; the token reports count the
-sessions with two or more calls, injection and lookups the interactive ones.
+sessions with two or more calls, injection and lookups the interactive ones
+(headless ones too when folded).
 A transcript that cannot be read through counts as unreadable, never as read.
 Aggregates only: no prompt, command, hook output or tool result reaches a
 report. Nothing here writes. The reading half lives in `spend_scan.py`.
@@ -51,7 +69,7 @@ from .spend_scan import (CHORE_PREFIXES, NO_COMMAND, UNATTRIBUTED,  # noqa: F401
 
 SCHEMA = "mindhive.spend/1"
 SNAPSHOT_SCHEMA = "mindhive.spend_baseline/1"
-CATEGORIES = ("interactive", "chore", "subagent")
+CATEGORIES = ("interactive", "headless", "chore", "subagent")
 CHARS_PER_TOKEN = 4
 BASELINE_FIELDS = ("sessions", "first_call_ctx_median", "first_call_ctx_p90",
                    "ctx_per_call_mean", "fixed_baseline_share")
@@ -97,8 +115,11 @@ def _agg(sessions: list) -> dict:
                        max(s.call_span[1] for s in sessions)]}
 
 
-def _frame(scan_: Scan, report: str) -> dict:
+def _frame(scan_: Scan, report: str, *, split: bool = True) -> dict:
+    """The fields every report opens with. `split=False` for a report the
+    headless split does not touch."""
     return {"schema": SCHEMA, "report": report, "since": scan_.since,
+            **({"headless_split": scan_.headless_split} if split else {}),
             "source": {"root": str(scan_.root), "transcripts_read": scan_.files_read,
                        "transcripts_skipped_as_older": scan_.files_skipped,
                        "transcripts_unreadable": scan_.files_unreadable}}
@@ -127,9 +148,13 @@ def _by_namespace(sessions: list) -> list:
 
 
 def baseline(scan_: Scan) -> dict:
-    """Context tokens per call by session kind: the snapshot's `tokens`."""
-    return {**_frame(scan_, "baseline"),
-            "tokens": {kind: _agg(eligible(scan_, kind)) for kind in CATEGORIES},
+    """Context tokens per call by session kind: the snapshot's `tokens`. The
+    headless kind is None unless the split was `separate`: not measured,
+    which a measured zero would misreport as none found."""
+    tokens = {kind: _agg(eligible(scan_, kind)) for kind in CATEGORIES}
+    if scan_.headless_split != "separate":
+        tokens["headless"] = None
+    return {**_frame(scan_, "baseline"), "tokens": tokens,
             "by_namespace": _by_namespace(eligible(scan_))}
 
 
@@ -214,7 +239,7 @@ def agents(scan_: Scan) -> dict:
             "sessions", "calls", "ctx_tokens", "output_tokens", "ctx_per_call_mean",
             "first_call_ctx_median")}, "share": _share(a["ctx_tokens"], total)})
     rows.sort(key=lambda r: (-r["ctx_tokens"], r["agent_type"]))
-    return {**_frame(scan_, "agents"), "rows": rows,
+    return {**_frame(scan_, "agents", split=False), "rows": rows,
             "total": {"sessions": len(subs), "calls": sum(len(s.calls) for s in subs),
                       "ctx_tokens": total}}
 
@@ -254,11 +279,15 @@ def _dict(value) -> dict:
 
 def compare_baseline(report: dict, snapshot: dict) -> dict:
     """`BASELINE_FIELDS` per session kind: the snapshot's value, today's, and
-    the difference."""
+    the difference. A kind today's report did not measure gets no rows."""
     tokens = _dict(snapshot.get("tokens"))
     out: dict = {}
     for kind in CATEGORIES:
-        old, new = _dict(tokens.get(kind)), report["tokens"].get(kind) or {}
+        new = report["tokens"].get(kind)
+        if new is None:
+            out[kind] = {}
+            continue
+        old = _dict(tokens.get(kind))
         rows = {}
         for name in BASELINE_FIELDS:
             was, now = _num(old.get(name)), new.get(name)
@@ -268,6 +297,16 @@ def compare_baseline(report: dict, snapshot: dict) -> dict:
                           "delta": None if None in (was, now) else round(now - was, 4)}
         out[kind] = rows
     return out
+
+
+def baseline_note(report: dict, snapshot: dict) -> str | None:
+    """Why a baseline comparison is not like for like, or None when it is: a
+    split report against a snapshot with no measured headless row."""
+    if report.get("headless_split") == "separate" and not isinstance(
+            _dict(snapshot.get("tokens")).get("headless"), dict):
+        return ("the snapshot predates the headless split, so its interactive row "
+                "also holds headless sessions; --include-headless reads like for like")
+    return None
 
 
 def _rate(row: dict, name: str):

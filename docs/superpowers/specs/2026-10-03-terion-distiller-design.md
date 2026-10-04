@@ -577,11 +577,28 @@ Draf tidak memuat baris atribusi: atribusi ditambahkan oleh penulis commit seben
 - Tes pengunci.
 - `hive context --check` (`commands/context_ops.py:99-103`) gagal bila batas terlewati.
 
-**0.5 Ukur ulang** setelah ≥3 sesi. Target:
-- panggilan pertama turun ≥35k token;
-- pensyve 0%;
-- nol error protect-mcp;
-- SessionStart tampil utuh.
+**0.5 Ukur ulang** setelah ≥3 sesi interaktif yang dimulai setelah diet, lewat
+`hive spend baseline|hooks --since 2026-10-03T09:22:00Z` (diet tercatat di ledger
+2026-10-03T09:21:16Z). `--days N` dihitung mundur dari sekarang, jadi jendelanya bisa
+mencampur sesi sebelum diet. Sesi headless — anak yang dijalankan lewat `claude_cli`
+dengan `MINDHIVE_HEADLESS=1`, antara lain pengiriman auto-resume dan misi mindnet —
+dipisah dari `interactive`. Iterasi loop dan fabricate, agen papan Workspace, dan
+penerus rotasi dimulai tanpa variabel itu, jadi hook MindHive tetap jalan dan sesinya
+tetap `interactive`. Snapshot mencampur sesi headless ke `interactive`, jadi
+`--include-headless` membandingkan setara snapshot. Target, dengan bidang `--json` yang
+membuktikannya:
+- ≥3 sesi: `tokens.interactive.sessions` pada run terpisah (`headless_split` =
+  `separate`);
+- panggilan pertama turun ≥35k token:
+  `against.deltas.interactive.first_call_ctx_median.delta` ≤ −35.000 pada run
+  `--include-headless`;
+- pensyve 0%: setiap baris `against.rows` ber-owner `pensyve` punya `runs.now` = 0;
+- nol error protect-mcp: baris ber-owner `protect-mcp` punya `runs.now` = 0
+  (`error_rate.now` bernilai null bila tidak ada run);
+- SessionStart tampil utuh: baris `mindhive | SessionStart` punya `too_large_rate.now`
+  = 0. Batas ≤6.000 karakter baru sampai ke hook yang hidup setelah PR digabung dan
+  checkout utama di-pull, jadi target ini dibaca dengan `--since <waktu pull itu>`,
+  bukan 09:22Z.
 
 ### Fase D1 — Fondasi deterministik (PR A, persis rev 3)
 
@@ -961,7 +978,7 @@ Berlaku di semua fase:
 
 | Fase | Bukti selesai |
 |---|---|
-| 0 | `hive spend baseline\|hooks --days 2` vs snapshot; transkrip baru tanpa "Output too large"; nol error protect-mcp |
+| 0 | `hive spend baseline\|hooks --since 2026-10-03T09:22:00Z` vs snapshot (hanya sesi yang dimulai setelah diet; `--include-headless` untuk perbandingan setara snapshot); transkrip baru tanpa "Output too large" (dibaca `--since` setelah merge dan pull checkout utama); nol error protect-mcp |
 | D1 | `hive distill run --v0` → digest ≤1.300 karakter; `hive sync` → seksi tampil di MEMORY.md; `hive distill verify` 50/50; `hive tanya "kenapa hive ci watch belum dijadwalkan"`; `hive distill status --gerbang` setelah 3–7 hari |
 | A2 | Primer di MEMORY.md (≤240 karakter, merah hilang setelah hijau); `hive tanya --kategori ci_cd "watch"`; `hive spend orientasi --days 14` |
 | D2 | Idle di AC ≥3 menit → baris `jalan` baru; mouse digerakkan → `pengguna_aktif` + latensi; `ollama ps` kosong; AC dicabut → tidak ada jalan |

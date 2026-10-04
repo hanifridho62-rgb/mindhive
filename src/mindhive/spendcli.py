@@ -8,19 +8,42 @@ on it. `spend` is imported at call time, so `import mindhive.__main__` stays as
 light as `tests/test_cli_startup.py` holds it.
 
 Exit codes: 0 a report printed (an empty window is a report too); 2 the
-arguments stopped it -- `--days` that is not a positive number, a
-`--claude-dir` with no `projects` directory under it, or an `--against`
-snapshot that cannot be read (an empty one included). A default snapshot that
-cannot be read is warned about on stderr and the report prints without it.
+arguments stopped it -- `--days` that is not a positive number, a `--since`
+that is not a date or an ISO time, a `--claude-dir` with no `projects`
+directory under it, or an `--against` snapshot that cannot be read (an empty
+one included). A default snapshot that cannot be read is warned about on
+stderr and the report prints without it. `--help` states the same, and what
+the JSON fields of the headless split mean, for a caller that reads no README.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import sys
+from datetime import datetime
 from pathlib import Path
 
 _READ_ONLY = "This command is read-only and changed nothing."
+_EPILOG = """\
+exit codes:
+  0    the report printed; an empty window is a report too
+  2    the arguments stopped it: --days not a positive number, --since not a
+       date or an ISO time, --claude-dir without a projects directory, or an
+       --against snapshot that cannot be read
+
+--json: baseline, hooks and lookups carry headless_split -- separate
+(MindHive's headless children counted apart), folded (--include-headless:
+counted as interactive) or unavailable (settings.json holds no readable
+MindHive SessionStart hook). A session kind that was not measured is null
+under tokens, never 0. A baseline read against a snapshot that predates the
+split carries against.note. Aggregates only; nothing is written."""
+# How a report counted MindHive's headless children, said under its head.
+_SPLIT = {"separate": "MindHive's headless children counted apart",
+          "folded": "MindHive's headless children counted as interactive "
+                    "(--include-headless)",
+          "unavailable": "MindHive's headless children not told apart: settings.json "
+                         "holds no readable MindHive SessionStart hook"}
 
 
 def _is_num(value) -> bool:
@@ -59,9 +82,11 @@ def _head(report: dict) -> str:
     since = report.get("since")
     window = f"sessions started since {since}" if since else "every session on disk"
     unreadable = src.get("transcripts_unreadable")
-    return (f"hive spend {report['report']} -- {window}; {src['transcripts_read']} "
+    head = (f"hive spend {report['report']} -- {window}; {src['transcripts_read']} "
             f"transcript(s) read, {src['transcripts_skipped_as_older']} older skipped"
             + (f", {unreadable} unreadable" if unreadable else ""))
+    split = _SPLIT.get(report.get("headless_split"))
+    return f"{head}\n{split}" if split else head
 
 
 def _footer(report: dict) -> list:
@@ -77,6 +102,8 @@ def _render_baseline(report: dict) -> list:
     lines = [_head(report), f"{'kind':<12}{'sessions':>9}{'calls':>10}{'ctx tokens':>17}"
              f"{'ctx/call':>10}  {'first call med / p90':>21}  fixed share"]
     for kind, t in report["tokens"].items():
+        if t is None:                 # not measured; the head says why
+            continue
         if not t.get("sessions"):
             lines.append(f"{kind:<12}{0:>9}")
             continue
@@ -95,6 +122,8 @@ def _render_baseline(report: dict) -> list:
             if rows:
                 lines.append(f"  {kind}: " + "; ".join(
                     _compared(name, r) for name, r in rows.items()))
+        if against.get("note"):
+            lines.append(f"  note: {against['note']}")
     return lines
 
 
@@ -175,9 +204,27 @@ def _snapshot(args):
         return None, None
 
 
+def _parse_since(text: str) -> datetime | None:
+    """A date (midnight UTC) or an ISO time (UTC unless it names an offset),
+    in UTC; None for anything else, a moment UTC cannot hold included
+    (9999-12-31T23:00-05:00 is the year 10000). Transcripts are stamped in UTC."""
+    from .spend_scan import to_utc
+    try:
+        return to_utc(datetime.fromisoformat(text.strip()))
+    except (ValueError, OverflowError):
+        return None
+
+
 def _run(args, build, render, compare=None) -> int | None:
     from . import spend
-    if not args.all and not (math.isfinite(args.days) and args.days > 0):
+    since = None
+    if args.since is not None:
+        since = _parse_since(args.since)
+        if since is None:
+            print(f"hive spend: --since must be a date (YYYY-MM-DD) or an ISO time, "
+                  f"not {args.since!r}", file=sys.stderr)
+            return 2
+    elif not args.all and not (math.isfinite(args.days) and args.days > 0):
         print(f"hive spend: --days must be a positive number of days, not {args.days:g}",
               file=sys.stderr)
         return 2
@@ -195,7 +242,10 @@ def _run(args, build, render, compare=None) -> int | None:
     except spend.SnapshotError as exc:
         print(f"hive spend: {exc}", file=sys.stderr)
         return 2
-    report = build(spend.scan(claude_dir, days=None if args.all else args.days))
+    report = build(spend.scan(claude_dir,
+                              days=None if args.all or since is not None else args.days,
+                              since=since,
+                              include_headless=getattr(args, "include_headless", False)))
     if snapshot is not None:
         report["against"] = {"path": path, "created": snapshot.get("created"),
                              **compare(report, snapshot)}
@@ -206,8 +256,11 @@ def _run(args, build, render, compare=None) -> int | None:
 
 def cmd_spend_baseline(args) -> int | None:
     from . import spend
-    return _run(args, spend.baseline, _render_baseline,
-                lambda rep, snap: {"deltas": spend.compare_baseline(rep, snap)})
+
+    def compare(rep, snap):
+        note = spend.baseline_note(rep, snap)
+        return {"deltas": spend.compare_baseline(rep, snap), **({"note": note} if note else {})}
+    return _run(args, spend.baseline, _render_baseline, compare)
 
 
 def cmd_spend_hooks(args) -> int | None:
@@ -241,15 +294,25 @@ def register(subparsers) -> None:
          cmd_spend_lookups, False),
         ("agents", "subagent spend by agent type", cmd_spend_agents, False),
     ):
-        p = ssub.add_parser(name, help=text)
+        p = ssub.add_parser(name, help=text, description=f"hive spend {name}: {text}.",
+                            epilog=_EPILOG,
+                            formatter_class=argparse.RawDescriptionHelpFormatter)
         window = p.add_mutually_exclusive_group()
         window.add_argument("--days", type=float, default=7.0,
                             help="sessions that started in the last N days (default 7)")
+        window.add_argument("--since", default=None, metavar="DATE",
+                            help="sessions that started at or after DATE: YYYY-MM-DD "
+                                 "(midnight UTC) or an ISO time (UTC unless it names "
+                                 "an offset)")
         window.add_argument("--all", action="store_true",
                             help="every transcript on disk")
         p.add_argument("--claude-dir", default=None,
                        help="Claude Code's home directory (default: ~/.claude)")
         p.add_argument("--json", action="store_true", help="print the report as JSON")
+        if name != "agents":
+            p.add_argument("--include-headless", action="store_true", help=(
+                "count MindHive's own headless sessions as interactive, as the "
+                "snapshot did"))
         if compares:
             snap = p.add_mutually_exclusive_group()
             snap.add_argument("--against", default=None, help=(

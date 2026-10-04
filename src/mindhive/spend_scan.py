@@ -48,7 +48,7 @@ _MARKERS = ('"usage"', '"attachment"', '"tool_result"', "compact_boundary")
 class Session:
     path: Path
     project_dir: Path                                  # <projects>/<folder>
-    kind: str                                          # interactive|chore|subagent
+    kind: str                                  # interactive|headless|chore|subagent
     agent_type: str | None
     first_ts: str
     calls: list = field(default_factory=list)          # context tokens per call
@@ -68,6 +68,7 @@ class Scan:
     files_read: int = 0
     files_skipped: int = 0
     files_unreadable: int = 0          # failed to stat, open or read: never "read"
+    headless_split: str = "unavailable"    # separate | folded | unavailable
 
 
 def default_claude_dir() -> Path:
@@ -76,22 +77,29 @@ def default_claude_dir() -> Path:
 
 
 def _read_json(path: Path):
+    """A JSON file's value, or None. `utf-8-sig`, because PowerShell 5.1's
+    `-Encoding utf8` writes a byte-order mark that `json.loads` refuses."""
     try:
-        return json.loads(Path(path).read_text(encoding="utf-8"))
+        return json.loads(Path(path).read_text(encoding="utf-8-sig"))
     except (OSError, *_JSON_ERRORS):
         return None
 
 
 def _commands(node, out: set) -> None:
-    if isinstance(node, dict):
-        for key, value in node.items():
-            if key == "command" and isinstance(value, str):
-                out.add(value)
-            else:
-                _commands(value, out)
-    elif isinstance(node, list):
-        for value in node:
-            _commands(value, out)
+    """Every `command` string anywhere in a hook map. A walk with its own
+    stack: `json.loads` follows nesting deeper than Python's recursion limit,
+    so a recursive walk over what it returns can raise where it did not."""
+    stack = [node]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            for key, value in cur.items():
+                if key == "command" and isinstance(value, str):
+                    out.add(value)
+                else:
+                    stack.append(value)
+        elif isinstance(cur, list):
+            stack.extend(cur)
 
 
 def _inside_plugin(ref: str) -> bool:
@@ -143,6 +151,18 @@ def hook_owner(command: str, owners: dict) -> str:
     if "mindhive" in command.lower():
         return "mindhive"
     return UNATTRIBUTED if command else NO_COMMAND
+
+
+def registers_mindhive_session_start(claude_dir: Path, owners: dict) -> bool:
+    """Whether `settings.json` registers a SessionStart hook MindHive owns.
+    Only then does a session that records no run of it say anything: MindHive
+    registers its hooks there, not in a plugin. A file that cannot be read
+    registers nothing, as far as this can tell."""
+    data = _read_json(Path(claude_dir) / "settings.json")
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    found: set = set()
+    _commands(hooks.get("SessionStart") if isinstance(hooks, dict) else None, found)
+    return any(hook_owner(cmd, owners) == "mindhive" for cmd in found)
 
 
 def classify_lookup(block: dict) -> str | None:
@@ -218,8 +238,8 @@ def _key(value) -> str | None:
 class _Reader:
     """The state of one pass over one transcript."""
 
-    def __init__(self, owners: dict, subagent: bool):
-        self.owners, self.subagent = owners, subagent
+    def __init__(self, owners: dict, subagent: bool, split: bool = False):
+        self.owners, self.subagent, self.split = owners, subagent, split
         self.first_ts = self.first_user = None
         self.calls, self.lookups, self.span, self.out = [], [], ["", ""], 0
         self.index: dict = {}
@@ -327,15 +347,30 @@ class _Reader:
         self.done_res += [(n, now - at) for at, n in self.open_res]
         self.open_inj, self.open_res = [], []
 
+    def _mindhive_silent_at_start(self) -> bool:
+        """MindHive's SessionStart hook left no run while another owner's did.
+        `claude_cli` starts its children with MINDHIVE_HEADLESS=1, on which
+        MindHive's hooks exit without a word and no other plugin's do; a child
+        started with its parent's environment (the loop driver's, a Workspace
+        board agent) runs them and is not caught here. A run that failed or was
+        cancelled still ran; one whose command was not recorded is left out,
+        since its owner cannot be read."""
+        started = {owner for owner, event, *_ in self.runs
+                   if event == "SessionStart" and owner != NO_COMMAND}
+        return bool(started) and "mindhive" not in started
+
     def session(self, path: Path, project_dir: Path) -> Session | None:
         self._close()
         if self.first_ts is None or not (self.calls or self.runs):
             return None
         if self.subagent:
             kind = "subagent"
+        elif (self.first_user or "").lstrip().startswith(CHORE_PREFIXES):
+            kind = "chore"
+        elif self.split and self._mindhive_silent_at_start():
+            kind = "headless"
         else:
-            kind = "chore" if (self.first_user or "").lstrip().startswith(
-                CHORE_PREFIXES) else "interactive"
+            kind = "interactive"
         return Session(path=path, project_dir=project_dir, kind=kind,
                        agent_type=_agent_type(path) if self.subagent else None,
                        first_ts=self.first_ts, calls=self.calls,
@@ -345,12 +380,15 @@ class _Reader:
 
 
 def read_transcript(path: Path, owners: dict, *, subagent: bool,
-                    project_dir: Path | None = None) -> tuple[Session | None, bool]:
+                    project_dir: Path | None = None,
+                    split: bool = False) -> tuple[Session | None, bool]:
     """`(session, readable)` for one transcript. `session` is None when the
     file holds no call and no hook run. `readable` is False when opening or
     reading it failed, part-way included: what was read is then dropped, not
-    reported as the whole file. Malformed lines are skipped; nothing raises."""
-    reader = _Reader(owners, subagent)
+    reported as the whole file. Malformed lines are skipped; nothing raises.
+    `split` files a session whose MindHive SessionStart hook stayed silent as
+    `headless` rather than `interactive`."""
+    reader = _Reader(owners, subagent, split)
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -367,29 +405,58 @@ def read_transcript(path: Path, owners: dict, *, subagent: bool,
     return reader.session(Path(path), Path(project_dir or Path(path).parent)), True
 
 
+def to_utc(moment: datetime) -> datetime:
+    """`moment` in UTC, a naive one read as UTC already: the clock transcripts
+    are stamped in. Raises OverflowError where UTC falls past the calendar's
+    ends (year 10000, year 0)."""
+    return (moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+            ).astimezone(timezone.utc)
+
+
 def _iso(moment: datetime) -> str:
-    return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
+    """A UTC moment in Claude Code's own timestamp shape -- milliseconds and
+    `Z` -- so a string comparison orders the two."""
+    return moment.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def scan(claude_dir=None, *, days: float | None = 7, now: datetime | None = None) -> Scan:
+def _window_start(days, since, now) -> datetime | None:
+    """Where the window opens: `since`, else `days` before `now`, else None
+    for no window at all. A `since` UTC cannot hold is refused, because no
+    window is not what was asked for; a `days` window that reaches past the
+    calendar holds every session there is, and is read as none."""
+    if since is not None:
+        try:
+            return to_utc(since)
+        except OverflowError as exc:
+            raise ValueError(f"since {since.isoformat()} has no place in UTC") from exc
+    if days is None:
+        return None
+    try:
+        return to_utc(now or datetime.now(timezone.utc)) - timedelta(days=days)
+    except (OverflowError, ValueError):            # NaN days is a ValueError
+        return None
+
+
+def scan(claude_dir=None, *, days: float | None = 7, since: datetime | None = None,
+         now: datetime | None = None, include_headless: bool = False) -> Scan:
     """Every transcript under `<claude_dir>/projects` whose session started in
-    the last `days` (None: all of them). A file last written before the cutoff
-    cannot hold a call inside the window, so it is skipped unread; one that
-    cannot be stat'd, opened or read through is counted unreadable."""
+    the last `days`, or at or after `since` when that is given (neither: all of
+    them). A file last written before the cutoff cannot hold a call inside the
+    window, so it is skipped unread; one that cannot be stat'd, opened or read
+    through is counted unreadable. A session whose MindHive SessionStart hook
+    stayed silent is filed `headless` where that hook is registered, unless
+    `include_headless` counts it as interactive again, as the snapshot did.
+    Raises ValueError for a `since` that UTC cannot hold."""
     claude_dir = Path(claude_dir) if claude_dir else default_claude_dir()
     root = claude_dir / "projects"
-    now = now or datetime.now(timezone.utc)
-    since = cutoff = None
-    if days is not None:
-        try:
-            moment = (now - timedelta(days=days)).astimezone(timezone.utc)
-            since, cutoff = _iso(moment), moment.timestamp()
-        except (OverflowError, ValueError):
-            since = cutoff = None
-    result = Scan(root=root, since=since)
+    moment = _window_start(days, since, now)
+    start, cutoff = (None, None) if moment is None else (_iso(moment), moment.timestamp())
+    owners = hook_owners(claude_dir / "plugins")
+    split = not include_headless and registers_mindhive_session_start(claude_dir, owners)
+    result = Scan(root=root, since=start, headless_split=(
+        "folded" if include_headless else "separate" if split else "unavailable"))
     if not root.is_dir():
         return result
-    owners = hook_owners(claude_dir / "plugins")
     for path in sorted(root.rglob("*.jsonl")):
         try:
             if cutoff is not None and path.stat().st_mtime < cutoff:
@@ -401,11 +468,11 @@ def scan(claude_dir=None, *, days: float | None = 7, now: datetime | None = None
         parts = path.relative_to(root).parts
         session, readable = read_transcript(path, owners,
                                             subagent="subagents" in parts[:-1],
-                                            project_dir=root / parts[0])
+                                            project_dir=root / parts[0], split=split)
         if not readable:
             result.files_unreadable += 1
             continue
         result.files_read += 1
-        if session is not None and (since is None or session.first_ts >= since):
+        if session is not None and (start is None or session.first_ts >= start):
             result.sessions.append(session)
     return result

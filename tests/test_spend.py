@@ -11,7 +11,9 @@ for number, which is how Fase 0.5 judges the plugin diet:
   once per message id, `<synthetic>` replies skipped;
 - a session is one transcript; it counts toward the token reports with at least
   two calls; subagent = under `subagents/`, chore = its first prompt opens a
-  machine prompt, interactive = the rest;
+  machine prompt, headless = a MindHive child (MindHive's registered
+  SessionStart hook stayed silent while another owner's ran), interactive =
+  the rest; `--since` pins the window's start to a moment;
 - a hook's owner comes from the command: installed plugins' hook maps, then the
   plugin cache path, then `mindhive`;
 - injected hook text and lookup results stay in context until the next
@@ -23,6 +25,7 @@ JSON. Nothing here reads `~/.claude`.
 import itertools
 import json
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -231,7 +234,8 @@ def test_a_single_call_session_is_left_out_of_the_token_reports(claude):
 
     tokens = spend.baseline(_scan(claude))["tokens"]
 
-    assert sum(t["sessions"] for t in tokens.values()) == 4
+    assert tokens["headless"] is None                  # not measured: no settings.json
+    assert sum(t["sessions"] for t in tokens.values() if t is not None) == 4
     assert tokens["interactive"]["first_call_ctx_p90"] != 9999
 
 
@@ -263,6 +267,239 @@ def test_every_machine_prompt_prefix_marks_a_chore(claude):
 
     assert tokens["chore"]["sessions"] == len(spend.CHORE_PREFIXES) == 5
     assert tokens["interactive"] == {"sessions": 0}
+
+
+# --- 1b. headless sessions: MindHive's own children ----------------------------
+
+def _register_mindhive(claude, event="SessionStart", command=MH_CMD):
+    """MindHive's hooks live in Claude Code's user settings, not in a plugin."""
+    (claude / "settings.json").write_text(json.dumps({"hooks": {event: [
+        {"hooks": [{"type": "command", "command": command}]}]}}), encoding="utf-8")
+
+
+def _headless_world(claude, register=True):
+    """A typed session, where MindHive's SessionStart hook ran beside another
+    owner's, and a child MindHive started through `claude_cli` (an auto-resume
+    delivery, say), where only the other one did: `claude_cli` sets
+    MINDHIVE_HEADLESS=1 on its children, and MindHive's hooks exit on it
+    without a word."""
+    if register:
+        _register_mindhive(claude)
+    _write(claude, "C--hl/typed.jsonl", [
+        _hook(_t(minute=0), command=SP_CMD, content="s" * 40),
+        _hook(_t(minute=0), command=MH_CMD, content="m" * 40),
+        _prompt("fix the flaky test", _t(minute=0)),
+        _call("t1", _t(minute=1), read=5000,
+              tools=[("tl1", "Bash", {"command": 'hive recall "flaky"'})]),
+        _call("t2", _t(minute=2), read=5000),
+    ])
+    _write(claude, "C--hl/child.jsonl", [
+        _hook(_t(minute=10), command=SP_CMD, content="s" * 40),
+        _prompt("resume the release notes where the last session stopped", _t(minute=10)),
+        _call("c1", _t(minute=11), read=700,
+              tools=[("tc1", "Bash", {"command": "hive state"})]),
+        _call("c2", _t(minute=12), read=700),
+    ])
+
+
+def test_a_session_whose_mindhive_session_start_stayed_silent_is_headless(claude):
+    _headless_world(claude)
+    scan = _scan(claude)
+
+    rep = spend.baseline(scan)
+
+    assert rep["headless_split"] == "separate"
+    assert rep["tokens"]["interactive"]["sessions"] == 1
+    assert rep["tokens"]["interactive"]["first_call_ctx_median"] == 5000
+    assert rep["tokens"]["headless"]["sessions"] == 1
+    assert rep["tokens"]["headless"]["ctx_tokens"] == 1400
+    # Hook health counts every session in the window, the child's runs too.
+    assert _by(spend.hooks(scan)["health"], owner=spend.UNATTRIBUTED,
+               event="SessionStart")["runs"] == 2
+
+
+@pytest.mark.parametrize("settings", [
+    None, "{not json", '["a", 1]', '{"hooks": null}', '{"hooks": []}',
+    '{"model": "opus"}', "other event", "other command"])
+def test_without_mindhive_s_session_start_registered_nothing_is_headless(claude, settings):
+    """CANARY for the split: MindHive's silence is evidence only where its
+    SessionStart hook is registered. Elsewhere every session stays where the
+    snapshot put it, and the headless kind is not measured at all -- which is
+    not the same as measuring none."""
+    _headless_world(claude, register=False)
+    if settings == "other event":
+        _register_mindhive(claude, event="UserPromptSubmit")
+    elif settings == "other command":
+        _register_mindhive(claude, command=SP_CMD)
+    elif settings is not None:
+        (claude / "settings.json").write_text(settings, encoding="utf-8")
+
+    rep = spend.baseline(_scan(claude))
+
+    assert rep["headless_split"] == "unavailable"
+    assert rep["tokens"]["interactive"]["sessions"] == 2
+    assert rep["tokens"]["headless"] is None
+
+
+def test_a_settings_json_saved_with_a_byte_order_mark_is_still_read(claude):
+    """PowerShell 5.1's `-Encoding utf8` writes one, and `json.loads` refuses
+    a string that opens with it."""
+    _headless_world(claude)
+    settings = claude / "settings.json"
+    settings.write_bytes(b"\xef\xbb\xbf" + settings.read_bytes())
+
+    rep = spend.baseline(_scan(claude))
+
+    assert rep["headless_split"] == "separate"
+    assert rep["tokens"]["headless"]["sessions"] == 1
+
+
+@pytest.mark.parametrize("where", ["settings", "plugin"])
+def test_hook_maps_nested_past_the_recursion_limit_are_read_not_raised(claude, where):
+    """`json.loads` follows nesting far deeper than a recursive walk over its
+    result can (thousands of levels on Python 3.14), so a hook map that deep --
+    in `settings.json` or in a plugin's `hooks.json` -- must be read, or
+    skipped where this interpreter's parser stops first, never raised out of
+    the report."""
+    _headless_world(claude, register=where == "plugin")
+    _plugins(claude)
+    depth = 3 * sys.getrecursionlimit()
+    command = MH_CMD if where == "settings" else SP_CMD
+    nest = "[" * depth + json.dumps({"type": "command", "command": command}) + "]" * depth
+    try:
+        json.loads(nest)
+        parsed = True
+    except RecursionError:
+        parsed = False
+    target = claude / "settings.json" if where == "settings" else (
+        claude / "plugins" / "cache" / "superpowers-dev" / "superpowers" / "5.1.0"
+        / "hooks" / "hooks.json")
+    target.write_text('{"hooks": {"SessionStart": ' + nest + "}}", encoding="utf-8")
+
+    scan = _scan(claude)
+
+    if where == "settings":
+        split = spend.baseline(scan)["headless_split"]
+        assert split == ("separate" if parsed else "unavailable")
+    else:
+        owner = "superpowers" if parsed else spend.UNATTRIBUTED
+        assert _by(spend.hooks(scan)["health"], owner=owner,
+                   event="SessionStart")["runs"] == 2
+
+
+def test_a_loop_child_whose_mindhive_session_start_ran_stays_interactive(claude):
+    """The split's boundary. The loop driver (`hive loop`, `hive fabricate run`,
+    a loop-mode auto-resume) and Workspace board agents start `claude` with
+    their parent's environment, so MindHive's hooks run in them and nothing in
+    the transcript tells them from a typed session."""
+    _register_mindhive(claude)
+    _write(claude, "C--hl/loop.jsonl", [
+        _hook(_t(minute=0), command=SP_CMD, content="s" * 40),
+        _hook(_t(minute=0), command=MH_CMD, content="m" * 40),
+        _prompt("# Loop goal\nship the release notes", _t(minute=0)),
+        _call("l1", _t(minute=1), read=10), _call("l2", _t(minute=2), read=10)])
+
+    tokens = spend.baseline(_scan(claude))["tokens"]
+
+    assert (tokens["interactive"]["sessions"], tokens["headless"]) == (1, {"sessions": 0})
+
+
+def test_hook_runs_of_other_events_say_nothing_about_who_started_a_session(claude):
+    """CANARY for the event filter: a session whose only runs belong to other
+    events recorded no SessionStart run at all, so MindHive's silence at its
+    start is not in evidence."""
+    _register_mindhive(claude)
+    _write(claude, "C--hl/pre.jsonl", [
+        _prompt("hi", _t(minute=0)),
+        _hook(_t(minute=0), event="UserPromptSubmit", command=PV_CMD, content="p" * 40),
+        _hook(_t(minute=1), kind="hook_non_blocking_error", event="PreToolUse",
+              command=CACHE_CMD),
+        _call("e1", _t(minute=1), read=10), _call("e2", _t(minute=2), read=10)])
+
+    tokens = spend.baseline(_scan(claude))["tokens"]
+
+    assert (tokens["interactive"]["sessions"], tokens["headless"]) == (1, {"sessions": 0})
+
+
+def test_a_session_start_run_without_a_command_proves_nothing(claude):
+    """A run whose owner cannot be read cannot show that MindHive's was
+    missing: a transcript that records no command for any SessionStart run
+    would otherwise file every typed session as headless."""
+    _register_mindhive(claude)
+    _write(claude, "C--hl/nocmd.jsonl", [
+        _hook(_t(minute=0), command="", content="x" * 40),
+        _prompt("hi", _t(minute=0)),
+        _call("n1", _t(minute=1), read=10), _call("n2", _t(minute=2), read=10)])
+
+    tokens = spend.baseline(_scan(claude))["tokens"]
+
+    assert (tokens["interactive"]["sessions"], tokens["headless"]) == (1, {"sessions": 0})
+
+
+def test_a_session_that_records_no_session_start_run_stays_interactive(claude):
+    """Nothing in it shows that hooks ran at all, so MindHive's silence there
+    says nothing about who started it."""
+    _register_mindhive(claude)
+    _write(claude, "C--hl/bare.jsonl", [
+        _prompt("hi", _t(minute=0)),
+        _call("b1", _t(minute=1), read=10), _call("b2", _t(minute=2), read=10)])
+
+    tokens = spend.baseline(_scan(claude))["tokens"]
+
+    assert (tokens["interactive"]["sessions"], tokens["headless"]) == (1, {"sessions": 0})
+
+
+@pytest.mark.parametrize("kind", ["hook_cancelled", "hook_non_blocking_error"])
+def test_a_mindhive_session_start_that_failed_still_ran(claude, kind):
+    _register_mindhive(claude)
+    _write(claude, "C--hl/s.jsonl", [
+        _hook(_t(minute=0), command=SP_CMD, content="s"),
+        _hook(_t(minute=0), kind=kind, command=MH_CMD),
+        _prompt("hi", _t(minute=0)),
+        _call("f1", _t(minute=1), read=10), _call("f2", _t(minute=2), read=10)])
+
+    assert spend.baseline(_scan(claude))["tokens"]["interactive"]["sessions"] == 1
+
+
+@pytest.mark.parametrize("kind", ["chore", "subagent"])
+def test_a_chore_or_a_subagent_keeps_its_kind_though_its_mindhive_hook_was_silent(
+        claude, kind):
+    """Chores are MindHive children too, and a subagent is nobody's typed
+    session either; both keep the snapshot's own kind."""
+    _register_mindhive(claude)
+    rel, prompt = {"chore": ("C--hl/chore.jsonl", "You are the Resolution Engine. one"),
+                   "subagent": ("C--hl/s1/subagents/agent-a1.jsonl", "explore")}[kind]
+    _write(claude, rel, [
+        _hook(_t(minute=0), command=SP_CMD, content="s"),
+        _prompt(prompt, _t(minute=0)),
+        _call("r1", _t(minute=1), read=10), _call("r2", _t(minute=2), read=10)])
+
+    tokens = spend.baseline(_scan(claude))["tokens"]
+
+    assert (tokens[kind]["sessions"], tokens["headless"]) == (1, {"sessions": 0})
+
+
+def test_include_headless_counts_them_as_interactive_again(claude):
+    _headless_world(claude)
+
+    rep = spend.baseline(spend.scan(claude, days=7, now=NOW, include_headless=True))
+
+    assert rep["headless_split"] == "folded"
+    assert rep["tokens"]["interactive"]["sessions"] == 2
+    assert rep["tokens"]["interactive"]["first_call_ctx_median"] == (5000 + 700) / 2
+    assert rep["tokens"]["headless"] is None
+
+
+@pytest.mark.parametrize("folded", [False, True])
+def test_injection_and_lookups_leave_headless_sessions_out_unless_folded(claude, folded):
+    _headless_world(claude)
+    scan = spend.scan(claude, days=7, now=NOW, include_headless=folded)
+
+    inj, look = spend.hooks(scan)["injection"], spend.lookups(scan)
+
+    assert inj["sessions"] == look["sessions"] == (2 if folded else 1)
+    assert look["lookup_calls"] == (2 if folded else 1)
+    assert inj["ctx_tokens"] == (11400 if folded else 10000)
 
 
 # --- 2. the window ------------------------------------------------------------
@@ -298,6 +535,68 @@ def test_a_transcript_last_written_before_the_window_is_not_opened(claude):
     assert scan.files_read == 0 and scan.files_skipped == 1
     assert spend.baseline(scan)["tokens"]["interactive"] == {"sessions": 0}
     assert _scan(claude, days=None).files_read == 1
+
+
+SINCE = datetime(2026, 10, 3, tzinfo=timezone.utc)
+
+
+def test_since_keeps_sessions_that_started_at_or_after_the_moment(claude):
+    """Fase 0.5 reads the sessions that started after the plugin diet, and a
+    window counted back from now cannot be pinned to that moment. The session
+    starting on the boundary is in: a `>` would drop it."""
+    for name, ts in (("before", "2026-10-02T23:59:59.999Z"),
+                     ("at", "2026-10-03T00:00:00.000Z"), ("after", _t(hour=8))):
+        _write(claude, f"C--s/{name}.jsonl", [
+            _prompt(name, ts), _call(name + "1", ts, read=100),
+            _call(name + "2", ts, read=100)])
+
+    scan = spend.scan(claude, since=SINCE, now=NOW)
+
+    assert scan.since == "2026-10-03T00:00:00.000Z"
+    assert spend.baseline(scan)["tokens"]["interactive"]["sessions"] == 2
+
+
+def test_since_skips_a_transcript_last_written_before_it_unread(claude):
+    _write(claude, "C--s/stale.jsonl", [
+        _prompt("stale", _t(day=2)), _call("st1", _t(day=2), read=100),
+        _call("st2", _t(day=2), read=100)], mtime=(SINCE - timedelta(hours=1)).timestamp())
+
+    scan = spend.scan(claude, since=SINCE, now=NOW)
+
+    assert (scan.files_read, scan.files_skipped) == (0, 1)
+
+
+@pytest.mark.parametrize("since", [
+    datetime(9999, 12, 31, 23, tzinfo=timezone(timedelta(hours=-5))),
+    datetime(1, 1, 1, tzinfo=timezone(timedelta(hours=5)))])
+def test_a_since_past_the_calendar_s_ends_in_utc_is_refused(claude, since):
+    """In UTC these are the years 10000 and 0. Read as no window at all, they
+    reported every session on disk as the one asked for."""
+    with pytest.raises(ValueError, match="since"):
+        spend.scan(claude, since=since, now=NOW)
+
+
+def test_a_days_window_reaching_past_the_calendar_reads_everything(claude):
+    """CANARY beside the refused `since`: a window that long holds every
+    session there is, so reading them all is the answer, not a stand-in."""
+    _write(claude, "C--w/s.jsonl", [_prompt("hi", _t()), _call("y1", _t(), read=10),
+                                    _call("y2", _t(), read=10)])
+
+    for days in (1e12, 800000):                 # past timedelta; past year 1
+        scan = spend.scan(claude, days=days, now=NOW)
+        assert scan.since is None
+        assert spend.baseline(scan)["tokens"]["interactive"]["sessions"] == 1
+
+
+@pytest.mark.parametrize("since, start", [
+    (datetime(2026, 10, 3), "2026-10-03T00:00:00.000Z"),
+    (datetime(2026, 10, 3, 15, 0, 0, 999999, tzinfo=timezone(timedelta(hours=7))),
+     "2026-10-03T08:00:00.999Z"),
+    (datetime(1, 1, 1), "0001-01-01T00:00:00.000Z")])
+def test_since_is_stamped_the_way_transcripts_are(claude, since, start):
+    """A naive moment is UTC already, the clock transcripts are stamped in, and
+    the start is written in their own shape so a string comparison orders it."""
+    assert spend.scan(claude, since=since, now=NOW).since == start
 
 
 def test_a_missing_claude_dir_is_an_empty_scan_not_a_raise(tmp_path):
@@ -801,6 +1100,22 @@ def test_baseline_reads_against_the_snapshot(claude):
     assert row == {"snapshot": 108037.0, "now": 2000, "delta": 2000 - 108037.0}
 
 
+@pytest.mark.parametrize("held, noted", [("absent", True), (None, True),
+                                         ({"sessions": 3}, False)])
+def test_the_split_note_asks_whether_the_snapshot_measured_headless_sessions(
+        claude, held, noted):
+    """A snapshot whose headless row is missing or not measured (null) counted
+    those sessions as interactive, so a split run does not read like for like."""
+    _headless_world(claude)
+    snap = spend.load_snapshot(_snapshot())
+    if held != "absent":
+        snap["tokens"]["headless"] = held
+
+    note = spend.baseline_note(spend.baseline(_scan(claude)), snap)
+
+    assert (note is not None) == noted
+
+
 def test_hooks_read_against_the_snapshot_by_rate(claude):
     _hooks_world(claude)
     snap = spend.load_snapshot(_snapshot())
@@ -1000,10 +1315,118 @@ def test_cli_days_must_be_positive(claude):
     assert _cli("hooks", "--claude-dir", str(claude), "--days", "0") == 2
 
 
+@pytest.mark.parametrize("given, since, sessions", [
+    ("2026-10-03", "2026-10-03T00:00:00.000Z", 2),
+    ("2026-10-03T08:00:00Z", "2026-10-03T08:00:00.000Z", 1),
+    ("2026-10-03T15:00:00+07:00", "2026-10-03T08:00:00.000Z", 1),
+    ("2026-10-03T08:00", "2026-10-03T08:00:00.000Z", 1),
+])
+def test_cli_since_takes_a_utc_date_or_an_iso_time(claude, capsys, given, since, sessions):
+    """A bare date is midnight UTC, the clock transcripts are stamped in; a time
+    without an offset is read as UTC too."""
+    for name, ts in (("early", _t(hour=7, minute=59)), ("late", _t(hour=8))):
+        _write(claude, f"C--s/{name}.jsonl", [
+            _prompt(name, ts), _call(name + "1", ts, read=100),
+            _call(name + "2", ts, read=100)])
+
+    code = _cli("baseline", "--claude-dir", str(claude), "--since", given, "--json",
+                "--no-compare")
+
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert out["since"] == since
+    assert out["tokens"]["interactive"]["sessions"] == sessions
+
+
+@pytest.mark.parametrize("given", ["yesterday", "", "2026-13-01", "03-10-2026",
+                                   "9999-12-31T23:00:00-05:00"])
+def test_cli_a_since_that_is_not_a_date_is_exit_2(claude, capsys, given):
+    """The last one parses, then overflows: in UTC it is the year 10000."""
+    _baseline_world(claude)
+
+    code = _cli("baseline", "--claude-dir", str(claude), "--since", given, "--no-compare")
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "--since" in captured.err and captured.out == ""
+
+
+def test_cli_baseline_notes_that_the_snapshot_predates_the_headless_split(claude, capsys):
+    """The snapshot's interactive row held MindHive's children too. Read
+    against it, a typed-only row is not like for like, and the report says so;
+    --include-headless restores the snapshot's own split."""
+    _headless_world(claude)
+    _snapshot()
+
+    assert _cli("baseline", "--claude-dir", str(claude), "--all") == 0
+    text = capsys.readouterr().out
+    assert "headless" in text and "predates the headless split" in text
+
+    assert _cli("baseline", "--claude-dir", str(claude), "--all", "--json",
+                "--include-headless") == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["headless_split"] == "folded" and "note" not in out["against"]
+    assert out["tokens"]["interactive"]["sessions"] == 2
+    assert _cli("baseline", "--claude-dir", str(claude), "--all", "--json") == 0
+    assert "predates the headless split" in json.loads(capsys.readouterr().out)[
+        "against"]["note"]
+
+
+@pytest.mark.parametrize("mode", ["separate", "folded", "unavailable"])
+def test_cli_baseline_says_how_it_counted_headless_sessions(claude, capsys, mode):
+    """A kind that was not measured is null, never 0: a measured zero reads as
+    `no headless sessions`, and against the snapshot as a change. The head
+    says which way the report counted them, and why."""
+    _headless_world(claude, register=mode != "unavailable")
+    _snapshot()
+    argv = ("baseline", "--claude-dir", str(claude), "--all",
+            *(("--include-headless",) if mode == "folded" else ()))
+
+    assert _cli(*argv, "--json") == 0
+    out = json.loads(capsys.readouterr().out)
+    assert _cli(*argv) == 0
+    text = capsys.readouterr().out
+
+    assert out["headless_split"] == mode
+    rows = [line.split() for line in text.splitlines() if line.startswith("headless")]
+    said = {"separate": "headless children counted apart",
+            "folded": "headless children counted as interactive (--include-headless)",
+            "unavailable": "settings.json holds no readable MindHive SessionStart hook"}
+    assert said[mode] in text
+    if mode == "separate":
+        assert out["against"]["deltas"]["headless"]["sessions"] == {
+            "snapshot": None, "now": 1, "delta": None}
+        assert [row[:2] for row in rows] == [["headless", "1"]]
+    else:
+        assert out["tokens"]["headless"] is None
+        assert out["against"]["deltas"]["headless"] == {} and "note" not in out["against"]
+        assert rows == []
+
+
+@pytest.mark.parametrize("report", ["hooks", "lookups"])
+def test_cli_include_headless_reaches_the_interactive_only_reports(claude, capsys, report):
+    """... and the text says which way they were counted."""
+    _headless_world(claude)
+    sessions = {"hooks": lambda r: r["injection"]["sessions"],
+                "lookups": lambda r: r["sessions"]}[report]
+
+    counts = []
+    for extra, said in (((), "counted apart"),
+                        (("--include-headless",), "counted as interactive")):
+        assert _cli(report, "--claude-dir", str(claude), "--all", "--json", *extra) == 0
+        counts.append(sessions(json.loads(capsys.readouterr().out)))
+        assert _cli(report, "--claude-dir", str(claude), "--all", *extra) == 0
+        assert "headless children " + said in capsys.readouterr().out
+
+    assert counts == [1, 2]
+
+
 @pytest.mark.parametrize("report", ["baseline", "hooks", "lookups", "agents"])
 def test_cli_every_report_runs_in_text_and_json(claude, capsys, report):
     """Every report closes the way the repo's read-only reports do, and the two
-    that estimate tokens from characters say so, in both forms."""
+    that estimate tokens from characters say so, in both forms. Every one
+    takes `--since`; all but `agents`, which counts subagents only, say how
+    they counted headless sessions."""
     _baseline_world(claude)
     _hooks_world(claude)
     _lookup_world(claude)
@@ -1017,19 +1440,37 @@ def test_cli_every_report_runs_in_text_and_json(claude, capsys, report):
     out = json.loads(capsys.readouterr().out)
     assert out["report"] == report
     assert out.get("chars_per_token") == (4 if estimates else None)
+    assert ("headless_split" in out) == (report != "agents")
+    assert _cli(report, "--claude-dir", str(claude), "--since", "2026-10-03", "--json") == 0
+    assert json.loads(capsys.readouterr().out)["since"] == "2026-10-03T00:00:00.000Z"
+
+
+def test_cli_help_states_the_exit_codes_and_the_json_contract(capsys):
+    """An agent reads `--help`, not this repo's README, to learn what a field
+    means and what an exit code says."""
+    with pytest.raises(SystemExit) as exc:
+        cli_mod.main(["spend", "baseline", "--help"])
+
+    out = capsys.readouterr().out
+    assert exc.value.code == 0
+    assert "exit codes" in out and "headless_split" in out and "null" in out
 
 
 @pytest.mark.parametrize("report", ["baseline", "hooks", "lookups", "agents"])
 def test_no_report_prints_a_prompt_a_command_or_hook_text(claude, capsys, report):
     """Aggregates only: what a session typed, ran or was handed by a hook --
-    and what a subagent was asked -- never reaches the output, in either form.
-    Each JSON leg is first shown to have measured the planted rows; a report
-    that saw nothing would pass this vacuously."""
+    the hook commands `settings.json` registers included -- and what a
+    subagent was asked never reaches the output, in either form. Each JSON leg
+    is first shown to have measured the planted rows; a report that saw
+    nothing would pass this vacuously."""
     _plugins(claude)
+    _register_mindhive(claude, command=MH_CMD + " TOPSECRET-SETTINGS")
     leaky = "PLUGIN_DIR=~/.claude/plugins/cache/mkt/plug;KEY=TOPSECRET-CMD2;node x.js"
     _write(claude, "C--p/s1.jsonl", [
         _hook(_t(minute=0), command=OTHER_CMD + " TOPSECRET-HOOK",
               content="TOPSECRET-INJECTED"),
+        _hook(_t(minute=0), command=MH_CMD + " TOPSECRET-SETTINGS",
+              content="TOPSECRET-INJECTED3"),
         _hook(_t(minute=0), event="UserPromptSubmit", command=leaky,
               content="TOPSECRET-INJECTED2"),
         _prompt("TOPSECRET-PROMPT", _t(minute=0)),
@@ -1044,7 +1485,7 @@ def test_no_report_prints_a_prompt_a_command_or_hook_text(claude, capsys, report
     sub.with_name(sub.stem + ".meta.json").write_text(json.dumps(
         {"agentType": "Explore", "description": "TOPSECRET-DESCRIPTION"}), encoding="utf-8")
     measured = {"baseline": lambda r: r["tokens"]["interactive"]["sessions"] == 1,
-                "hooks": lambda r: sum(row["runs"] for row in r["health"]) == 2,
+                "hooks": lambda r: sum(row["runs"] for row in r["health"]) == 3,
                 "lookups": lambda r: r["lookup_calls"] == 1,
                 "agents": lambda r: r["total"]["sessions"] == 1}
 
