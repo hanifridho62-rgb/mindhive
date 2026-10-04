@@ -209,8 +209,9 @@ def test_the_six_domains_and_the_self_registering_groups_are_the_whole_surface()
     # is its only exit, so the group had to ship WITH that state rather than in
     # P1g with the CI runner. Self-registering like the rest -- one named call
     # in `commands/parsers/__init__.py`, handlers bound beside their flags.
+    # `spend` (Terion plan item 0.3) took the same trade.
     assert self_registered == {"bench", "inject", "pg", "consensus", "clusters",
-                               "lintester", "ci", "db"}
+                               "lintester", "ci", "db", "spend"}
     assert domains.isdisjoint(self_registered)
     assert domains | self_registered == set(live.choices)
 

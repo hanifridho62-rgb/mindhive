@@ -38,8 +38,9 @@ were false.
   `--allow-untested` passes a change no test could name, and the mission report
   counts those units.
 - `src/mindhive/directives.py` — §0 "Absolute honesty" opens the operating
-  directives that `hooks/session_start.ps1` / `hooks/session_start.sh` print
-  (`hive directives`) at every session start.
+  directives (`hive directives`). `hooks/session_start.ps1` /
+  `hooks/session_start.sh` print their brief form (`hive directives --brief`)
+  at every session start, with the five bold §0 rules kept verbatim.
 - Tests: `tests/test_verify.py`, `tests/test_orchestrator_gate.py` (for example
   `test_a_new_module_with_no_test_fails_closed_and_names_the_path`,
   `test_the_override_does_not_excuse_a_new_untested_module`).

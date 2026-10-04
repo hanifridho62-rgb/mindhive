@@ -104,6 +104,11 @@ def _build_parser() -> argparse.ArgumentParser:
     db_cli.register(sub)
     dashboard_p.add_ui(sub)                  # blueprint P1k
 
+    # --- spend --- self-registering, the same convention; Terion plan item
+    # 0.3: read-only token-spend reports over Claude Code transcripts.
+    from ... import spendcli as spendcli_mod
+    spendcli_mod.register(sub)
+
     return p
 
 def _closest_command(token: str, choices=None) -> str | None:

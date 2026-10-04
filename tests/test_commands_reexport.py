@@ -182,7 +182,10 @@ SURFACE = {'append': {},
  'db': {'migrate': {}, 'status': {}},
  # blueprint P1k: `hive dashboard`'s page with a heartbeat, on the same port.
  # Also registered last, so it takes the new tail.
- 'ui': {}}
+ 'ui': {},
+ # Terion plan item 0.3: read-only token-spend reports over Claude Code
+ # transcripts, self-registered by `spendcli` after `ui`.
+ 'spend': {'baseline': {}, 'hooks': {}, 'lookups': {}, 'agents': {}}}
 
 # The handler NAME every parser bound BEFORE the split (the `__func__` entries
 # of the same 2026-09-14 snapshot). Self-registering groups included: this is
@@ -348,7 +351,11 @@ LEAF_HANDLERS = {'append': 'cmd_append',
  'watcher run': 'cmd_watcher_run',
  'watcher status': 'cmd_watcher_status',
  'ui': 'cmd_ui',
- 'plugins cache-check': 'cmd_plugins_cache_check'}
+ 'plugins cache-check': 'cmd_plugins_cache_check',
+ 'spend agents': 'cmd_spend_agents',
+ 'spend baseline': 'cmd_spend_baseline',
+ 'spend hooks': 'cmd_spend_hooks',
+ 'spend lookups': 'cmd_spend_lookups'}
 
 
 def _sub(parser):

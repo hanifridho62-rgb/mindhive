@@ -600,7 +600,7 @@ def test_assistant_response_capped_at_5000_words(tmp_path, monkeypatch):
 
 def test_project_for_transcript_dir_extracts_first_cwd(tmp_path, monkeypatch):
     _isolate(tmp_path, monkeypatch)
-    monkeypatch.setattr(harvest.paths, "detect_project", lambda p: p.name)
+    monkeypatch.setattr(harvest.paths, "detect_project", lambda p, **_: p.name)
     d = tmp_path / "enc"
     d.mkdir()
     lines = [json.dumps({"cwd": "C:/ProjX"})] + [json.dumps({"i": i}) for i in range(200)]
@@ -620,11 +620,11 @@ def test_project_for_transcript_dir_skips_malformed_cwd_line(tmp_path, monkeypat
     """A malformed line containing '"cwd"' must not abandon the whole file — a
     later valid cwd line still resolves the project."""
     _isolate(tmp_path, monkeypatch)
-    monkeypatch.setattr(harvest.paths, "detect_project", lambda p: p.name)
+    monkeypatch.setattr(harvest.paths, "detect_project", lambda p, **_: p.name)
     d = tmp_path / "enc"
     d.mkdir()
     lines = [
-        '{"cwd": "C:/Broken"',                       # truncated JSON, has "cwd"
+        '{"cwd": "C:/Broken"',                      # truncated JSON, has "cwd"
         json.dumps({"cwd": "C:/ProjY"}),             # valid, later
     ]
     (d / "s.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1615,3 +1615,87 @@ def test_isMeta_does_not_suppress_slash_command_skill_capture():
     [skill] = [i for i in items if i["kind"] == "skill_used"]
     assert skill["value"]["name"] == "workflow-authoring"
     assert "memo" not in _kinds(items)
+
+
+# --- compaction summaries must not mint memos either (harvest defect) ---
+#
+# When Claude Code compacts a conversation it writes the summary back into the
+# transcript as a user-ROLE row. That row is stamped `isCompactSummary: True`
+# and `isVisibleInTranscriptOnly: True`, never `isMeta`, so the envelope check
+# above let it through: the summary was filed as something the operator typed
+# and mined for a memo at its first "decision:"/"caveat:". Measured 2026-10-03
+# over the 80 top-level transcripts harvest reads: 221 summary rows, every one
+# flagged and opening with the sentence below, 51 minting a memo and all 221
+# filed as user_prompt; all 51 memos had reached a project ledger. The fixture
+# keeps the live values of every field that bears on the classification: a
+# plain-str content (221/221), a role, a timestamp, and no isMeta, origin,
+# promptSource or permissionMode.
+
+_COMPACT_SUMMARY = (
+    "This session is being continued from a previous conversation that ran "
+    "out of context. The summary below covers the earlier portion of the "
+    "conversation.\n"
+    "\n"
+    "Summary:\n"
+    "1. Primary Request and Intent: ship the fold.\n"
+    "2. Key decision: keep the cursor per segment.\n"
+    "3. Caveat: the mirror lags the ledger by one tick.\n"
+)
+
+
+def _compact_summary_row(text=_COMPACT_SUMMARY):
+    return {"type": "user", "isCompactSummary": True,
+            "isVisibleInTranscriptOnly": True, "userType": "external",
+            "timestamp": "2026-10-03T05:32:57.000Z",
+            "message": {"role": "user", "content": text}}
+
+
+def test_a_compaction_summary_yields_no_memo():
+    items = harvest._items_from_obj(_compact_summary_row())
+
+    assert "memo" not in _kinds(items)
+
+
+def test_a_compaction_summary_is_not_filed_as_a_typed_prompt():
+    """promptgate counts user_prompt events as human-typed, and roadmap_auto
+    takes a session's first one as its original ask; a summary is neither."""
+    items = harvest._items_from_obj(_compact_summary_row())
+
+    assert "user_prompt" not in _kinds(items)
+
+
+def test_the_same_summary_text_typed_by_the_user_still_yields_a_memo_and_a_prompt():
+    """CANARY for the two tests above: the fixture text really mints a memo,
+    so their silence comes from the envelope. It also kills a text-prefix
+    fix: this text opens with the real summary sentence, and a user who
+    pastes a summary in has still typed it."""
+    items = harvest._items_from_obj(
+        _user(_COMPACT_SUMMARY, origin="terminal", promptSource="user"))
+
+    [memo] = [i for i in items if i["kind"] == "memo"]
+    assert memo["memo_type"] == "decision"
+    assert memo["value"].startswith("keep the cursor per segment.")
+    assert "user_prompt" in _kinds(items)
+
+
+def test_harvest_files_nothing_from_a_compaction_summary(tmp_path, monkeypatch):
+    """End to end in the recorded order: the compact_boundary system row, the
+    summary, then the first prompt typed after it. Only that prompt and its
+    memo reach the ledger."""
+    _isolate(tmp_path, monkeypatch)
+    tdir = tmp_path / "tx"
+    boundary = {"type": "system", "subtype": "compact_boundary",
+                "content": "Conversation compacted", "level": "info",
+                "compactMetadata": {"trigger": "auto", "preTokens": 369739}}
+    typed = _user("decision: ship the brief first",
+                  origin="terminal", promptSource="user")
+    _write_transcript(tdir, "s1", [json.dumps(r) for r in
+                                   (boundary, _compact_summary_row(), typed)])
+
+    harvest.harvest(tdir, "test")
+
+    evs = events.read_all("test")
+    assert [e.payload["text"] for e in evs
+            if e.type in events.SEMANTIC_TYPES] == ["ship the brief first"]
+    assert [e.payload["text"] for e in evs
+            if e.type == "user_prompt"] == ["decision: ship the brief first"]

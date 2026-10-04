@@ -127,21 +127,28 @@ tool before starting the work. When in doubt, invoke the skill — a skill run
 that turns out unnecessary is cheaper than an ad-hoc answer that skips a
 workflow's quality gates.
 
-**Scope is every installed skill, not one vendor's list.** This machine has
-**347 skills across 70 plugins**; gstack is roughly 40 of them. Routing to
-"the gstack skill that is closest" when a domain plugin fits better is the
-failure this section exists to prevent.
+**Scope is every ENABLED skill, not one vendor's list.** Since 2026-10-03 this
+machine runs a plugin diet (Terion plan, Fase 0.2): **7 of the 70 installed
+plugins are enabled** — `compound-engineering`, `superpowers`, `mindhive`,
+`python-development`, `agent-teams`, `full-stack-orchestration` and
+`tdd-workflows`. The other 63 are disabled at user scope, so their skills,
+commands and agents are not callable. User-level skills in `~/.claude/skills`
+(gstack's `/office-hours`, `/investigate`, `/review`, `/ship` and the rest) and
+this repo's `.claude/skills` are not plugins and were not touched. Routing to
+"the gstack skill that is closest" when an enabled domain plugin fits better is
+still the failure this section exists to prevent.
 
-The catalog is live, so read it rather than trusting any list written here:
+What is callable is live, so read it rather than trusting any list written
+here: the Skill tool's own listing, which carries each skill's one-line
+description, and `claude plugin list` for which plugins are enabled. Consult
+the description before invoking, and match the task to the skill's stated
+scope. `hive skills list` and `hive plugins recommend` read MindHive's own
+catalog, which does not yet know which plugins are enabled: they can list, and
+recommend, a skill from a disabled plugin. Check that its plugin is enabled
+before following one of their picks.
 
-```
-hive skills list
-```
-
-`hive plugins recommend` scores the picks. The Skill tool's own listing is the
-other authoritative source, and it carries each skill's one-line description —
-consult the description before invoking, and match the task to the skill's
-stated scope.
+Re-enabling a disabled plugin is the owner's call, never a routing decision:
+`claude plugin enable <id> --scope user`, only on the owner's word.
 
 **Names must be exact, including any `plugin:` prefix.** `ce-code-review` is
 `compound-engineering:ce-code-review`; a bare or guessed name errors. A
@@ -167,9 +174,10 @@ the boundary of what may be routed to:
   `superpowers:writing-plans`
 - Bugs, errors, "why is this broken" → `/investigate`,
   `superpowers:systematic-debugging`, `compound-engineering:ce-debug`,
-  `error-diagnostics:*`, `incident-response:*`
+  `agent-teams:parallel-debugging` (several competing hypotheses)
 - Tests and TDD → `mindhive-python-tdd`, `superpowers:test-driven-development`,
-  `tdd-workflows:*`, `unit-testing:*`
+  `tdd-workflows:*` (`/tdd-cycle`, `/tdd-red`, `/tdd-green`, `/tdd-refactor`),
+  `python-development:python-testing-patterns`
 - Code review before landing → `/review`,
   `compound-engineering:ce-code-review`, `thermo-nuclear-code-quality-review`,
   `security-review`, `/cso`
@@ -179,10 +187,11 @@ the boundary of what may be routed to:
   `mindhive-python-patterns`, `mindhive-python-security`,
   `mindhive-python-verification`, `windows-powershell-patterns`,
   `claude-harness-patterns`
-- Domain work → the matching plugin family: `python-development:*`,
-  `backend-development:*`, `ui-design:*`, `security-scanning:*`,
-  `observability-monitoring:*`, `llm-application-dev:*`, and the rest that
-  `hive skills list` reports.
+- Domain work → an enabled plugin family: `python-development:*` (error
+  handling, type safety, async, performance, packaging, ...), `agent-teams:*`
+  for parallel multi-agent review, debugging or feature work,
+  `full-stack-orchestration:*` (`/full-stack-feature`), and the rest the Skill
+  tool lists.
 
 The MANDATORY SOP in the ledger (`hive sop show execution-discipline`) already
 requires naming the skills a task will use before the first edit. This section

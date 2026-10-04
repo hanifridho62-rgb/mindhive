@@ -59,7 +59,7 @@ def write_memory_pointer(memory_md_path, project: str, one_line_state: str) -> P
     body = (
         "# Memory Index\n\n"
         f"Project/episodic memory now lives in MIND HIVE (`~/.mindhive/{project}/`).\n"
-        "The SessionStart hook loads `STATE.md`; use `hive recall \"<query>\"` for history.\n\n"
+        "The SessionStart hook loads a brief of `STATE.md` (`hive state` prints all of it); use `hive recall \"<query>\"` for history.\n\n"
         f"**Fallback (if a hook fails):** active project `{project}` — {one_line_state}\n"
     )
     p.write_text(body, encoding="utf-8")
