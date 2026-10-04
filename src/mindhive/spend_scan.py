@@ -354,7 +354,9 @@ class _Reader:
         started with its parent's environment (the loop driver's, a Workspace
         board agent) runs them and is not caught here. A run that failed or was
         cancelled still ran; one whose command was not recorded is left out,
-        since its owner cannot be read."""
+        since its owner cannot be read. A MindHive SessionStart that fails open
+        says so in one stderr line, which Claude Code keeps, so it counts as a
+        run."""
         started = {owner for owner, event, *_ in self.runs
                    if event == "SessionStart" and owner != NO_COMMAND}
         return bool(started) and "mindhive" not in started

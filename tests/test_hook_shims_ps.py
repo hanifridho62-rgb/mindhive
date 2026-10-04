@@ -79,6 +79,10 @@ SILENT_STAGES = ("post_tool_use", "post_tool_use_failure", "autosync",
                  "session_end")
 REMINDER = "MIND HIVE: before compaction, fold this session"
 
+# The one line `session_start` writes on stderr when it fails open, up to what
+# failed. Same text as `tests/test_hook_shims.py` pins for `session_start.sh`.
+FAILED_OPEN = "mindhive session_start: failed open: "
+
 
 # --- helpers -------------------------------------------------------------------
 
@@ -826,16 +830,29 @@ def test_an_over_long_session_id_is_refused(tmp_path):
 
 # --- the shims themselves: fail-open under every breakage ----------------------
 
-def assert_quiet(stem, r):
-    """Fail-open means silent on BOTH channels -- with one documented exception.
+def assert_quiet(stem, r, cause):
+    """Fail-open means silent on BOTH channels -- with two documented exceptions.
 
     `pre_compact` prints a fixed sentence addressed to a human. It needs no
     interpreter, so its contract is "the reminder and nothing else" rather than
     "nothing at all". Gating that line behind the resolver was a regression
     this branch introduced; these three tests asserted the regression, which is
-    why they had to change with it."""
+    why they had to change with it.
+
+    `session_start` names its failure in exactly ONE line on stderr, carrying
+    *cause*, and keeps stdout -- the context it injects -- empty. Claude Code
+    drops a SessionStart hook's transcript row only when its content, stdout
+    and stderr are all empty, and `hive spend` reads a typed session whose
+    MindHive SessionStart left no row as a headless child; the line keeps the
+    row."""
     assert r.returncode == 0, (stem, r.stderr)
-    assert r.stderr.strip() == "", (stem, r.stderr)
+    if stem == "session_start":
+        lines = r.stderr.splitlines()
+        assert len(lines) == 1, (stem, r.stderr)
+        assert lines[0].startswith(FAILED_OPEN), (stem, r.stderr)
+        assert cause in lines[0], (stem, cause, r.stderr)
+    else:
+        assert r.stderr.strip() == "", (stem, r.stderr)
     out = r.stdout.strip()
     if stem == "pre_compact":
         assert REMINDER in out, (stem, r.stdout)
@@ -863,7 +880,8 @@ def _copy_family(tmp_path, with_lib=True, lib_text=None):
 @pytest.mark.parametrize("stem", ps_shims())
 def test_a_shim_with_no_library_is_a_silent_no_op(tmp_path, stem):
     dest = _copy_family(tmp_path, with_lib=False)
-    assert_quiet(stem, run_ps(dest / (stem + ".ps1"), stdin=PAYLOAD))
+    assert_quiet(stem, run_ps(dest / (stem + ".ps1"), stdin=PAYLOAD),
+                 cause="lib.ps1 is missing")
 
 
 @windows_only
@@ -872,7 +890,8 @@ def test_a_shim_with_an_unparseable_library_is_a_silent_no_op(tmp_path, stem):
     """A library that cannot even be parsed is the case a bare `. $lib` would
     turn into a visible error at the end of every turn in every session."""
     dest = _copy_family(tmp_path, lib_text="function Broken { if ( {\r\n")
-    assert_quiet(stem, run_ps(dest / (stem + ".ps1"), stdin=PAYLOAD))
+    assert_quiet(stem, run_ps(dest / (stem + ".ps1"), stdin=PAYLOAD),
+                 cause="lib.ps1 did not load")
 
 
 @windows_only
@@ -883,7 +902,8 @@ def test_a_shim_with_no_interpreter_anywhere_is_a_silent_no_op(tmp_path, stem):
         dest / (stem + ".ps1"), stdin=PAYLOAD,
         env={"MINDHIVE_PYTHON": r"C:\definitely\not\here.exe",
              "MINDHIVE_HOOK_WALK_LIMIT": "1",
-             "PATH": r"C:\Windows\System32;C:\Windows"}))
+             "PATH": r"C:\Windows\System32;C:\Windows"}),
+        cause="no Python interpreter resolved")
 
 
 @windows_only
@@ -1326,7 +1346,8 @@ def test_a_library_that_parses_but_defines_nothing_is_a_silent_no_op(tmp_path):
     case that does -- a half-written or truncated `lib.ps1`."""
     dest = _copy_family(tmp_path, lib_text="# a library with no functions\r\n")
     for stem in ps_shims():
-        assert_quiet(stem, run_ps(dest / (stem + ".ps1"), stdin=PAYLOAD))
+        assert_quiet(stem, run_ps(dest / (stem + ".ps1"), stdin=PAYLOAD),
+                     cause="lib.ps1 defines no Get-MindhivePython")
 
 
 @windows_only
@@ -1520,20 +1541,26 @@ STATE = "-m mindhive state --brief"
 def session_start_interpreter(tmp_path: Path, log: Path) -> Path:
     """An 'interpreter' for `session_start`: each call appends its argv to *log*
     and prints `child stdout: <argv>`, so the hook's stdout shows which calls
-    it forwarded, in order. With `STUB_FAIL` set, the call whose fourth
-    argument equals it prints `child stderr: <argv>` on stderr and exits 3
-    instead. Each redirection LEADS its `echo`, so an argv ending in a digit
-    (`--max-age-hours 24`) cannot be read as a handle number, and no trailing
-    space reaches the log."""
+    it forwarded, in order. With `STUB_FAIL` set, the call whose third or
+    fourth argument equals it -- `append`, `directives`, `state`,
+    `cache-check` -- or every call, for `all`, prints `child stderr: <argv>`
+    on stderr and exits 3 instead. Each redirection LEADS its `echo`, so an
+    argv ending in a digit (`--max-age-hours 24`) cannot be read as a handle
+    number, and no trailing space reaches the log."""
     stub = tmp_path / "session_start_stub.cmd"
     stub.write_text(
         "@echo off\r\n"
         ">>\"%s\" echo %%*\r\n"
-        "if defined STUB_FAIL if \"%%4\"==\"%%STUB_FAIL%%\" (\r\n"
-        "    >&2 echo child stderr: %%*\r\n"
-        "    exit /b 3\r\n"
-        ")\r\n"
-        "echo child stdout: %%*\r\n" % log,
+        "if not defined STUB_FAIL goto ok\r\n"
+        "if \"%%STUB_FAIL%%\"==\"all\" goto fail\r\n"
+        "if \"%%3\"==\"%%STUB_FAIL%%\" goto fail\r\n"
+        "if \"%%4\"==\"%%STUB_FAIL%%\" goto fail\r\n"
+        ":ok\r\n"
+        "echo child stdout: %%*\r\n"
+        "exit /b 0\r\n"
+        ":fail\r\n"
+        ">&2 echo child stderr: %%*\r\n"
+        "exit /b 3\r\n" % log,
         encoding="ascii")
     return stub
 
@@ -1587,3 +1614,119 @@ def test_a_failing_plugin_cache_check_leaves_session_start_quiet_and_exit_0(tmp_
                           text=True, env=clean_env(env), timeout=30)
     assert (bare.returncode, bare.stdout, bare.stderr) == (
         3, "", "child stderr: " + CACHE_CHECK + "\n")
+
+
+# --- session_start names its failure on stderr when it fails open ---------------
+#
+# The one exception to failing open in silence. Claude Code 2.1.198 drops a
+# hook's `hook_success` row from the transcript only when its content, stdout
+# AND stderr are all empty, so a MindHive SessionStart that failed open without
+# a word left no row, and `hive spend` (`spend_scan._mindhive_silent_at_start`)
+# filed the typed session it started as a headless child. One line on stderr
+# keeps the row. Never on stdout, which is the context the hook injects; never
+# more than one line; never in a headless child, whose first line still exits
+# before anything else runs. `plugins cache-check` stays outside it: its
+# failure is already quiet by contract (the test above).
+
+@windows_only
+@pytest.mark.parametrize("fail, said, forwarded", [
+    ("append", "mindhive append session_start exited 3",
+     [DIRECTIVES, STATE, CACHE_CHECK]),
+    ("directives", "mindhive directives --brief exited 3", [STATE, CACHE_CHECK]),
+    ("state", "mindhive state --brief exited 3", [DIRECTIVES, CACHE_CHECK]),
+], ids=["append", "directives", "state"])
+def test_a_failing_mindhive_call_is_named_in_one_stderr_line(tmp_path, fail, said,
+                                                             forwarded):
+    """Each checked call failing alone: the hook exits 0, names that call and
+    its exit code in one line, keeps the child's own stderr discarded, and
+    still forwards every other call's context."""
+    dest = _copy_family(tmp_path)
+    log = tmp_path / "argv.log"
+    stub = session_start_interpreter(tmp_path, log)
+    r = run_ps(dest / "session_start.ps1", stdin=PAYLOAD,
+               env={"MINDHIVE_PYTHON": str(stub), "STUB_FAIL": fail})
+    assert r.returncode == 0, r.stderr
+    assert r.stderr.splitlines() == [FAILED_OPEN + said], r.stderr
+    assert r.stdout.splitlines() == ["child stdout: " + c for c in forwarded], r.stdout
+
+
+@windows_only
+def test_only_the_first_failure_is_named(tmp_path):
+    """Every call fails: still exactly ONE line, naming the first, while the
+    log shows the later calls ran all the same."""
+    dest = _copy_family(tmp_path)
+    log = tmp_path / "argv.log"
+    stub = session_start_interpreter(tmp_path, log)
+    r = run_ps(dest / "session_start.ps1", stdin=PAYLOAD,
+               env={"MINDHIVE_PYTHON": str(stub), "STUB_FAIL": "all"})
+    assert r.returncode == 0, r.stderr
+    assert r.stderr.splitlines() == [
+        FAILED_OPEN + "mindhive append session_start exited 3"], r.stderr
+    assert r.stdout == "", r.stdout
+    assert STATE in _calls(log), _calls(log)
+
+
+@windows_only
+def test_a_session_start_that_succeeds_says_nothing_on_stderr(tmp_path):
+    """The line marks a failure, so a run that succeeds writes nothing on
+    stderr. CANARY: the same fixture with one call failing does write the
+    line, so this silence is a verdict rather than a shim that cannot speak."""
+    dest = _copy_family(tmp_path)
+    log = tmp_path / "argv.log"
+    stub = session_start_interpreter(tmp_path, log)
+    ok = run_ps(dest / "session_start.ps1", stdin=PAYLOAD,
+                env={"MINDHIVE_PYTHON": str(stub)})
+    assert ok.returncode == 0, ok.stderr
+    assert ok.stderr == "", ok.stderr
+    bad = run_ps(dest / "session_start.ps1", stdin=PAYLOAD,
+                 env={"MINDHIVE_PYTHON": str(stub), "STUB_FAIL": "state"})
+    assert len(bad.stderr.splitlines()) == 1, bad.stderr
+
+
+@windows_only
+def test_a_headless_session_start_says_nothing_where_it_would_fail_open(tmp_path):
+    """`MINDHIVE_HEADLESS=1` still exits on the first line, before the line
+    could be written: no call, no stdout, no stderr. It runs first, so no
+    background call of the canary can reach the log. CANARY: the same fixture
+    without the flag names its failure."""
+    dest = _copy_family(tmp_path)
+    log = tmp_path / "argv.log"
+    stub = session_start_interpreter(tmp_path, log)
+    env = {"MINDHIVE_PYTHON": str(stub), "STUB_FAIL": "all"}
+    quiet = run_ps(dest / "session_start.ps1", stdin=PAYLOAD,
+                   env={**env, "MINDHIVE_HEADLESS": "1"})
+    assert (quiet.returncode, quiet.stdout, quiet.stderr) == (0, "", ""), quiet
+    assert _calls(log) == [], _calls(log)
+    loud = run_ps(dest / "session_start.ps1", stdin=PAYLOAD, env=env)
+    assert loud.returncode == 0, loud.stderr
+    assert len(loud.stderr.splitlines()) == 1, loud.stderr
+
+
+def _resolver_only_library(answer) -> str:
+    """A `lib.ps1` whose resolver answers *answer* and whose detached start does
+    nothing, so `session_start` can be handed an 'interpreter' the real
+    resolver would refuse without anything being launched in the background."""
+    return ("function Get-MindhivePython { %s }\r\n"
+            "function Get-MindhivePayload { '' }\r\n"
+            "function Get-MindhiveSessionId { 'unknown' }\r\n"
+            "function Start-MindhiveDetached { }\r\n" % ps_quote(answer))
+
+
+@windows_only
+@pytest.mark.parametrize("answer, said", [
+    ("absent.exe", "threw CommandNotFoundException"),
+    ("silent.ps1", "mindhive append session_start left no exit code"),
+], ids=["throws", "no-exit-code"])
+def test_a_call_that_never_ran_is_named_in_one_stderr_line(tmp_path, answer, said):
+    """The two ways a call can fail with no exit code to read. A path that does
+    not exist throws at `&`, inside the try block. A script runs in process
+    and sets no `$LASTEXITCODE`; counted as a success, that would be the very
+    silence the line exists to end."""
+    target = tmp_path / answer
+    if answer.endswith(".ps1"):
+        target.write_text("# runs, and leaves no exit code\r\n", encoding="ascii")
+    dest = _copy_family(tmp_path, lib_text=_resolver_only_library(target))
+    r = run_ps(dest / "session_start.ps1", stdin=PAYLOAD)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "", r.stdout
+    assert r.stderr.splitlines() == [FAILED_OPEN + said], r.stderr
