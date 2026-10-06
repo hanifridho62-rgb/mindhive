@@ -219,6 +219,36 @@ history and grouped by what each release window introduced. They summarise;
 
 ### Fixed
 
+- **`hive sync` writes `MEMORY.md` where Claude reads it** (chip
+  task_cb518538). Two faults kept the digest from the session it was written
+  for. `sync.encode_folder` kept a dot where Claude Code's project-directory
+  name has a hyphen (every character outside `[A-Za-z0-9]` is one), so a path
+  through `.claude\worktrees\...` landed in a `...-mindhive-.claude-...`
+  folder beside the `...-mindhive--claude-...` one Claude names -- eighteen
+  such folders on the author's machine. And the command keyed by the cwd,
+  while Claude keys a worktree session's memory by its MAIN repository, so
+  `hive sync` run in a linked worktree wrote under the worktree's folder even
+  where the name was right. The command now keys by `context._memory_folder`
+  (the git common dir's parent; the cwd off a repository), `--folder` still
+  wins, and the encoding matches Claude's for every character. The stray
+  folders are not removed. `tests/test_sync.py`.
+- **A captured CI child past its cap no longer waits for the grandchild it
+  left, and no CI child can stop to ask for a credential** (`ci/proc.py`).
+  The captured shape -- the `git`, `gh` and `wsl` probes -- ran through
+  `subprocess.run`, whose timeout path on Windows kills the direct child and
+  then drains the pipes with no cap; a grandchild that inherited them held
+  them open for as long as it lived, so a 2 s cap came back after 25.2 s,
+  the grandchild's lifetime, with the error text claiming a kill that never
+  happened -- the way a `hive ci watch` pass wedges. Captured children are
+  now started the way logged ones are: at the head of their own process
+  group, held in a Job Object (`orchestrator.driver`), the whole tree killed
+  at the cap, the drain bounded by `driver.DRAIN_GRACE_S`, and the error
+  text naming what the kill reached; `proc.stop_all` takes them with the
+  logged ones, since the console's Ctrl+C no longer does. Every child is
+  also handed `GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=Never` and
+  `GH_PROMPT_DISABLED=1` unless the caller chose a value, so a `git fetch`
+  or a `gh` call can fail for want of a credential but never wait for one.
+  `tests/test_ci_proc.py`.
 - **`hive failures capture` takes the harvest lock.** `failures.capture_dir`
   stamps each `tool_failed` row with the transcript line's own timestamp and
   dedups against a snapshot taken before the walk, so the command run beside

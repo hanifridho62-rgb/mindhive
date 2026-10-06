@@ -1652,15 +1652,19 @@ def test_sync_uses_registered_project_folder(dashboard_server, monkeypatch):
     assert obj["folder"] == "C:/code/test-project"
 
 
-def test_sync_falls_back_to_cwd_when_unregistered(dashboard_server, monkeypatch):
-    """An unregistered project has no folder mapping, so sync uses the cwd."""
-    import os
+def test_sync_falls_back_to_the_main_repo_when_unregistered(dashboard_server, monkeypatch):
+    """An unregistered project has no folder mapping, so sync keys by the main
+    repository of the server's cwd (`context._memory_folder`), never the cwd
+    itself: a dashboard launched in a linked worktree would otherwise write the
+    digest under a folder Claude never reads it from (chip task_cb518538)."""
+    from mindhive import context
     captured = {}
+    monkeypatch.setattr(context, "_memory_folder", lambda *a, **k: "C:/main/repo")
     monkeypatch.setattr(dashboard_post.sync_mod, "sync",
                         lambda folder, project=None: captured.update(folder=folder) or "x")
     base, token = dashboard_server
     _post(base, "/api/sync", {"project": "never-registered"}, token)
-    assert captured["folder"] == os.getcwd()
+    assert captured["folder"] == "C:/main/repo"
 
 
 # --- launch_background(): detached background launcher for the loop ----------

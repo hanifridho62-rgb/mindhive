@@ -264,15 +264,18 @@ def cmd_ui(args) -> int | None:
     return None
 
 def cmd_sync(args) -> int | None:
+    from .. import context as context_mod
     from .. import sync as sync_mod
-    folder = args.folder or os.getcwd()
+    # Keyed by the MAIN repository, a linked worktree's included: that is the
+    # folder Claude reads MEMORY.md under, and a cwd key taken in a worktree
+    # wrote the digest where no session looks (chip task_cb518538).
+    folder = args.folder or context_mod._memory_folder()
     native_path = sync_mod.sync(folder, include_briefing=not args.no_briefing)
     print(str(native_path))
     # Say it here, where the file was just written. The digest's caps bound item
     # counts, not lines, so this is the moment the file can cross the loader's
     # limit — and the loader's own warning appears in the NEXT session, to the
     # agent rather than to the person who ran sync.
-    from .. import context as context_mod
     pressure = context_mod.memory_pressure(native_path)
     if pressure["readable"] and pressure["truncated"]:
         print(f"warning: {context_mod.pressure_headline(pressure)}; the loader "

@@ -1499,9 +1499,11 @@ SPAWN_SITES = {
     # #136 merge-safety review (P2): `_gate_env` now withholds the token and,
     # for this child alone, the secret too (`scrub_agent_env(withhold_secret=True)`).
     "ci/runner.py": (1, 1),
-    # Two sites, one scrub (spec 2026-09-30): `subprocess.run` for the captured
-    # probes and `subprocess.Popen` for the logged, tree-held long steps; the
-    # single `scrub_agent_env(..., withhold_secret=True)` guards both.
+    # Two sites, one scrub (spec 2026-09-30): one `subprocess.Popen` for the
+    # captured probes and one for the logged long steps, both tree-held (the
+    # captured one was `subprocess.run` until its uncapped drain wedged a watch
+    # pass on a grandchild); the single `scrub_agent_env(..., withhold_secret=True)`
+    # guards both.
     "ci/proc.py": (2, 1),
     "claude_cli.py": (1, 1),
     "clusters.py": (1, 0), "commands/context_ops.py": (1, 0), "context.py": (1, 0),

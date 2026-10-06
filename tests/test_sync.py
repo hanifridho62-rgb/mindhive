@@ -16,6 +16,57 @@ def test_encode_folder_forward_slash():
     assert encode_folder("C:/Users/hanif") == "C--Users-hanif"
 
 
+def test_encode_folder_hyphenates_every_character_claude_code_does():
+    """Claude Code names a project directory by replacing every character
+    outside ``[A-Za-z0-9]`` with a hyphen, a dot included: on this machine
+    ``<repo>\\.claude\\worktrees\\x`` is ``<repo>--claude-worktrees-x``. The
+    older rule kept the dot and wrote a ``<repo>-.claude-...`` folder Claude
+    never reads (chip task_cb518538)."""
+    wt = r"C:\Users\hanif\mindhive\.claude\worktrees\cli-login-status-detection-cfec62"
+    assert encode_folder(wt) == ("C--Users-hanif-mindhive--claude-worktrees-"
+                                 "cli-login-status-detection-cfec62")
+    assert encode_folder(r"D:\my dir\x+y.z") == "D--my-dir-x-y-z"
+
+
+def test_hive_sync_keys_memory_by_the_main_repo_from_a_linked_worktree(tmp_path, monkeypatch):
+    """Claude reads MEMORY.md under the MAIN repository's folder even for a
+    session in a linked worktree (`context._memory_folder`), so a cwd key
+    taken in a worktree wrote the digest where no session looks. An explicit
+    `--folder` still wins."""
+    import subprocess
+    import mindhive.sync as sync_mod
+    from mindhive import __main__ as cli_mod
+    repo = tmp_path / "repo"
+    git = ["git", "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "init", "-q", str(repo)], check=True)
+    subprocess.run([*git, "-C", str(repo), "commit", "-q", "--allow-empty", "-m", "init"],
+                   check=True)
+    wt = repo / ".claude" / "worktrees" / "wt"
+    subprocess.run([*git, "-C", str(repo), "worktree", "add", "-q", str(wt)], check=True)
+    seen = []
+    written = tmp_path / "MEMORY.md"
+    written.write_text("x\n", encoding="utf-8")
+    monkeypatch.setattr(sync_mod, "sync", lambda folder, **kw: seen.append(folder) or written)
+    monkeypatch.chdir(wt)
+
+    assert cli_mod.main(["sync", "--no-briefing"]) == 0
+    assert Path(seen[-1]).resolve() == repo.resolve()
+    assert cli_mod.main(["sync", "--folder", r"C:\elsewhere"]) == 0
+    assert seen[-1] == r"C:\elsewhere"
+
+
+def test_the_dashboard_keys_an_unregistered_project_the_same_way(monkeypatch):
+    """The panel's Sync button resolves a project's folder from the autosync
+    registry and fell back to the server's cwd: launched in a linked worktree,
+    the same wrong key. The fallback is the main repository now."""
+    from mindhive import autosync, context, dashboard_data
+    monkeypatch.setattr(autosync, "load_registry", lambda: [
+        {"project": "other", "folder": r"C:\registered"}])
+    monkeypatch.setattr(context, "_memory_folder", lambda *a, **k: r"C:\main-repo")
+    assert dashboard_data._folder_for_project("other") == r"C:\registered"
+    assert dashboard_data._folder_for_project("mine") == r"C:\main-repo"
+
+
 def test_native_memory_path_structure(tmp_path):
     p = native_memory_path(r"C:\Users\hanif", home=tmp_path)
     assert p == tmp_path / ".claude" / "projects" / "C--Users-hanif" / "memory" / "MEMORY.md"
