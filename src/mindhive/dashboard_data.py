@@ -18,7 +18,6 @@ Three concerns, in the order they appear:
 * **HIVE MIND** — the ``project="*"`` unified read-only lens across namespaces.
 """
 import collections
-import os
 import time
 
 from . import chain, events, paths
@@ -32,14 +31,16 @@ from .dashboard_memo import _STATS_MEMO, _fingerprinted, _ledger_fingerprint
 
 def _folder_for_project(proj: str) -> str:
     """The project's own folder (where its native MEMORY.md belongs), taken from
-    the autosync registry. Falls back to the server's cwd only when the project
-    isn't registered — so picking a project in the UI syncs THAT project's
-    folder, not wherever the dashboard happens to be launched from."""
-    from . import autosync
+    the autosync registry. Falls back to the main repository of the server's
+    cwd (`context._memory_folder`, a linked worktree's included) only when the
+    project isn't registered — so picking a project in the UI syncs THAT
+    project's folder, not wherever the dashboard happens to be launched from,
+    and never a worktree, which Claude keys by its main repository."""
+    from . import autosync, context
     for e in autosync.load_registry():
         if e.get("project") == proj and e.get("folder"):
             return e["folder"]
-    return os.getcwd()
+    return context._memory_folder()
 
 
 def _all_projects() -> list:

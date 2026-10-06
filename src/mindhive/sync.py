@@ -40,20 +40,18 @@ Full current state:        hive state        Full briefing: hive briefing
 
 
 def encode_folder(folder: str) -> str:
-    """Encode a folder path to match Claude Code's project-dir encoding.
-
-    Replaces each of: : \\ / _ with a hyphen.
+    """Encode a folder path the way Claude Code names its project directory:
+    every character outside ``[A-Za-z0-9]`` becomes a hyphen -- the drive
+    colon and the separators, and a dot, a space or an underscore just the
+    same. ``.claude`` therefore encodes to ``-claude``, which is why a worktree
+    under ``<repo>\\.claude\\worktrees\\x`` is ``<repo>--claude-worktrees-x``
+    on disk; the older rule, which kept the dot, wrote a ``<repo>-.claude-...``
+    folder Claude never reads (chip task_cb518538).
     Examples:
         C:\\Users\\hanif   -> C--Users-hanif
         C:\\FABIO_HFT_V18  -> C--FABIO-HFT-V18
     """
-    result = []
-    for ch in folder:
-        if ch in (":", "\\", "/", "_"):
-            result.append("-")
-        else:
-            result.append(ch)
-    return "".join(result)
+    return "".join(ch if ch.isascii() and ch.isalnum() else "-" for ch in folder)
 
 
 def native_memory_path(folder: str, home: Path | None = None) -> Path:

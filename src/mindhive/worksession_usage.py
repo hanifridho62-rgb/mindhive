@@ -10,9 +10,9 @@ safe line.
 
 Finding that file is the delicate part. It sits at
 ``~/.claude/projects/<encode_folder(folder)>/memory/MEMORY.md``, keyed by the
-FOLDER sync ran in, and the encoding is lossy (``:``, ``\\``, ``/``, ``_`` and a
-literal ``-`` all become ``-``), so a folder name cannot be decoded back into a
-namespace. `memory_path_for_project` therefore asks the source every sync
+FOLDER sync was given, and the encoding is lossy (every character outside
+``[A-Za-z0-9]`` becomes ``-``, a literal ``-`` included), so a folder name
+cannot be decoded back into a namespace. `memory_path_for_project` therefore asks the source every sync
 writer itself uses first -- the autosync registry's ``project -> folder`` row,
 encoded exactly as `sync.native_memory_path` encodes it. Only an unregistered
 namespace falls back to the encoded names, and there a candidate is refused

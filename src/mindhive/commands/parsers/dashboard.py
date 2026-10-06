@@ -177,7 +177,9 @@ def add_sync(sub) -> None:
     # --- sync ---
     sp = sub.add_parser("sync", help="write native MEMORY.md for desktop auto-load")
     sp.add_argument("--folder", default=None,
-                    help="project folder to encode (default: cwd)")
+                    help="project folder to key MEMORY.md by (default: the main "
+                         "repository of the current checkout, a linked worktree's "
+                         "included; off a repository, the cwd)")
     sp.add_argument("--no-briefing", action="store_true",
                     help="omit BRIEFING.md from native MEMORY.md")
     sp.set_defaults(func=cmd_sync)

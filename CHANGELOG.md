@@ -219,6 +219,19 @@ history and grouped by what each release window introduced. They summarise;
 
 ### Fixed
 
+- **`hive sync` writes `MEMORY.md` where Claude reads it** (chip
+  task_cb518538). Two faults kept the digest from the session it was written
+  for. `sync.encode_folder` kept a dot where Claude Code's project-directory
+  name has a hyphen (every character outside `[A-Za-z0-9]` is one), so a path
+  through `.claude\worktrees\...` landed in a `...-mindhive-.claude-...`
+  folder beside the `...-mindhive--claude-...` one Claude names -- eighteen
+  such folders on the author's machine. And the command keyed by the cwd,
+  while Claude keys a worktree session's memory by its MAIN repository, so
+  `hive sync` run in a linked worktree wrote under the worktree's folder even
+  where the name was right. The command now keys by `context._memory_folder`
+  (the git common dir's parent; the cwd off a repository), `--folder` still
+  wins, and the encoding matches Claude's for every character. The stray
+  folders are not removed. `tests/test_sync.py`.
 - **A captured CI child past its cap no longer waits for the grandchild it
   left, and no CI child can stop to ask for a credential** (`ci/proc.py`).
   The captured shape -- the `git`, `gh` and `wsl` probes -- ran through
