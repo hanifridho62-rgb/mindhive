@@ -4,8 +4,8 @@
 What carries the weight: a captured child answers its code and both streams; a
 logged child writes into its file and nothing else; a cap returns promptly and
 says so, even when the child left a grandchild running; stdin is empty unless
-given; and no child -- captured or logged, inheriting or handed an environment
--- sees the SOP secret or the token.
+given; no child -- captured or logged, inheriting or handed an environment --
+sees the SOP secret or the token; and none can stop to ask for a credential.
 """
 import json
 import os
@@ -22,6 +22,10 @@ SECRET, TOKEN = advice.SECRET_ENV, advice.TOKEN_ENV
 FAKE = "fake-sop-secret-for-this-test-only"
 NAMES = ("import json, os; print(json.dumps(sorted("
          "k for k in os.environ if k.startswith('MINDHIVE_'))))")
+# What git, its credential manager and gh each read as "never ask".
+QUIET = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "Never", "GH_PROMPT_DISABLED": "1"}
+SEEN = ("import json, os; print(json.dumps({k: os.environ.get(k) for k in "
+        + repr(sorted(QUIET)) + "}))")
 
 
 def test_a_captured_child_answers_its_code_and_both_streams():
@@ -121,6 +125,25 @@ def test_no_child_sees_the_sop_secret_or_the_token(monkeypatch, tmp_path):
     assert FAKE in handed.values()                # the caller's own copy is untouched
 
 
+def test_no_child_can_stop_to_ask_for_a_credential(monkeypatch, tmp_path):
+    """A pass nobody is watching: a `git fetch` or a `gh` call that stops to
+    ask for a credential holds the run until its cap. Every child, in both
+    shapes, inheriting or handed an environment, is told not to ask -- and a
+    value the caller chose is kept, the way `paths.no_bytecode_env` keeps one."""
+    for name in QUIET:
+        monkeypatch.delenv(name, raising=False)
+    for env in (None, dict(os.environ)):
+        rc, out, err = proc.run([sys.executable, "-c", SEEN], env=env)
+        assert rc == 0, err
+        assert json.loads(out) == QUIET
+    log = tmp_path / "leg.log"
+    assert proc.run([sys.executable, "-c", SEEN], env=dict(os.environ), log=log)[0] == 0
+    assert json.loads(log.read_text(encoding="utf-8")) == QUIET
+    chosen = dict(os.environ, GIT_TERMINAL_PROMPT="1")
+    seen = json.loads(proc.run([sys.executable, "-c", SEEN], env=chosen)[1])
+    assert seen == dict(QUIET, GIT_TERMINAL_PROMPT="1")
+
+
 def _bounded(call, limit_s=45):
     """Run *call* in a thread and answer what it returned -- or fail, rather
     than hang the suite, when it is still running after *limit_s*."""
@@ -130,6 +153,59 @@ def _bounded(call, limit_s=45):
     worker.join(limit_s)
     assert not worker.is_alive(), f"still running after {limit_s}s"
     return box["out"]
+
+
+def test_a_captured_child_past_its_cap_is_killed_with_the_grandchild_it_left(tmp_path):
+    """The shape `subprocess.run` gets wrong on Windows, on the captured path
+    this time: past the cap it kills the child and then waits, with no cap,
+    for the pipes to close -- and a grandchild that inherited them holds them
+    open for as long as it lives. Measured before the fix: a 2s cap came back
+    after 25.2s, the grandchild's own lifetime, with the error text claiming
+    the kill. Here the tree is held, so the cap returns in seconds, keeps what
+    the child had printed, and the grandchild's heartbeat stops with it."""
+    beat = tmp_path / "beat"
+    grand = tmp_path / "grand.py"
+    grand.write_text("import sys, time\n"
+                     "for _ in range(350):\n"          # 35s, then it goes by itself
+                     "    open(sys.argv[1], 'a').write('x'); time.sleep(0.1)\n",
+                     encoding="utf-8")
+    code = ("import subprocess, sys, time; "
+            f"subprocess.Popen([sys.executable, {str(grand)!r}, {str(beat)!r}], "
+            "stdout=sys.stdout, stderr=sys.stderr); "
+            "print('parent up', flush=True); time.sleep(40)")
+    started = time.monotonic()
+    rc, out, err = _bounded(lambda: proc.run([sys.executable, "-c", code], timeout_s=2))
+    elapsed = time.monotonic() - started
+    assert rc == proc.TIMEOUT_EXIT and "2s cap" in err
+    assert "parent up" in out                 # what it printed before the cap is kept
+    assert elapsed < 30, elapsed              # seconds, not the grandchild's lifetime
+    beats = beat.stat().st_size if beat.exists() else 0
+    time.sleep(1.5)
+    assert (beat.stat().st_size if beat.exists() else 0) == beats, "the grandchild lives"
+
+
+def test_stop_all_takes_a_captured_child_too(tmp_path):
+    """A captured child heads its own process group, where the console's Ctrl+C
+    never reaches it: `stop_all` must, or a `git fetch` in a leg's thread would
+    run on to its cap after the operator's Ctrl+C."""
+    up = tmp_path / "up"
+    box = {}
+    worker = threading.Thread(target=lambda: box.update(out=proc.run(
+        [sys.executable, "-c",
+         f"import pathlib, time; pathlib.Path({str(up)!r}).touch(); time.sleep(40)"],
+        timeout_s=60)), daemon=True)
+    worker.start()
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and not up.exists():
+        time.sleep(0.05)
+    started = time.monotonic()
+    try:
+        proc.stop_all()
+        worker.join(30)
+    finally:
+        proc.clear_stop()
+    assert not worker.is_alive() and time.monotonic() - started < 30
+    assert box["out"][0] != 0
 
 
 @pytest.mark.parametrize("logged", [False, True])
